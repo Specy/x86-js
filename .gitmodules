@@ -1,0 +1,9 @@
+[submodule "src/x86/unicorn"]
+	path = src/x86/unicorn
+	url = https://github.com/AlexAltea/unicorn.js
+[submodule "src/x86/keystone"]
+	path = src/x86/keystone
+	url = https://github.com/AlexAltea/keystone.js
+[submodule "src/x86/capstone"]
+	path = src/x86/capstone
+	url = https://github.com/AlexAltea/capstone.js
