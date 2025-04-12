@@ -1,6 +1,6 @@
 {
   "name": "@specy/x86",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "An x86 interpreter for Javascript",
   "homepage": "https://github.com/Specy/x86-js#readme",
   "bugs": {

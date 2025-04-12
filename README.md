@@ -1,4 +1,5 @@
 # X86 Interpreter
+[![npm](https://img.shields.io/npm/v/@specy/x86.svg)](https://www.npmjs.com/package/@specy/x86)
 
 A TypeScript library for x86 assembly interpretation, simulation, and debugging.
 
@@ -6,9 +7,9 @@ A TypeScript library for x86 assembly interpretation, simulation, and debugging.
 
 This library provides a JavaScript/TypeScript interface for interpreting and simulating x86 assembly code. It combines three powerful engines:
 
-- **Unicorn Engine** - For CPU emulation
-- **Keystone Engine** - For assembly
-- **Capstone Engine** - For disassembly
+- **[Unicorn.js](https://github.com/AlexAltea/unicorn.js)** - For CPU emulation
+- **[Keystone.js](https://github.com/AlexAltea/keystone.js)** - For assembly
+- **[Capstone.js](https://github.com/AlexAltea/capstone.js)** - For disassembly
 
 With this library, you can assemble, execute, and debug x86 instructions, manipulate registers and memory, and analyze program behavior at the instruction level.
 
