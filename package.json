@@ -1,7 +1,7 @@
 {
   "name": "@specy/x86",
   "version": "1.0.0",
-  "description": "",
+  "description": "An x86 interpreter for Javascript",
   "homepage": "https://github.com/Specy/x86-js#readme",
   "bugs": {
     "url": "https://github.com/Specy/x86-js/issues"
@@ -11,18 +11,20 @@
     "url": "git+https://github.com/Specy/x86-js.git"
   },
   "license": "GPL-2.0",
-  "author": "",
-  "type": "commonjs",
-  "main": "index.js",
+  "author": "Specy",
+  "type": "module",
+  "module": "/dist/index.js",
+  "types": "/dist/index.d.ts",
   "scripts": {
-    "install:deps": "cd src/x86 && cd capstone && npm i --force && cd ../keystone && npm i  --force && cd ../unicorn && npm i  --force",
-    "build:deps": "npx tsx scripts/build-deps.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsup src/index.ts --format esm --dts --clean --minify",
+    "start": "npx tsx src/index.ts",
+    "test": "npx tsx src/test.ts"
   },
   "devDependencies": {
     "tsup": "^8.4.0"
   },
   "dependencies": {
-    "@types/node": "^22.13.14"
+    "@types/node": "^22.13.14",
+    "typescript": "^5.8.3"
   }
 }
