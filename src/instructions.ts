@@ -1,3 +1,5 @@
+import {enumKeys} from "./utils";
+
 export enum X86InstructionCode {
     AAA = 1,
     AAD = 2,
@@ -1341,4 +1343,4 @@ export enum X86InstructionCode {
 
 export type X86InstructionName = keyof typeof X86InstructionCode
 
-export const X86InstructionNames = Object.keys(X86InstructionCode) as X86InstructionName[]
+export const X86InstructionNames = enumKeys(X86InstructionCode) as X86InstructionName[]

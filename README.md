@@ -13,6 +13,9 @@ This library provides a JavaScript/TypeScript interface for interpreting and sim
 
 With this library, you can assemble, execute, and debug x86 instructions, manipulate registers and memory, and analyze program behavior at the instruction level.
 
+## Bundle size
+The library has a Gzipped bundle size of around 1.5MB, uncompressed is around 9MB
+
 ## Features
 
 - **Assembly/Disassembly**: Convert x86 assembly code to machine code and back

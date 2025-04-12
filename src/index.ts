@@ -1,7 +1,11 @@
+//@ts-ignore
 import {uc} from './x86/deps/unicorn-x86.min'
+//@ts-ignore
 import {ks} from './x86/deps/keystone-x86.min'
+//@ts-ignore
 import {cs} from './x86/deps/capstone-x86.min'
 import {X86InstructionCode, X86InstructionName, X86InstructionNames} from "./instructions";
+import {enumKeys} from "./utils";
 
 export {
     X86InstructionNames,
@@ -35,17 +39,7 @@ export enum X86Register {
     EDX = 24,
 }
 
-/**
- * Returns the keys of an enum
- * @template T - Enum type
- * @param {T} e - Enum object
- * @returns {string[]} Array of enum keys
- */
-function enumKeys<T extends object>(e: T) {
-    const keys = Object.keys(e)
-    const isStringEnum = isNaN(Number(keys[0]))
-    return isStringEnum ? keys : keys.slice(keys.length / 2)
-}
+
 
 /** Array of all x86 register names */
 export const X86_REGISTERS = enumKeys(X86Register)
@@ -154,6 +148,7 @@ export class X86Interpreter {
      * @param {number} size - Size of the region
      * @param {any} user_data - User data
      */
+    //@ts-ignore
     private hook = (handle, addr_lo, addr_hi, size, user_data) => {
 
     }
@@ -177,7 +172,7 @@ export class X86Interpreter {
      */
     assemble() {
         try {
-            this.codeBuffer = this.assembler.asm(this.code);
+            this.codeBuffer = this.assembler.asm(this.code) as number[]
             const instructions = this.getInstructions();
             this.instructions = instructions.map((ins, i) => {
                 return {
@@ -235,7 +230,7 @@ export class X86Interpreter {
      */
     simulateWithBreakpoints(breakpoints: number[], limit?: number) {
         const breakpointsMap = new Map(breakpoints.map((bp) => [bp, true]));
-        const handle = this.interpreter.hook_add(uc.HOOK_CODE, (_, address: number) => {
+        const handle = this.interpreter.hook_add(uc.HOOK_CODE, (_: unknown, address: number) => {
             if (breakpointsMap.has(address)) {
                 this.interpreter.emu_stop();
             }
