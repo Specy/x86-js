@@ -1,6 +1,6 @@
 {
   "name": "@specy/x86",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "An x86 interpreter for Javascript",
   "homepage": "https://github.com/Specy/x86-js#readme",
   "bugs": {
@@ -10,6 +10,9 @@
     "type": "git",
     "url": "git+https://github.com/Specy/x86-js.git"
   },
+  "files": [
+    "dist"
+  ],
   "license": "GPL-2.0",
   "author": "Specy",
   "type": "module",
