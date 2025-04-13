@@ -1,11 +1,11 @@
 //@ts-ignore
-import {uc} from './x86/deps/unicorn-x86.min'
+import { uc } from './x86/deps/unicorn-x86.min'
 //@ts-ignore
-import {ks} from './x86/deps/keystone-x86.min'
+import { ks } from './x86/deps/keystone-x86.min'
 //@ts-ignore
-import {cs} from './x86/deps/capstone-x86.min'
-import {X86InstructionCode, X86InstructionName, X86InstructionNames} from "./instructions";
-import {enumKeys} from "./utils";
+import { cs } from './x86/deps/capstone-x86.min'
+import { X86InstructionCode, X86InstructionName, X86InstructionNames } from "./instructions";
+import { enumKeys } from "./utils";
 
 export {
     X86InstructionNames,
@@ -202,6 +202,7 @@ export class X86Interpreter {
         this.interpreter.mem_map(X86Interpreter.START_ADDRESS, calculatePageSize(this.codeBuffer.length), uc.PROT_ALL);
         this.interpreter.mem_write(X86Interpreter.START_ADDRESS, this.codeBuffer);
         this.interpreter.mem_map(X86Interpreter.STACK_START_ADDRESS, calculatePageSize(X86Interpreter.STACK_SIZE), uc.PROT_ALL);
+        console.log(X86Interpreter.STACK_START_ADDRESS + X86Interpreter.STACK_SIZE)
         this.interpreter.reg_write_i32(X86Register.ESP, X86Interpreter.STACK_START_ADDRESS + X86Interpreter.STACK_SIZE);
         this.interpreter.reg_write_i32(X86Register.EBP, X86Interpreter.STACK_START_ADDRESS + X86Interpreter.STACK_SIZE);
         this.interpreter.reg_write_i32(X86_PROGRAM_COUNTER_REGISTER, X86Interpreter.START_ADDRESS);
@@ -313,9 +314,9 @@ export class X86Interpreter {
      * @returns {number[]} Array of byte values
      * @throws {Error} If reading memory fails
      */
-    readMemoryBytes(address: number, length: number) {
+    readMemoryBytes(address: number, length: number): Uint8Array {
         try {
-            return [...this.interpreter.mem_read(address, length)];
+            return this.interpreter.mem_read(address, length);
         } catch (e) {
             throw new Error(simplifyError(e));
         }

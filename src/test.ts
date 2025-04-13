@@ -12,6 +12,6 @@ interpreter.assemble()
 interpreter.initialize()
 interpreter.simulate()
 
-console.log(interpreter.getRegisterValue(X86Register.ECX))
+
 
 
