@@ -1,6 +1,6 @@
 {
   "name": "@specy/x86",
-  "version": "1.0.9",
+  "version": "1.1.0",
   "description": "An x86 interpreter for Javascript",
   "homepage": "https://github.com/Specy/x86-js#readme",
   "bugs": {
@@ -19,11 +19,13 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --clean --minify",
+    "build": "tsc && minify",
+    "minify": "npx tsx terser.ts",
     "start": "npx tsx src/index.ts",
     "test": "npx tsx src/test.ts"
   },
   "devDependencies": {
+    "terser": "^5.39.0",
     "tsup": "^8.4.0"
   },
   "dependencies": {
