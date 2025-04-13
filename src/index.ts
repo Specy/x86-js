@@ -17,12 +17,12 @@ export {
  * Enumeration of x86 condition flags
  */
 export enum X86ConditionFlags {
-    C = 0, // Carry flag
-    Z = 1, // Zero flag
-    S = 2, // Sign flag
-    O = 3, // Overflow flag
-    P = 4, // Parity flag
-    A = 5, // Auxiliary carry flag
+    C,// Carry flag
+    P,// Parity flag
+    A,// Auxiliary carry flag
+    Z,// Zero flag
+    S,// Sign flag
+    O, // Overflow flag
 }
 
 /**
@@ -202,7 +202,6 @@ export class X86Interpreter {
         this.interpreter.mem_map(X86Interpreter.START_ADDRESS, calculatePageSize(this.codeBuffer.length), uc.PROT_ALL);
         this.interpreter.mem_write(X86Interpreter.START_ADDRESS, this.codeBuffer);
         this.interpreter.mem_map(X86Interpreter.STACK_START_ADDRESS, calculatePageSize(X86Interpreter.STACK_SIZE), uc.PROT_ALL);
-        console.log(X86Interpreter.STACK_START_ADDRESS + X86Interpreter.STACK_SIZE)
         this.interpreter.reg_write_i32(X86Register.ESP, X86Interpreter.STACK_START_ADDRESS + X86Interpreter.STACK_SIZE);
         this.interpreter.reg_write_i32(X86Register.EBP, X86Interpreter.STACK_START_ADDRESS + X86Interpreter.STACK_SIZE);
         this.interpreter.reg_write_i32(X86_PROGRAM_COUNTER_REGISTER, X86Interpreter.START_ADDRESS);
