@@ -2,6 +2,13 @@
 [![npm](https://img.shields.io/npm/v/@specy/x86.svg)](https://www.npmjs.com/package/@specy/x86)
 
 A TypeScript library for x86 assembly interpretation, simulation, and debugging.
+It is part of a family of javascript assembly interpreters/simulators: 
+
+- MIPS: [git repo](https://github.com/Specy/mars),  [npm package](https://www.npmjs.com/package/@specy/mips)
+- RISC-V: [git repo](https://github.com/Specy/rars), [npm package](https://www.npmjs.com/package/@specy/risc-v)
+- X86: [git repo](https://github.com/Specy/x86-js), [npm package](https://www.npmjs.com/package/@specy/x86)
+- M68K: [git repo](https://github.com/Specy/s68k), [npm package](https://www.npmjs.com/package/@specy/s68k)
+
 
 ## Overview
 
