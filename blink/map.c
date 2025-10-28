@@ -99,6 +99,9 @@ static void *PortableMmap(void *addr,     //
 }
 
 static int GetBitsInAddressSpace(void) {
+#ifdef __EMSCRIPTEN__
+  return 32;
+#else
   int i;
   void *ptr;
   uint64_t want;
@@ -117,6 +120,7 @@ static int GetBitsInAddressSpace(void) {
     }
   }
   Abort();
+#endif
 }
 
 static u64 GetVirtualAddressSpace(int vabits, long pagesize) {
@@ -164,6 +168,11 @@ void *Mmap(void *addr,     //
   void *res;
 #if LOG_MEM
   char szbuf[16];
+#endif
+#if defined(__NetBSD__)
+  if (!(flags & MAP_SHARED)) {
+    prot |= PROT_MPROTECT(PROT_EXEC | PROT_WRITE | PROT_READ);
+  }
 #endif
   res = PortableMmap(addr, length, prot, flags, fd, offset);
 #if LOG_MEM
