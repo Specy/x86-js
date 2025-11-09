@@ -50,6 +50,7 @@
 #define kMachineSimdException        -9
 #define kMachineExitTrap             -10
 #define kMachineFatalSystemSignal    -11
+#define kMachineFakeTTYtrap          -12
 
 #define CR0_PE 0x01        // protected mode enabled
 #define CR0_MP 0x02        // monitor coprocessor
@@ -422,6 +423,7 @@ struct Machine {               //
   bool insyscall;                        //
   bool nofault;                          //
   bool canhalt;                          //
+  bool fakettycanhalt;                   //
   bool metal;                            //
   bool interrupted;                      //
   bool issigsuspend;                     //

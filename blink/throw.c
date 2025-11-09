@@ -100,7 +100,11 @@ void HaltMachine(struct Machine *m, int code) {
       m->faultaddr = 0;
       DeliverSignalToUser(m, SIGSEGV_LINUX, SI_KERNEL_LINUX);
       break;
+    case kMachineFakeTTYtrap:
     case kMachineExitTrap:
+      // These are special cases that we don't want to go trough
+      // the signal delivery system. They will be simply handled
+      // in the main execution loop, in the sigsetjump catch.
       RestoreIp(m);
       break;
     default:

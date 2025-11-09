@@ -51,9 +51,10 @@ int switches_count = 0;
  * The event codes are defined here. An event code
  * of 0 will be recognized as an actuall SIGTRAP.
  */
-#define SIGTRAP_CODE_SIGTRAP 0
-#define SIGTRAP_CODE_PREEMPT 40
-#define SIGTRAP_CODE_STEP    41
+#define SIGTRAP_CODE_SIGTRAP  0
+#define SIGTRAP_CODE_PREEMPT  40
+#define SIGTRAP_CODE_STEP     41
+#define SIGTRAP_CODE_FAKE_TTY 42
 
 /*
  * These variables are defined by javascript;
@@ -278,13 +279,13 @@ void runLoop() {
     puts("--");
 #endif
     if (interrupt == kMachineExitTrap) {
-#ifdef DEBUG
-      puts("Exit trap found! \n");
-#endif
       if (signal_callback) {
         update_clstruct(m);
         exit_callback(m->system->exitcode);
       }
+    } else if (interrupt == kMachineFakeTTYtrap) {
+      update_clstruct(m);
+      TerminateSignal(m, SIGTRAP, SIGTRAP_CODE_FAKE_TTY);
     }
   }
   m->canhalt = false;
@@ -296,6 +297,9 @@ void SetUp(void) {
   s = NewSystem(XED_MACHINE_MODE_LONG);
   m = g_machine = NewMachine(s, 0);
   m->metal = false;
+  // when true, read(0) will halt the machine, with a SIGTRAP_CODE_FAKE_TTY
+  // To resume the machine, a call to blinkenlib_faketty_resume is required
+  m->fakettycanhalt = true;
   // when true, guest exit syscalls will generate an interrupt that
   // can be handled via sigsetjmp, instead of calling the native _exit().
   // see: blinkenlib.c:runLoop()
@@ -436,6 +440,18 @@ void blinkenlib_preempt_resume() {
   if (s->exited) {
     unassert(!"Invalid state");
   }
+  runLoop();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_faketty_resume() {
+  if (s->exited) {
+    unassert(!"Invalid state");
+  }
+  if (!m->fakettycanhalt) {
+    unassert(!"Invalid state (tty)");
+  }
+  m->fakettycanhalt = false;
   runLoop();
 }
 

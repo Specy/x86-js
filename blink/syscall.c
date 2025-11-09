@@ -2347,6 +2347,13 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
+    if (fildes == 0){
+      if(m->fakettycanhalt){
+        HaltMachine(m, kMachineFakeTTYtrap);
+      }else{
+        m->fakettycanhalt = true;
+      }
+    }
     unassert(readv_impl = fd->cb->readv);
     oflags = fd->oflags;
   } else {
