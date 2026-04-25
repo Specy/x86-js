@@ -90,6 +90,25 @@ enum blinkenlib_stop_kind {
   BLINKENLIB_STOP_LIMIT = 2,
 };
 
+enum blinkenlib_control_flow_kind {
+  BLINKENLIB_CONTROL_FLOW_NONE = 0,
+  BLINKENLIB_CONTROL_FLOW_CALL = 1,
+  BLINKENLIB_CONTROL_FLOW_RETURN = 2,
+};
+
+struct blinkenlib_step_info {
+  bool valid;
+  u64 pc_before;
+  u64 pc_after;
+  u64 sp_before;
+  u64 sp_after;
+  u32 flags_before;
+  u32 flags_after;
+  u32 control_flow;
+  u32 memory_write_count;
+  bool memory_truncated;
+};
+
 void blinkenlib_run_fast();
 void blinkenlib_run();
 void blinkenlib_start();
@@ -110,6 +129,8 @@ bool blinkenlib_set_register_u64(int register_id, u64 value);
 u64 blinkenlib_get_pc();
 u64 blinkenlib_get_sp();
 u32 blinkenlib_get_flags();
+void blinkenlib_set_flags(u32 flags);
+void blinkenlib_set_step_recording(bool enabled);
 u64 blinkenlib_get_input_max_bytes();
 bool blinkenlib_read_memory_byte(u64 virtual_address, u8 *value);
 bool blinkenlib_write_memory_byte(u64 virtual_address, u8 value);
@@ -121,8 +142,14 @@ u64 blinkenlib_get_run_breakpoint_address(u32 index);
 u32 blinkenlib_get_last_stop_kind();
 u64 blinkenlib_get_last_stop_address();
 u64 blinkenlib_get_last_run_instruction_count();
+bool blinkenlib_get_last_step_info(struct blinkenlib_step_info *info);
+bool blinkenlib_get_last_step_memory_write(u32 index, u64 *address, u32 *size,
+                                           const u8 **old_bytes,
+                                           u32 *old_size, bool *truncated);
 bool blinkenlib_get_instruction_at(u64 virtual_address, u64 *address, u8 *size,
                                    char *buffer, u32 buffer_size);
+bool blinkenlib_resolve_symbol(u64 virtual_address, u64 *symbol_address,
+                               char *buffer, u32 buffer_size);
 u32 blinkenlib_refresh_disassembly();
 u32 blinkenlib_get_disassembly_current_line();
 u32 blinkenlib_get_disassembly_line_count();

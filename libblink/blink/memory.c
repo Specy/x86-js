@@ -46,8 +46,54 @@ void SetReadAddr(struct Machine *m, i64 addr, u32 size) {
   }
 }
 
+static u32 CopyOldBytes(struct Machine *m, i64 addr, u32 size, u8 *target) {
+  u32 copied = 0;
+  while (copied < size) {
+    u8 *page;
+    u32 chunk;
+    i64 current = addr + copied;
+    BEGIN_NO_PAGE_FAULTS;
+    page = SpyAddress(m, current);
+    END_NO_PAGE_FAULTS;
+    if (!page) break;
+    chunk = MIN(size - copied, 4096 - (current & 4095));
+    memcpy(target + copied, page, chunk);
+    copied += chunk;
+  }
+  return copied;
+}
+
+static void RecordWriteOldBytes(struct Machine *m, i64 addr, u32 size) {
+  struct MachineWriteRecord *record;
+  u32 available, captured;
+  if (!m->recordwrites || !size) return;
+  if (m->writeoldcount >= MACHINE_WRITE_RECORD_MAX) {
+    m->writeoldtruncated = true;
+    return;
+  }
+  record = &m->writeold[m->writeoldcount++];
+  record->addr = addr;
+  record->size = size;
+  record->oldoffset = m->writeoldbytesused;
+  record->oldsize = 0;
+  record->truncated = false;
+  available = MACHINE_WRITE_OLD_BYTES_MAX - m->writeoldbytesused;
+  captured = MIN(size, available);
+  if (captured) {
+    captured = CopyOldBytes(m, addr, captured,
+                            m->writeoldbytes + record->oldoffset);
+    m->writeoldbytesused += captured;
+    record->oldsize = captured;
+  }
+  if (captured < size) {
+    record->truncated = true;
+    m->writeoldtruncated = true;
+  }
+}
+
 void SetWriteAddr(struct Machine *m, i64 addr, u32 size) {
   if (size) {
+    RecordWriteOldBytes(m, addr, size);
     m->writeaddr = addr;
     m->writesize = size;
   }
@@ -402,8 +448,8 @@ int CopyToUser(struct Machine *m, i64 dst, void *src, u64 n) {
 }
 
 int CopyToUserWrite(struct Machine *m, i64 addr, void *src, u64 n) {
-  if (CopyToUser(m, addr, src, n) == -1) return -1;
   SetWriteAddr(m, addr, n);
+  if (CopyToUser(m, addr, src, n) == -1) return -1;
   return 0;
 }
 

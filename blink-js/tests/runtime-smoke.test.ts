@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest'
 import { EmulatorStatus } from '../src/interface'
 import { createX86Emulator } from '../src/x86-emulator'
 
-
 describe('wasm runtime integration', () => {
     it('initializes the emulator runtime', async () => {
         const emulator = await createX86Emulator()
@@ -182,6 +181,65 @@ _start:
 
         emulator.writeMemoryBytes(stackPointer, original)
         expect(() => emulator.readMemoryBytes(0xdeadbeefn, 4n)).toThrow(/not mapped/i)
+        emulator.dispose()
+    })
+
+    it('reads chunks from a larger mapped memory write', async () => {
+        const emulator = await createX86Emulator()
+        const result = await emulator.compile(`
+.global _start
+.text
+_start:
+  mov $60, %rax
+  xor %rdi, %rdi
+  syscall
+`)
+
+        expect(result.ok).toBe(true)
+        await emulator.step()
+
+        const stackPointer = emulator.getSp()
+        const original = emulator.readMemoryBytes(stackPointer, 32n)
+        const bytes = Uint8Array.from(Array.from({ length: 32 }, (_, index) => (index * 7 + 3) & 0xff))
+
+        emulator.writeMemoryBytes(stackPointer, bytes)
+        expect(Array.from(emulator.readMemoryBytes(stackPointer, 5n))).toEqual(Array.from(bytes.slice(0, 5)))
+        expect(Array.from(emulator.readMemoryBytes(stackPointer + 9n, 11n))).toEqual(Array.from(bytes.slice(9, 20)))
+        expect(Array.from(emulator.readMemoryBytes(stackPointer + 28n, 4n))).toEqual(Array.from(bytes.slice(28, 32)))
+
+        emulator.writeMemoryBytes(stackPointer, original)
+        emulator.dispose()
+    })
+
+    it('writes chunks without clobbering adjacent memory', async () => {
+        const emulator = await createX86Emulator()
+        const result = await emulator.compile(`
+.global _start
+.text
+_start:
+  mov $60, %rax
+  xor %rdi, %rdi
+  syscall
+`)
+
+        expect(result.ok).toBe(true)
+        await emulator.step()
+
+        const stackPointer = emulator.getSp()
+        const original = emulator.readMemoryBytes(stackPointer, 24n)
+        const base = Uint8Array.from(Array.from({ length: 24 }, (_, index) => index + 1))
+        const patch = Uint8Array.from([0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5])
+        const expected = Uint8Array.from(base)
+        expected.set(patch, 8)
+
+        emulator.writeMemoryBytes(stackPointer, base)
+        emulator.writeMemoryBytes(stackPointer + 8n, patch)
+
+        expect(Array.from(emulator.readMemoryBytes(stackPointer, 24n))).toEqual(Array.from(expected))
+        expect(Array.from(emulator.readMemoryBytes(stackPointer + 6n, 4n))).toEqual(Array.from(expected.slice(6, 10)))
+        expect(Array.from(emulator.readMemoryBytes(stackPointer + 14n, 4n))).toEqual(Array.from(expected.slice(14, 18)))
+
+        emulator.writeMemoryBytes(stackPointer, original)
         emulator.dispose()
     })
 })

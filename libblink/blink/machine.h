@@ -330,6 +330,17 @@ struct MachineTlb {
   u64 entry;
 };
 
+#define MACHINE_WRITE_RECORD_MAX     16
+#define MACHINE_WRITE_OLD_BYTES_MAX  65536
+
+struct MachineWriteRecord {
+  i64 addr;
+  u32 size;
+  u32 oldoffset;
+  u32 oldsize;
+  bool truncated;
+};
+
 struct Machine {               //
   u64 ip;                      // instruction pointer
   u8 oplen;                    // length of operation
@@ -391,6 +402,12 @@ struct Machine {               //
   i64 writeaddr;                    // so tui can show memory write
   i64 readsize;                     // bytes length of last read op
   i64 writesize;                    // byte length of last write op
+  bool recordwrites;                // capture old bytes for debugger undo
+  u32 writeoldcount;                // count of captured write records
+  u32 writeoldbytesused;            // used bytes in writeoldbytes
+  bool writeoldtruncated;           // old bytes exceeded fixed capture space
+  struct MachineWriteRecord writeold[MACHINE_WRITE_RECORD_MAX];
+  u8 writeoldbytes[MACHINE_WRITE_OLD_BYTES_MAX];
   union {                           //
     struct DescriptorCache seg[8];  //
     struct {                        //

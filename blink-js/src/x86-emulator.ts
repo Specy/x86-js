@@ -20,7 +20,27 @@ import {
     type X86EmulatorEventName,
     type X86RegisterName,
 } from './types'
-import type { BlinkenlibModule } from './wasm-types'
+import type {
+    BlinkenlibModule,
+    NativeInstruction,
+    NativeMemoryWrite,
+    NativeStepInfo,
+    RegisterSnapshot,
+} from './wasm-types'
+import {
+    CircularHistory,
+    X86_FLAGS,
+    cloneCallStack,
+    cloneRegisterValues,
+    deferToHost,
+    makeFrameColor,
+    maskForSize,
+    maskRegisterValue,
+    stripPrivateHistory,
+    toHistoryPc,
+    type UndoMemoryWrite,
+    type X86HistoryEntry,
+} from './x86-emulator-utils'
 
 export type X86EmulatorOptions = Omit<BlinkRuntimeOptions, 'callbacks' | 'mode'> & {
     mode?: AssemblerMode | AssemblerId
@@ -42,6 +62,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     private lastCompileResult: X86CompileResult | null = null
     private lastSourceCode = ''
+    private history = new CircularHistory<X86HistoryEntry>(0)
+    private callStack: StackFrame[] = []
 
     private constructor(runtime: BlinkRuntime) {
         super({
@@ -105,20 +127,24 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     async setMode(mode: AssemblerMode | AssemblerId): Promise<void> {
+        this.clearExecutionTrace()
         await this.runtime.setMode(mode)
     }
 
     async compile(code: string): Promise<X86CompileResult> {
+        this.clearExecutionTrace()
         this.lastSourceCode = code
         this.lastCompileResult = await this.runtime.compileAssembly(code)
         return this.lastCompileResult
     }
 
     loadElf(data: ArrayBuffer | Uint8Array): void {
+        this.clearExecutionTrace()
         this.runtime.loadElf(data)
     }
 
     async runUntilBlocked(): Promise<EmulatorStatus> {
+        if (this.isTracingEnabled()) return this.run()
         await this.runtime.runUntilBlocked()
         return this.getStatus()
     }
@@ -127,9 +153,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         this.runtime.provideInput(line)
     }
 
-    initialize(_undoSize: number): void {
-        this.lastCompileResult = null
-        this.lastSourceCode = ''
+    initialize(undoSize: number): void {
+        const undoLimit = Number.isFinite(undoSize) ? Math.max(0, Math.floor(undoSize)) : 0
+        this.history = new CircularHistory<X86HistoryEntry>(undoLimit)
+        this.clearExecutionTrace()
+        this.runtime.setStepRecording(this.isTracingEnabled())
     }
 
     getCompiledCode(): { decorations: EmulatorDecoration[]; code: string } {
@@ -137,6 +165,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     dispose(): void {
+        this.runtime.setStepRecording(false)
+        this.clearExecutionTrace()
         this.eventHandlers.stateChange.clear()
         this.eventHandlers.stdout.clear()
         this.eventHandlers.stderr.clear()
@@ -165,14 +195,38 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         }))
     }
 
-    undo(): void {}
+    undo(): void {
+        const entry = this.history.pop()
+        if (!entry) return
+        if (!entry.reversible) {
+            this.history.push(entry)
+            throw new Error('The latest x86 step cannot be undone because its memory writes were too large to capture')
+        }
+
+        for (let index = entry.memoryWrites.length - 1; index >= 0; index -= 1) {
+            const write = entry.memoryWrites[index]
+            if (write) this.runtime.writeMemoryBytes(write.address, Uint8Array.from(write.old))
+        }
+        for (const register of X86_REGISTER_NAMES) {
+            this.runtime.setRegister(register, entry.registersBefore[register])
+        }
+        this.runtime.setFlags(entry.flagsBefore)
+        this.callStack = cloneCallStack(entry.callStackBefore)
+        this.runtime.resumeAfterStateMutation()
+    }
 
     canUndo(): boolean {
-        return false
+        const entry = this.history.peekNewest()
+        return Boolean(entry?.reversible)
     }
 
     async step(): Promise<{ terminated: boolean }> {
-        this.runtime.step()
+        if (this.isTracingEnabled()) {
+            this.captureStep()
+        } else {
+            this.prepareOneInstructionRun()
+            this.runtime.step()
+        }
         return { terminated: this.hasTerminated() }
     }
 
@@ -195,8 +249,10 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.getInstructionAt(this.getPc())
     }
 
-    getUndoHistory(_max: number): ExecutionStep[] {
-        return []
+    getUndoHistory(max: number): ExecutionStep[] {
+        const count = Math.max(0, Math.floor(max))
+        if (count === 0) return []
+        return this.history.newestFirst(count).map(stripPrivateHistory)
     }
 
     getPc(): bigint {
@@ -209,14 +265,17 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     getFlags(): { name: string; value: number; prev?: number }[] {
         const flags = this.runtime.getFlags()
+        const latest = this.history.peekNewest()
+        const previousFlags = latest ? BigInt(latest.flagsBefore) : flags
         return X86_FLAGS.map((flag) => ({
             name: flag.name,
             value: (flags & BigInt(flag.mask)) > 0n ? 1 : 0,
+            prev: (previousFlags & BigInt(flag.mask)) > 0n ? 1 : 0,
         }))
     }
 
     getCallStack(): StackFrame[] {
-        return []
+        return cloneCallStack(this.callStack)
     }
 
     getInstructionAt(address: bigint): Instruction | null {
@@ -257,6 +316,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     async run(limit?: number, breakpoints: number[] = []): Promise<EmulatorStatus> {
         this.validateRunLimit(limit)
         const breakpointAddresses = this.resolveBreakpointAddresses(breakpoints)
+        if (this.isTracingEnabled()) return this.runWithHistory(limit, breakpointAddresses)
         if (breakpointAddresses.length) return this.runWithBreakpoints(limit, breakpointAddresses)
         await this.runtime.runUntilBlocked({ limit, breakpointAddresses })
         return this.getStatus()
@@ -287,12 +347,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const hasLimit = limit !== undefined && limit > 0
         let executedInstructions = 0
 
-        if (this.runtime.state === BlinkState.ProgramLoaded || this.runtime.state === BlinkState.ProgramStopped) {
-            this.runtime.starti()
-        }
-        if (this.runtime.state === BlinkState.ProgramPaused) {
-            this.runtime.continue()
-        }
+        this.prepareOneInstructionRun()
 
         while (this.runtime.state === BlinkState.ProgramRunning) {
             const pc = this.getPc()
@@ -313,6 +368,167 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.getStatus()
     }
 
+    private async runWithHistory(limit: number | undefined, breakpointAddresses: bigint[]): Promise<EmulatorStatus> {
+        const breakpointSet = new Set(breakpointAddresses.map((address) => address.toString()))
+        const hasLimit = limit !== undefined && limit > 0
+        let executedInstructions = 0
+
+        this.prepareOneInstructionRun()
+
+        while (this.runtime.state === BlinkState.ProgramRunning) {
+            const pc = this.getPc()
+            if (breakpointSet.has(pc.toString())) {
+                this.runtime.pauseForBreakpoint(pc, this.runtime.getSourceLineForAddress(pc) ?? undefined)
+                return this.getStatus()
+            }
+            if (hasLimit && executedInstructions >= limit) {
+                this.runtime.pauseForLimit(pc, BigInt(executedInstructions))
+                return this.getStatus()
+            }
+
+            await this.step()
+            executedInstructions += 1
+            if (executedInstructions % 10000 === 0) await deferToHost()
+        }
+
+        return this.getStatus()
+    }
+
+    private isTracingEnabled(): boolean {
+        return this.history.capacity > 0
+    }
+
+    private clearExecutionTrace(): void {
+        this.history.clear()
+        this.callStack = []
+    }
+
+    private prepareOneInstructionRun(): void {
+        if (this.runtime.state === BlinkState.ProgramLoaded || this.runtime.state === BlinkState.ProgramStopped) {
+            this.runtime.starti()
+            return
+        }
+        if (this.runtime.state === BlinkState.ProgramPaused) {
+            this.runtime.resumeAfterStateMutation()
+        }
+    }
+
+    private captureStep(): void {
+        this.prepareOneInstructionRun()
+        const before = this.runtime.getRegisterSnapshot()
+        const instruction = this.runtime.getInstructionAt(before.pc)
+        const callStackBefore = cloneCallStack(this.callStack)
+
+        this.runtime.step()
+
+        const after = this.runtime.getRegisterSnapshot()
+        const nativeStep = this.runtime.getLastStepInfo()
+        this.recordStep(before, after, nativeStep, instruction, callStackBefore)
+    }
+
+    private recordStep(
+        before: RegisterSnapshot,
+        after: RegisterSnapshot,
+        nativeStep: NativeStepInfo,
+        instruction: NativeInstruction | null,
+        callStackBefore: StackFrame[],
+    ): void {
+        const registersBefore = cloneRegisterValues(before)
+        const registersAfter = cloneRegisterValues(after)
+        const pcBefore = nativeStep.valid ? nativeStep.pcBefore : before.pc
+        const pcAfter = nativeStep.valid ? nativeStep.pcAfter : after.pc
+        const flagsBefore = nativeStep.valid ? nativeStep.flagsBefore : before.flags
+        const flagsAfter = nativeStep.valid ? nativeStep.flagsAfter : after.flags
+        const mutations: ExecutionStep['mutations'] = []
+
+        for (const register of X86_REGISTER_NAMES) {
+            if (register === 'rip') continue
+            if (registersBefore[register] !== registersAfter[register]) {
+                mutations.push({
+                    type: 'WriteRegister',
+                    value: {
+                        register,
+                        old: registersBefore[register],
+                        size: RegisterSize.Double,
+                    },
+                })
+            }
+        }
+
+        const memoryWrites = nativeStep.valid ? this.recordMemoryMutations(nativeStep.memoryWrites, mutations) : []
+        if (nativeStep.valid) {
+            this.recordControlFlowMutation(nativeStep, instruction, mutations)
+        }
+
+        const entry: X86HistoryEntry = {
+            mutations,
+            pc: toHistoryPc(pcBefore),
+            old_ccr: { bits: flagsBefore },
+            new_ccr: { bits: flagsAfter },
+            line: this.runtime.getSourceLineForAddress(pcBefore) ?? -1,
+            registersBefore,
+            flagsBefore,
+            callStackBefore,
+            memoryWrites,
+            reversible: !nativeStep.valid || !nativeStep.truncatedMemoryWrites,
+        }
+
+        this.history.push(entry)
+    }
+
+    private recordMemoryMutations(
+        writes: NativeMemoryWrite[],
+        mutations: ExecutionStep['mutations'],
+    ): UndoMemoryWrite[] {
+        const undoWrites: UndoMemoryWrite[] = []
+        for (const write of writes) {
+            if (write.truncated || write.old.length !== write.size) {
+                mutations.push({
+                    type: 'Other',
+                    value: `Wrote ${write.size} bytes to 0x${write.address.toString(16)}`,
+                })
+                continue
+            }
+            undoWrites.push({ address: write.address, old: [...write.old] })
+            mutations.push({
+                type: 'WriteMemoryBytes',
+                value: {
+                    address: write.address,
+                    old: [...write.old],
+                },
+            })
+        }
+        return undoWrites
+    }
+
+    private recordControlFlowMutation(
+        step: Extract<NativeStepInfo, { valid: true }>,
+        instruction: NativeInstruction | null,
+        mutations: ExecutionStep['mutations'],
+    ): void {
+        if (step.controlFlow === 'call') {
+            const returnAddress = instruction ? instruction.address + BigInt(instruction.size) : step.pcBefore
+            const symbol = this.runtime.resolveSymbol(step.pcAfter)
+            const frameAddress = symbol?.address ?? step.pcAfter
+            this.callStack.push({
+                name: symbol?.name ?? '',
+                address: frameAddress,
+                destination: returnAddress,
+                sp: step.spAfter,
+                line: this.runtime.getSourceLineForAddress(frameAddress) ?? -1,
+                color: makeFrameColor(this.callStack.length, frameAddress),
+            })
+            mutations.push({ type: 'PushCallStack', value: { from: step.pcBefore, to: step.pcAfter } })
+            return
+        }
+
+        if (step.controlFlow === 'return') {
+            if (this.callStack.pop()) {
+                mutations.push({ type: 'PopCallStack', value: { from: step.pcBefore, to: step.pcAfter } })
+            }
+        }
+    }
+
     private emit<T extends X86EmulatorEventName>(eventName: T, event: X86EmulatorEventMap[T]): void {
         for (const handler of this.eventHandlers[eventName]) handler(event)
     }
@@ -320,27 +536,4 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
 export async function createX86Emulator(options: X86EmulatorOptions = {}): Promise<X86Emulator> {
     return X86Emulator.create(options)
-}
-
-const X86_FLAGS = [
-    { name: 'CF', mask: 0x00000001 },
-    { name: 'PF', mask: 0x00000004 },
-    { name: 'AF', mask: 0x00000010 },
-    { name: 'ZF', mask: 0x00000040 },
-    { name: 'SF', mask: 0x00000080 },
-    { name: 'TF', mask: 0x00000100 },
-    { name: 'DF', mask: 0x00000400 },
-    { name: 'OF', mask: 0x00000800 },
-] as const
-
-function maskForSize(size: RegisterSize): bigint {
-    return (1n << BigInt(size * 8)) - 1n
-}
-
-function maskRegisterValue(value: bigint, size: RegisterSize): bigint {
-    return value & maskForSize(size)
-}
-
-function deferToHost(): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, 0))
 }

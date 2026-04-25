@@ -88,6 +88,9 @@ void ResetCpu(struct Machine *m) {
   m->readaddr = 0;
   m->writesize = 0;
   m->readsize = 0;
+  m->writeoldcount = 0;
+  m->writeoldbytesused = 0;
+  m->writeoldtruncated = false;
   m->flags = 0;
   m->flags = SetFlag(m->flags, FLAGS_VF, 1);
   m->flags = SetFlag(m->flags, FLAGS_IOPL, 3);

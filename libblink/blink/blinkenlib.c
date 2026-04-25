@@ -13,6 +13,7 @@
 #include "blink/loader.h"
 #include "blink/machine.h"
 #include "blink/map.h"
+#include "blink/rde.h"
 #include "blink/syscall.h"
 #include "blink/x86.h"
 
@@ -103,6 +104,13 @@ static u32 last_stop_kind = BLINKENLIB_STOP_NONE;
 static u64 last_stop_address = 0;
 static bool skip_current_breakpoint = false;
 static u64 skip_breakpoint_address = 0;
+static bool step_recording_enabled = false;
+static bool active_step = false;
+static u64 active_pc_before = 0;
+static u64 active_sp_before = 0;
+static u32 active_flags_before = 0;
+static u32 active_control_flow = BLINKENLIB_CONTROL_FLOW_NONE;
+static struct blinkenlib_step_info last_step_info;
 
 /**
  * Signals handler.
@@ -249,6 +257,81 @@ static void ClearRunStop(void) {
   SetRunStop(BLINKENLIB_STOP_NONE, 0);
 }
 
+static bool IsCall(void) {
+  switch (Mopcode(m->xedd->op.rde)) {
+    case 0x0CC:
+    case 0x0CD:
+    case 0x0CE:
+    case 0x0E8:
+      return true;
+    case 0x0FF:
+      return ModrmReg(m->xedd->op.rde) == 2;
+    default:
+      return false;
+  }
+}
+
+static bool IsRet(void) {
+  switch (Mopcode(m->xedd->op.rde)) {
+    case 0x0C2:
+    case 0x0C3:
+    case 0x0CA:
+    case 0x0CB:
+    case 0x0CF:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static u32 GetControlFlowKind(void) {
+  if (IsCall()) return BLINKENLIB_CONTROL_FLOW_CALL;
+  if (IsRet()) return BLINKENLIB_CONTROL_FLOW_RETURN;
+  return BLINKENLIB_CONTROL_FLOW_NONE;
+}
+
+static void ClearStepMemoryWrites(void) {
+  if (!m) return;
+  m->readaddr = 0;
+  m->readsize = 0;
+  m->writeaddr = 0;
+  m->writesize = 0;
+  m->writeoldcount = 0;
+  m->writeoldbytesused = 0;
+  m->writeoldtruncated = false;
+}
+
+static void ClearLastStepInfo(void) {
+  memset(&last_step_info, 0, sizeof(last_step_info));
+  active_step = false;
+}
+
+static void BeginRecordedStep(u32 control_flow) {
+  if (!step_recording_enabled || !m) return;
+  ClearStepMemoryWrites();
+  memset(&last_step_info, 0, sizeof(last_step_info));
+  active_pc_before = GetPc(m);
+  active_sp_before = Read64(m->sp);
+  active_flags_before = m->flags;
+  active_control_flow = control_flow;
+  active_step = true;
+}
+
+static void FinishRecordedStep(void) {
+  if (!active_step || !m) return;
+  last_step_info.valid = true;
+  last_step_info.pc_before = active_pc_before;
+  last_step_info.pc_after = GetPc(m);
+  last_step_info.sp_before = active_sp_before;
+  last_step_info.sp_after = Read64(m->sp);
+  last_step_info.flags_before = active_flags_before;
+  last_step_info.flags_after = m->flags;
+  last_step_info.control_flow = active_control_flow;
+  last_step_info.memory_write_count = m->writeoldcount;
+  last_step_info.memory_truncated = m->writeoldtruncated;
+  active_step = false;
+}
+
 static bool PushRunBreakpoint(u64 address) {
   struct Breakpoint breakpoint = {0};
   breakpoint.addr = address;
@@ -366,7 +449,9 @@ void runLoop() {
         }
       }
 
+      BeginRecordedStep(GetControlFlowKind());
       ExecuteInstruction(m);
+      FinishRecordedStep();
       run_instruction_count += 1;
 
       if (single_stepping) {
@@ -399,6 +484,7 @@ void runLoop() {
     printf("handling machine interrupt: %d \n", interrupt);
     puts("--");
 #endif
+    FinishRecordedStep();
     if (interrupt == kMachineExitTrap) {
       if (signal_callback) {
         update_clstruct(m);
@@ -425,6 +511,7 @@ void SetUp(void) {
   // can be handled via sigsetjmp, instead of calling the native _exit().
   // see: blinkenlib.c:runLoop()
   m->system->trapexit = true;
+  m->recordwrites = false;
 
   // reset the counter we use to limit the execution cycles of a program
   switches_count = 0;
@@ -501,6 +588,9 @@ void setupProgram(bool withdebugger) {
   char *bios = 0;
   LoadProgram(m, progname_string, progname_string, args, &vars, bios);
   PostLoadSetup();
+  m->recordwrites = withdebugger && step_recording_enabled;
+  ClearStepMemoryWrites();
+  ClearLastStepInfo();
   ApplyPendingRunBreakpoints();
   skip_current_breakpoint = false;
   skip_breakpoint_address = 0;
@@ -618,6 +708,19 @@ u32 blinkenlib_get_flags() {
   return m ? m->flags : 0;
 }
 
+void blinkenlib_set_flags(u32 flags) {
+  if (m) m->flags = flags;
+}
+
+void blinkenlib_set_step_recording(bool enabled) {
+  step_recording_enabled = enabled;
+  ClearLastStepInfo();
+  if (m) {
+    m->recordwrites = enabled;
+    ClearStepMemoryWrites();
+  }
+}
+
 u64 blinkenlib_get_input_max_bytes() {
   return blinkenlib_get_register_u64(BLINKENLIB_REG_RDX);
 }
@@ -682,6 +785,29 @@ u64 blinkenlib_get_last_run_instruction_count() {
   return run_instruction_count;
 }
 
+bool blinkenlib_get_last_step_info(struct blinkenlib_step_info *info) {
+  if (!info || !last_step_info.valid) return false;
+  *info = last_step_info;
+  return true;
+}
+
+bool blinkenlib_get_last_step_memory_write(u32 index, u64 *address, u32 *size,
+                                           const u8 **old_bytes,
+                                           u32 *old_size, bool *truncated) {
+  struct MachineWriteRecord *record;
+  if (!m || !last_step_info.valid || index >= last_step_info.memory_write_count ||
+      !address || !size || !old_bytes || !old_size || !truncated) {
+    return false;
+  }
+  record = &m->writeold[index];
+  *address = record->addr;
+  *size = record->size;
+  *old_bytes = m->writeoldbytes + record->oldoffset;
+  *old_size = record->oldsize;
+  *truncated = record->truncated;
+  return true;
+}
+
 bool blinkenlib_get_instruction_at(u64 virtual_address, u64 *address, u8 *size,
                                    char *buffer, u32 buffer_size) {
   struct Dis one = {true};
@@ -698,6 +824,20 @@ bool blinkenlib_get_instruction_at(u64 virtual_address, u64 *address, u8 *size,
   line = DisGetLine(&one, m, 0);
   snprintf(buffer, buffer_size, "%s", line ? line : "");
   DisFree(&one);
+  return true;
+}
+
+bool blinkenlib_resolve_symbol(u64 virtual_address, u64 *symbol_address,
+                               char *buffer, u32 buffer_size) {
+  long symbol;
+  if (buffer && buffer_size) buffer[0] = 0;
+  if (!m || !debugger_enabled || !symbol_address || !buffer || !buffer_size) {
+    return false;
+  }
+  symbol = DisFindSym(dis, virtual_address);
+  if (symbol == -1) return false;
+  *symbol_address = dis->syms.p[symbol].addr;
+  snprintf(buffer, buffer_size, "%s", dis->syms.p[symbol].name);
   return true;
 }
 

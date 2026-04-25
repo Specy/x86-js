@@ -4,7 +4,14 @@ import { assemblers, DEFAULT_ASSEMBLER_ID, type AssemblerId, type AssemblerMode 
 import { readResourceBytes } from './resources'
 import { parseSourceMap, type SourceMap } from './source-map'
 import { BlinkState, type StopReason, type X86CompileResult } from './types'
-import type { BlinkenlibModule, DisassemblySnapshot, NativeInstruction, RegisterSnapshot } from './wasm-types'
+import type {
+    BlinkenlibModule,
+    DisassemblySnapshot,
+    NativeInstruction,
+    NativeStepInfo,
+    NativeSymbol,
+    RegisterSnapshot,
+} from './wasm-types'
 
 const SIGNALS = {
     SIGTRAP: 5,
@@ -261,6 +268,14 @@ export class BlinkRuntime {
         }
     }
 
+    setFlags(flags: bigint | number): void {
+        this.module.blinkenlibSetFlags(Number(flags) >>> 0)
+    }
+
+    setStepRecording(enabled: boolean): void {
+        this.module.blinkenlibSetStepRecording(enabled)
+    }
+
     getPc(): bigint {
         return this.getRegisterSnapshot().pc
     }
@@ -279,6 +294,14 @@ export class BlinkRuntime {
 
     getInstructionAt(address: bigint): NativeInstruction | null {
         return this.module.blinkenlibGetInstructionAt(address)
+    }
+
+    getLastStepInfo(): NativeStepInfo {
+        return this.module.blinkenlibGetLastStepInfo()
+    }
+
+    resolveSymbol(address: bigint): NativeSymbol | null {
+        return this.module.blinkenlibResolveSymbol(address)
     }
 
     getSourceLineForAddress(address: bigint): number | null {
@@ -312,6 +335,17 @@ export class BlinkRuntime {
             executedInstructions,
         }
         this.setState(BlinkState.ProgramPaused)
+    }
+
+    resumeAfterStateMutation(): void {
+        this.stopReason = null
+        if (
+            this.state === BlinkState.ProgramStopped ||
+            this.state === BlinkState.ProgramPaused ||
+            this.state === BlinkState.ProgramReadlinePause
+        ) {
+            this.setState(BlinkState.ProgramRunning)
+        }
     }
 
     private startProgram(method: '_blinkenlib_run' | '_blinkenlib_start' | '_blinkenlib_starti'): void {

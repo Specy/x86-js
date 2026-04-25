@@ -103,6 +103,7 @@ static void PushN(P, u64 x, unsigned mode, unsigned osz) {
     default:
       __builtin_unreachable();
   }
+  SetWriteAddr(m, v, osz);
   w = AccessRam(m, v, osz, p, b, false);
   WriteStackWord(w, rde, osz, x);
   EndStore(m, v, osz, p, b);

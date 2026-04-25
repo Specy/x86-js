@@ -57,15 +57,53 @@ const result = await emulator.checkCode(sourceCode)
 ### Read registers and memory
 
 ```ts
-const rax = emulator.getRegister('rax')
-const bytes = emulator.readMemory(address, length)
+const rax = emulator.getRegisterValue('rax')
+const bytes = emulator.readMemoryBytes(address, length)
 ```
 
-### Undo
+### Undo history and call stack
+
+Undo recording is opt-in. Call `initialize(undoSize)` after loading or compiling a program and before execution. `undoSize` is the maximum number of reversible instructions kept in history; internally this is a fixed-size circular buffer, so older entries are discarded when the buffer fills.
 
 ```ts
-if (emulator.canUndo()) emulator.undo()
+const result = await emulator.compile(sourceCode)
+if (!result.ok) throw new Error(result.errors[0]?.error ?? 'Assembly failed')
+
+// Keep the last 128 reversible instructions.
+emulator.initialize(128)
+
+await emulator.step()
+await emulator.step()
+
+const [latestStep] = emulator.getUndoHistory(1)
+console.log(latestStep?.pc, latestStep?.mutations)
+
+if (emulator.canUndo()) {
+  emulator.undo()
+}
 ```
+
+History entries include register writes, memory writes, flag changes, and call-stack mutations. `getUndoHistory(max)` returns the newest entries first, as `ExecutionStep[]`, which is useful for instruction-history UIs.
+
+```ts
+for (const step of emulator.getUndoHistory(10)) {
+  console.log(step.pc, step.mutations)
+}
+```
+
+The call stack is tracked while history recording is enabled. Calls push frames and returns pop them; undo restores the previous call-stack snapshot along with registers, flags, PC, SP, and captured memory bytes.
+
+```ts
+emulator.initialize(64)
+await emulator.run(20)
+
+const frames = emulator.getCallStack()
+console.log(frames.map((frame) => frame.name))
+```
+
+When history is enabled, `run()` uses traced stepping so each executed instruction can be undone. If history is disabled with `initialize(0)` or by never calling `initialize`, normal fast execution remains available and `canUndo()` returns `false`.
+
+Very large or truncated memory writes may not be reversible. In that case `canUndo()` returns `false` for the latest step, and calling `undo()` throws instead of restoring a partial state.
 
 ### Events
 
@@ -76,10 +114,3 @@ emulator.on('stderr',      (charCode) => { /* ... */ })
 emulator.on('signal',      (signal)   => { /* ... */ })
 emulator.on('inputRequest', ()        => { /* ... */ })
 ```
-
-## Current Shims
-
-These API points are present but intentionally minimal while the C++ facade grows dedicated support:
-
-- Undo history is empty and `canUndo()` always returns `false`.
-- Call stack inspection returns an empty list.

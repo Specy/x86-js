@@ -67,6 +67,14 @@ val GetRegisterSnapshot() {
   return result;
 }
 
+void SetFlags(uint32_t flags) {
+  blinkenlib_set_flags(flags);
+}
+
+void SetStepRecording(bool enabled) {
+  blinkenlib_set_step_recording(enabled);
+}
+
 val ReadMemoryBytes(uint64_t address, uint32_t length) {
   val result = val::object();
   val bytes = val::array();
@@ -126,6 +134,17 @@ const char *StopKindName(uint32_t kind) {
   }
 }
 
+const char *ControlFlowName(uint32_t kind) {
+  switch (kind) {
+    case BLINKENLIB_CONTROL_FLOW_CALL:
+      return "call";
+    case BLINKENLIB_CONTROL_FLOW_RETURN:
+      return "return";
+    default:
+      return "none";
+  }
+}
+
 void SetRunControls(uint64_t limit, val breakpointAddresses) {
   blinkenlib_set_run_instruction_limit(limit);
   blinkenlib_clear_run_breakpoints();
@@ -157,6 +176,50 @@ val GetRunControls() {
   return result;
 }
 
+val GetLastStepInfo() {
+  blinkenlib_step_info info;
+  val result = val::object();
+  val memoryWrites = val::array();
+  if (!blinkenlib_get_last_step_info(&info)) {
+    result.set("valid", false);
+    result.set("memoryWrites", memoryWrites);
+    return result;
+  }
+  result.set("valid", true);
+  result.set("pcBefore", info.pc_before);
+  result.set("pcAfter", info.pc_after);
+  result.set("spBefore", info.sp_before);
+  result.set("spAfter", info.sp_after);
+  result.set("flagsBefore", info.flags_before);
+  result.set("flagsAfter", info.flags_after);
+  result.set("controlFlow", ControlFlowName(info.control_flow));
+  result.set("truncatedMemoryWrites", info.memory_truncated);
+  for (uint32_t index = 0; index < info.memory_write_count; ++index) {
+    uint64_t address = 0;
+    uint32_t size = 0;
+    const uint8_t *oldBytes = nullptr;
+    uint32_t oldSize = 0;
+    bool truncated = false;
+    if (!blinkenlib_get_last_step_memory_write(index, &address, &size,
+                                               &oldBytes, &oldSize,
+                                               &truncated)) {
+      continue;
+    }
+    val write = val::object();
+    val old = val::array();
+    for (uint32_t byteIndex = 0; byteIndex < oldSize; ++byteIndex) {
+      old.set(byteIndex, oldBytes[byteIndex]);
+    }
+    write.set("address", address);
+    write.set("size", size);
+    write.set("old", old);
+    write.set("truncated", truncated);
+    memoryWrites.set(index, write);
+  }
+  result.set("memoryWrites", memoryWrites);
+  return result;
+}
+
 val GetInstructionAt(uint64_t address) {
   uint64_t resolvedAddress = 0;
   uint8_t size = 0;
@@ -172,6 +235,19 @@ val GetInstructionAt(uint64_t address) {
   return result;
 }
 
+val ResolveSymbol(uint64_t address) {
+  uint64_t symbolAddress = 0;
+  char buffer[1024];
+  if (!blinkenlib_resolve_symbol(address, &symbolAddress, buffer,
+                                 sizeof(buffer))) {
+    return val::null();
+  }
+  val result = val::object();
+  result.set("address", symbolAddress);
+  result.set("name", std::string(buffer));
+  return result;
+}
+
 void SetEmulationArgs(const std::string &progname, const std::string &argc,
                       const std::string &argv) {
   blinkenlib_set_program_args(progname.c_str(), argc.c_str(), argv.c_str());
@@ -182,6 +258,8 @@ void SetEmulationArgs(const std::string &progname, const std::string &argc,
 EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
   emscripten::function("blinkenlibGetRegister", &GetRegister);
   emscripten::function("blinkenlibSetRegister", &SetRegister);
+  emscripten::function("blinkenlibSetFlags", &SetFlags);
+  emscripten::function("blinkenlibSetStepRecording", &SetStepRecording);
   emscripten::function("blinkenlibGetRegisterSnapshot", &GetRegisterSnapshot);
   emscripten::function("blinkenlibReadMemoryBytes", &ReadMemoryBytes);
   emscripten::function("blinkenlibWriteMemoryBytes", &WriteMemoryBytes);
@@ -189,7 +267,9 @@ EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
   emscripten::function("blinkenlibSetRunControls", &SetRunControls);
   emscripten::function("blinkenlibGetRunControls", &GetRunControls);
   emscripten::function("blinkenlibGetRunStop", &GetRunStop);
+  emscripten::function("blinkenlibGetLastStepInfo", &GetLastStepInfo);
   emscripten::function("blinkenlibGetInstructionAt", &GetInstructionAt);
+  emscripten::function("blinkenlibResolveSymbol", &ResolveSymbol);
   emscripten::function("blinkenlibSetEmulationArgs", &SetEmulationArgs);
   emscripten::function("blinkenlibGetInputMaxBytes",
                        &blinkenlib_get_input_max_bytes);

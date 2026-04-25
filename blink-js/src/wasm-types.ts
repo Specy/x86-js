@@ -47,6 +47,38 @@ export type NativeRunControls = {
     breakpoints: bigint[]
 }
 
+export type NativeControlFlowKind = 'none' | 'call' | 'return'
+
+export type NativeMemoryWrite = {
+    address: bigint
+    size: number
+    old: number[]
+    truncated: boolean
+}
+
+export type NativeStepInfo =
+    | {
+          valid: false
+          memoryWrites: NativeMemoryWrite[]
+      }
+    | {
+          valid: true
+          pcBefore: bigint
+          pcAfter: bigint
+          spBefore: bigint
+          spAfter: bigint
+          flagsBefore: number
+          flagsAfter: number
+          controlFlow: NativeControlFlowKind
+          truncatedMemoryWrites: boolean
+          memoryWrites: NativeMemoryWrite[]
+      }
+
+export type NativeSymbol = {
+    address: bigint
+    name: string
+}
+
 export type NativeInstruction = {
     address: bigint
     size: number
@@ -72,6 +104,8 @@ export type BlinkenlibModule = {
     _blinkenlib_faketty_resume(): void
     blinkenlibGetRegister(register: X86RegisterName): bigint
     blinkenlibSetRegister(register: X86RegisterName, value: bigint): boolean
+    blinkenlibSetFlags(flags: number): void
+    blinkenlibSetStepRecording(enabled: boolean): void
     blinkenlibGetRegisterSnapshot(): RegisterSnapshot
     blinkenlibReadMemoryBytes(address: bigint, length: number): MemoryReadResult
     blinkenlibWriteMemoryBytes(address: bigint, bytes: Uint8Array | number[]): MemoryWriteResult
@@ -81,5 +115,7 @@ export type BlinkenlibModule = {
     blinkenlibSetRunControls(limit: bigint, breakpointAddresses: string[]): void
     blinkenlibGetRunControls(): NativeRunControls
     blinkenlibGetRunStop(): NativeRunStop
+    blinkenlibGetLastStepInfo(): NativeStepInfo
     blinkenlibGetInstructionAt(address: bigint): NativeInstruction | null
+    blinkenlibResolveSymbol(address: bigint): NativeSymbol | null
 }
