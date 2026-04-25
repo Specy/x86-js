@@ -24,7 +24,7 @@ rm -f o//blink/blinkenlib.js o//blink/blinkenlib.wasm
 emmake make \
   CXX=em++ \
   'CXXFLAGS=-g -O2' \
-  'LDFLAGS=-sENVIRONMENT=web,node -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sEXIT_RUNTIME=0 -sWASM_BIGINT=1 -sEXPORT_ES6=1 -sMODULARIZE -sEXPORT_NAME="blinkenlib" -sEXPORTED_RUNTIME_METHODS=[UTF8ToString,stringToNewUTF8,AsciiToString,FS,callMain,addFunction,wasmExports] -lembind' \
+  'LDFLAGS=-O2 -sENVIRONMENT=web,node -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sEXIT_RUNTIME=0 -sWASM_BIGINT=1 -sEXPORT_ES6=1 -sMODULARIZE -sEXPORT_NAME="blinkenlib" -sEXPORTED_RUNTIME_METHODS=[UTF8ToString,stringToNewUTF8,AsciiToString,FS,callMain,addFunction,wasmExports] -lembind' \
   o//blink/blinkenlib.js
 
 

@@ -1,9 +1,8 @@
 {
-  "name": "blink-js",
+  "name": "@specy/x86",
   "type": "module",
-  "version": "0.1.0",
-  "private": true,
-  "description": "TypeScript API for the x86-64 playground WebAssembly emulator",
+  "version": "2.0.0",
+  "description": "X86 Emulator for JavaScript using Blink",
   "exports": {
     ".": "./dist/index.mjs",
     "./package.json": "./package.json"
