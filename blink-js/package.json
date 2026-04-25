@@ -1,10 +1,15 @@
 {
   "name": "@specy/x86",
   "type": "module",
-  "version": "2.0.1",
+  "version": "2.0.5",
   "description": "X86 Emulator for JavaScript using Blink",
+  "types": "./dist/index.d.mts",
   "exports": {
-    ".": "./dist/index.mjs",
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs",
+      "default": "./dist/index.mjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [

@@ -114,7 +114,7 @@ export function toHistoryPc(address: bigint): number {
 }
 
 export function makeFrameColor(index: number, address: bigint): string {
-    return `hsl(${(index + Number(address & 0xffn) * 137) % 360}, 40%, 60%)`
+    return `hsl(${(index * 137) % 360}, 40%, 60%)`
 }
 
 export function maskForSize(size: RegisterSize): bigint {

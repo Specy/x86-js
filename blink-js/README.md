@@ -1,11 +1,11 @@
-# blink-js
+# @specy/x86
 
 TypeScript wrapper around the [blink](https://github.com/jart/blink) x86-64 emulator, compiled to WebAssembly via Emscripten.
 
 ## Usage
 
 ```ts
-import { createX86Emulator } from 'blink-js'
+import { createX86Emulator } from '@specy/x86'
 
 const emulator = await createX86Emulator({
   callbacks: {
@@ -15,9 +15,8 @@ const emulator = await createX86Emulator({
 })
 
 const result = await emulator.compile(`
-.intel_syntax noprefix
-.global _start
-.text
+global _start
+section .text
 _start:
   mov rax, 60
   xor rdi, rdi
@@ -30,7 +29,7 @@ if (result.ok) {
 }
 ```
 
-`createX86Emulator()` initializes and awaits the wasm module internally; no wasm URL or byte buffer needs to be passed by the caller.
+`createX86Emulator()` initializes and awaits the wasm module internally; no wasm URL or byte buffer needs to be passed by the caller. NASM is the default assembler; pass `mode: 'GNU_trunk'` to use GNU as instead.
 
 ### Compile and run
 
@@ -45,7 +44,7 @@ await emulator.run(limit, breakpoints)
 await emulator.runUntilBlocked()
 ```
 
-`run(limit, breakpoints)` accepts an optional maximum instruction count and an array of 0-based source-line breakpoint indices. Breakpoints are resolved to native instruction addresses using the DWARF line information emitted by GNU as.
+`run(limit, breakpoints)` accepts an optional maximum instruction count and an array of 0-based source-line breakpoint indices. Breakpoints are resolved to native instruction addresses using the DWARF line information emitted by the assembler.
 
 ### Check code without running
 

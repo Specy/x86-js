@@ -191,6 +191,11 @@ export class BlinkRuntime {
         this.startProgram('_blinkenlib_starti')
     }
 
+    pauseAtEntry(): void {
+        this.starti()
+        if (this.state === BlinkState.ProgramRunning) this.setState(BlinkState.ProgramPaused)
+    }
+
     run(): void {
         this.startProgram('_blinkenlib_run')
     }

@@ -1,12 +1,38 @@
 import { describe, expect, it } from 'vitest'
 import { EmulatorStatus } from '../src/interface'
-import { createX86Emulator } from '../src/x86-emulator'
+import { createX86Emulator as createDefaultX86Emulator, type X86EmulatorOptions } from '../src/x86-emulator'
+
+const createX86Emulator = (options: X86EmulatorOptions = {}) =>
+  createDefaultX86Emulator({ ...options, mode: 'GNU_trunk' })
 
 describe('wasm runtime integration', () => {
     it('initializes the emulator runtime', async () => {
         const emulator = await createX86Emulator()
         expect(emulator.state).toBe('READY')
         emulator.dispose()
+    })
+
+    it('uses NASM by default and maps source lines at the entry point', async () => {
+      const emulator = await createDefaultX86Emulator()
+      const result = await emulator.compile([
+        'global _start',
+        'section .text',
+        '_start:',
+        '  mov rax, 60',
+        '  xor rdi, rdi',
+        '  syscall',
+      ].join('\n'))
+
+      expect(result.ok).toBe(true)
+      const firstInstruction = emulator.getNextInstruction()
+      expect(firstInstruction?.lineNumber).toBe(3)
+      expect(firstInstruction?.code).toContain('mov')
+
+      await emulator.step()
+      const nextInstruction = emulator.getNextInstruction()
+      expect(nextInstruction?.lineNumber).toBe(4)
+      expect(nextInstruction?.code).toContain('xor')
+      emulator.dispose()
     })
 
     it('compiles and runs an exit syscall program', async () => {

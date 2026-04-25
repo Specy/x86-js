@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { EmulatorStatus } from '../src/interface'
-import { createX86Emulator, type X86Emulator } from '../src/x86-emulator'
+import { createX86Emulator as createDefaultX86Emulator, type X86Emulator, type X86EmulatorOptions } from '../src/x86-emulator'
+
+const createX86Emulator = (options: X86EmulatorOptions = {}) =>
+  createDefaultX86Emulator({ ...options, mode: 'GNU_trunk' })
 
 async function stepUntil(emulator: X86Emulator, predicate: () => boolean, maxSteps = 100): Promise<void> {
     for (let step = 0; step < maxSteps && !predicate(); step += 1) {

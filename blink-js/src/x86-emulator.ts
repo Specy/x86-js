@@ -252,6 +252,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     getNextInstruction(): Instruction | null {
+        if (this.runtime.state === BlinkState.ProgramLoaded) this.runtime.pauseAtEntry()
         return this.getInstructionAt(this.getPc())
     }
 

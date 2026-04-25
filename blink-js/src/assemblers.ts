@@ -63,7 +63,7 @@ export const assemblers = {
         binaries: {
             assembler: {
                 file: assemblerAsset('nasm.3.00.elf'),
-                commands: '/assembler -felf64 /assembly.s -o /program.o',
+                commands: '/assembler -g -F dwarf -felf64 /assembly.s -o /program.o',
             },
             linker: {
                 file: assemblerAsset('gnu-ld.2.43.50.elf'),
@@ -75,7 +75,7 @@ export const assemblers = {
 
 export type AssemblerId = keyof typeof assemblers
 
-export const DEFAULT_ASSEMBLER_ID: AssemblerId = 'GNU_trunk'
+export const DEFAULT_ASSEMBLER_ID: AssemblerId = 'NASM_trunk'
 
 export function nasmDiagnostics(str: string): DiagnosticLine[] {
     const diagnostics: DiagnosticLine[] = []
