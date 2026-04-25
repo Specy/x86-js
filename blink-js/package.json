@@ -1,0 +1,28 @@
+{
+  "name": "blink-js",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript API for the x86-64 playground WebAssembly emulator",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown && node scripts/copy-assets.mjs",
+    "build:wasm": "../compile_blink.sh",
+    "dev": "tsdown --watch",
+    "test": "vitest run",
+    "type-check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "rolldown-plugin-wasm": "^0.2.1",
+    "tsdown": "^0.21.7",
+    "typescript": "^6.0.2",
+    "vitest": "^3.0.0"
+  }
+}

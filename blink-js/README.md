@@ -38,12 +38,14 @@ The package imports `blinkenlib.wasm` through `rolldown-plugin-wasm` using the `
 Build from WSL:
 
 ```sh
+cd /mnt/c/Users/specy/Desktop/progetti/x86-64-playground
 ./compile_blink.sh
 ```
 
 Then run library checks:
 
 ```sh
+cd /mnt/c/Users/specy/Desktop/progetti/x86-64-playground/blink-js
 npm run type-check
 npm test
 npm run build
@@ -56,3 +58,9 @@ These API points are present but intentionally minimal while the C++ facade grow
 - Undo history is empty and `canUndo()` returns `false`.
 - Call stack inspection returns an empty list.
 - Virtual memory reads and writes are copied through the native facade and throw when the current emulator cannot map the requested guest address.
+
+## Execution Controls
+
+`compile()` and `checkCode()` are async and run the actual assembler/linker pipeline. `checkCode()` uses the current runtime, so it updates the loaded program just like `compile()`.
+
+`run(limit, breakpoints)` supports an optional instruction limit and source-line breakpoints. Breakpoints are 0-based source line indices at the public API layer; the runtime resolves them to native instruction addresses using debug line information from the compiled ELF. GNU as emits DWARF line data by default in this package. Assembler modes without source maps still support exact native instruction lookup, but source-line breakpoint resolution may not find addresses.
