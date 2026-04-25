@@ -114,3 +114,5 @@ emulator.on('stderr',      (charCode) => { /* ... */ })
 emulator.on('signal',      (signal)   => { /* ... */ })
 emulator.on('inputRequest', ()        => { /* ... */ })
 ```
+
+Callbacks passed to `createX86Emulator()` and handlers registered with `on()` may return either `void` or `Promise<void>`. Async callbacks are observed but not awaited by the emulator, so UI work can be scheduled without blocking execution. `stdin` remains synchronous because it is called directly by Emscripten's filesystem; for non-blocking UI input, listen for `inputRequest` and call `provideInput()` when the user submits text.

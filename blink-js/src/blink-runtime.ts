@@ -4,6 +4,7 @@ import { assemblers, DEFAULT_ASSEMBLER_ID, type AssemblerId, type AssemblerMode 
 import { readResourceBytes } from './resources'
 import { parseSourceMap, type SourceMap } from './source-map'
 import { BlinkState, type StopReason, type X86CompileResult } from './types'
+import { observeCallbackResult, type MaybePromise } from './callbacks'
 import type {
     BlinkenlibModule,
     DisassemblySnapshot,
@@ -47,11 +48,11 @@ const SIGNAL_INFO: Record<number, { name: string; description: string }> = {
 
 export type BlinkRuntimeCallbacks = {
     stdin?: () => number | null
-    stdout?: (charCode: number) => void
-    stderr?: (charCode: number) => void
-    signal?: (signal: number, code: number) => void
-    stateChange?: (state: BlinkState, oldState: BlinkState) => void
-    inputRequest?: (event: { maxBytes: bigint }) => void
+    stdout?: (charCode: number) => MaybePromise<void>
+    stderr?: (charCode: number) => MaybePromise<void>
+    signal?: (signal: number, code: number) => MaybePromise<void>
+    stateChange?: (state: BlinkState, oldState: BlinkState) => MaybePromise<void>
+    inputRequest?: (event: { maxBytes: bigint }) => MaybePromise<void>
 }
 
 export type BlinkRuntimeOptions = {
@@ -122,11 +123,11 @@ export class BlinkRuntime {
                     () => (runtime?.stdinBytes.length ? runtime.stdinBytes.pop() ?? null : callbacks.stdin()),
                     (charCode) => {
                         runtime?.collectAssemblerLog(charCode)
-                        callbacks.stdout(charCode)
+                        observeCallbackResult(callbacks.stdout(charCode))
                     },
                     (charCode) => {
                         runtime?.collectAssemblerLog(charCode)
-                        callbacks.stderr(charCode)
+                        observeCallbackResult(callbacks.stderr(charCode))
                     },
                 )
             },
@@ -402,7 +403,7 @@ export class BlinkRuntime {
                     : `Program terminated with Exit(${exitCode}) due to signal ${signal}`,
             }
             this.setState(BlinkState.ProgramStopped)
-            this.callbacks.signal(signal, code)
+            observeCallbackResult(this.callbacks.signal(signal, code))
             return
         }
 
@@ -419,7 +420,7 @@ export class BlinkRuntime {
                 details: 'program is waiting for input',
             }
             this.setState(BlinkState.ProgramReadlinePause)
-            this.callbacks.inputRequest({ maxBytes: this.getInputMaxBytes() })
+            observeCallbackResult(this.callbacks.inputRequest({ maxBytes: this.getInputMaxBytes() }))
         }
 
         if (code === SIGTRAP_CODES.BLINK_BREAKPOINT || code === SIGTRAP_CODES.BLINK_RUN_LIMIT) {
@@ -440,7 +441,7 @@ export class BlinkRuntime {
             this.setState(BlinkState.ProgramPaused)
         }
 
-        this.callbacks.signal(signal, code)
+        observeCallbackResult(this.callbacks.signal(signal, code))
     }
 
     private handleExit(code: number): void {
@@ -495,7 +496,7 @@ export class BlinkRuntime {
         if (this.state === state) return
         const oldState = this.state
         this.state = state
-        this.callbacks.stateChange(state, oldState)
+        observeCallbackResult(this.callbacks.stateChange(state, oldState))
         this.resolveStateWaiters(state)
     }
 

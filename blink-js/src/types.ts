@@ -1,3 +1,5 @@
+import type { MaybePromise } from './callbacks'
+
 export const X86_REGISTER_NAMES = [
     'rax',
     'rbx',
@@ -65,4 +67,4 @@ export type X86EmulatorEventName = keyof X86EmulatorEventMap
 
 export type X86EmulatorEventHandler<T extends X86EmulatorEventName> = (
     event: X86EmulatorEventMap[T],
-) => void
+) => MaybePromise<void>

@@ -115,6 +115,8 @@ emulator.on('signal',      (signal)   => { /* ... */ })
 emulator.on('inputRequest', ()        => { /* ... */ })
 ```
 
+Callbacks passed to `createX86Emulator()` and handlers registered with `on()` may return either `void` or `Promise<void>`. Async callbacks are observed but not awaited by the emulator, so UI work can be scheduled without blocking execution. `stdin` remains synchronous because it is called directly by Emscripten's filesystem; for non-blocking UI input, listen for `inputRequest` and call `provideInput()` when the user submits text.
+
 ## Building from Source
 
 Prerequisites: [Emscripten](https://emscripten.org/docs/getting_started/downloads.html), `make`. The build script must run inside WSL (or a Linux shell) because it invokes `emmake`.

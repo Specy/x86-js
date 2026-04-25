@@ -132,6 +132,44 @@ msg:
         emulator.dispose()
     })
 
+    it('accepts async stdout callbacks', async () => {
+        let stdout = ''
+        const pendingWrites: Promise<void>[] = []
+        const emulator = await createX86Emulator({
+            callbacks: {
+                stdout: (charCode) => {
+                    const pendingWrite = Promise.resolve().then(() => {
+                        stdout += String.fromCharCode(charCode)
+                    })
+                    pendingWrites.push(pendingWrite)
+                    return pendingWrite
+                },
+            },
+        })
+
+        const result = await emulator.compile(`
+.global _start
+.text
+_start:
+  mov $1, %rax
+  mov $1, %rdi
+  lea msg(%rip), %rsi
+  mov $3, %rdx
+  syscall
+  mov $60, %rax
+  xor %rdi, %rdi
+  syscall
+msg:
+  .ascii "ok\\n"
+`)
+
+        expect(result.ok).toBe(true)
+        await emulator.runUntilBlocked()
+        await Promise.all(pendingWrites)
+        expect(stdout).toContain('ok\n')
+        emulator.dispose()
+    })
+
     it('steps from a loaded program and exposes copied state snapshots', async () => {
         const emulator = await createX86Emulator()
         const result = await emulator.compile(`

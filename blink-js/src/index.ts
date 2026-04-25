@@ -1,5 +1,6 @@
 export * from './assemblers'
 export * from './blink-runtime'
+export * from './callbacks'
 export * from './interface'
 export * from './resources'
 export * from './types'

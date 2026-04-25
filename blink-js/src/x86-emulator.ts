@@ -41,6 +41,7 @@ import {
     type UndoMemoryWrite,
     type X86HistoryEntry,
 } from './x86-emulator-utils'
+import { observeCallbackResult } from './callbacks'
 
 export type X86EmulatorOptions = Omit<BlinkRuntimeOptions, 'callbacks' | 'mode'> & {
     mode?: AssemblerMode | AssemblerId
@@ -81,24 +82,29 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             callbacks: {
                 ...options.callbacks,
                 stdout: (charCode) => {
-                    options.callbacks?.stdout?.(charCode)
+                    const result = options.callbacks?.stdout?.(charCode)
                     emulator?.emit('stdout', charCode)
+                    return result
                 },
                 stderr: (charCode) => {
-                    options.callbacks?.stderr?.(charCode)
+                    const result = options.callbacks?.stderr?.(charCode)
                     emulator?.emit('stderr', charCode)
+                    return result
                 },
                 signal: (signal, code) => {
-                    options.callbacks?.signal?.(signal, code)
+                    const result = options.callbacks?.signal?.(signal, code)
                     emulator?.emit('signal', { signal, code })
+                    return result
                 },
                 stateChange: (state, oldState) => {
-                    options.callbacks?.stateChange?.(state, oldState)
+                    const result = options.callbacks?.stateChange?.(state, oldState)
                     emulator?.emit('stateChange', { state, oldState })
+                    return result
                 },
                 inputRequest: (event) => {
-                    options.callbacks?.inputRequest?.(event)
+                    const result = options.callbacks?.inputRequest?.(event)
                     emulator?.emit('inputRequest', event)
+                    return result
                 },
             },
         })
@@ -530,7 +536,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     private emit<T extends X86EmulatorEventName>(eventName: T, event: X86EmulatorEventMap[T]): void {
-        for (const handler of this.eventHandlers[eventName]) handler(event)
+        for (const handler of this.eventHandlers[eventName]) observeCallbackResult(handler(event))
     }
 }
 
