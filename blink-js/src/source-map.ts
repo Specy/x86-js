@@ -81,12 +81,12 @@ export function parseSourceMap(bytes: Uint8Array): SourceMap | null {
     return entries.length ? new SourceMap(entries) : null
 }
 
-type ElfSection = {
+export type ElfSection = {
     offset: number
     size: number
 }
 
-function findElfSection(bytes: Uint8Array, name: string): ElfSection | null {
+export function findElfSection(bytes: Uint8Array, name: string): ElfSection | null {
     if (bytes.length < 0x40) return null
     if (bytes[0] !== 0x7f || bytes[1] !== 0x45 || bytes[2] !== 0x4c || bytes[3] !== 0x46) return null
     if (bytes[4] !== 2 || bytes[5] !== 1) return null
@@ -313,13 +313,13 @@ function dwarfSourcePath(sourceFile: { name: string; directory?: string } | unde
     return `${sourceFile.directory.replace(/\/$/, '')}/${sourceFile.name}`
 }
 
-function readU64Number(view: DataView, offset: number): number {
+export function readU64Number(view: DataView, offset: number): number {
     const value = view.getBigUint64(offset, true)
     if (value > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER
     return Number(value)
 }
 
-function readNullTerminatedString(bytes: Uint8Array, offset: number, limit: number): [string, number] {
+export function readNullTerminatedString(bytes: Uint8Array, offset: number, limit: number): [string, number] {
     let end = offset
     while (end < limit && bytes[end] !== 0) end += 1
     const value = new TextDecoder().decode(bytes.subarray(offset, end))

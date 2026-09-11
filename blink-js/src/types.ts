@@ -1,3 +1,4 @@
+import type { DiagnosticSeverity } from './interface'
 import type { MaybePromise } from './callbacks'
 
 export const X86_REGISTER_NAMES = [
@@ -52,6 +53,10 @@ export type X86CompilationDiagnostic = {
     error: string
     /** Project-relative source path when compiling a virtual Project. */
     file?: string
+    /** A warning still assembles; only an error stops the build. */
+    severity: DiagnosticSeverity
+    /** The assembler's own name for the warning, such as `label-orphan`. */
+    warningClass?: string
 }
 
 export type X86ProjectFile = string | Uint8Array
@@ -69,9 +74,14 @@ export type X86SourceLocation = {
 
 export type X86Breakpoint = number | X86SourceLocation
 
+/**
+ * `diagnostics` carries everything the assembler said, warnings included - a
+ * successful build routinely has some, and they are the most useful thing it
+ * produces. `errors` is the subset that stopped the build.
+ */
 export type X86CompileResult =
-    | { ok: true; report: string }
-    | { ok: false; errors: X86CompilationDiagnostic[]; report: string }
+    | { ok: true; report: string; diagnostics: X86CompilationDiagnostic[] }
+    | { ok: false; errors: X86CompilationDiagnostic[]; report: string; diagnostics: X86CompilationDiagnostic[] }
 
 export type X86EmulatorEventMap = {
     stateChange: { state: BlinkState; oldState: BlinkState }

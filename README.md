@@ -156,6 +156,14 @@ Prerequisites: [Emscripten](https://emscripten.org/docs/getting_started/download
 
 This builds `libblink` with Emscripten and copies `blinkenlib.wasm` and `blinkenlib.js` into `blink-js/src/wasm/`.
 
+**1b. Compile NASM to wasm** (optional; only when changing NASM versions)
+
+```sh
+./compile_wasm_nasm.sh
+```
+
+The assemblers under `blink-js/src/assets/assemblers/` are x86-64 ELF binaries that blink interprets one instruction at a time.
+
 **2. Build and test the TypeScript package**
 
 ```sh

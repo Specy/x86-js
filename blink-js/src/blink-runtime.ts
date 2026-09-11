@@ -4,6 +4,7 @@ import { assemblers, DEFAULT_ASSEMBLER_ID, type AssemblerId, type AssemblerMode 
 import { readResourceBytes } from './resources'
 import { parseSourceMap, type SourceMap } from './source-map'
 import { stageX86Project, x86ProjectSourcePath } from './project'
+import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols } from './elf-symbols'
 import {
     BlinkState,
     type StopReason,
@@ -86,7 +87,10 @@ export class BlinkRuntime {
     state = BlinkState.NotReady
     stopReason: StopReason | null = null
     assemblerLogs = ''
+    /** The subset of `assemblerDiagnostics` that stopped the build. */
     assemblerErrors: X86CompilationDiagnostic[] = []
+    /** Everything the assembler said, warnings included. */
+    assemblerDiagnostics: X86CompilationDiagnostic[] = []
 
     private readonly callbacks: Required<BlinkRuntimeCallbacks>
     private readonly scheduler: (callback: () => void) => void
@@ -94,6 +98,8 @@ export class BlinkRuntime {
     private readonly stdinBytes: number[] = []
     private sourceMap: SourceMap | null = null
     private sourceProject: X86Project | null = null
+    private assembleOnly = false
+    private assembledObject: Uint8Array | null = null
 
     private readonly defaultArgc = '/program'
     private readonly defaultArgv = ''
@@ -161,7 +167,9 @@ export class BlinkRuntime {
         this.assemblerLogs = ''
         this.assemblerErrors = []
         this.setState(BlinkState.NotReady)
-        await this.writeExecutable('/assembler', await readResourceBytes(this.mode.binaries.assembler.file))
+        if (this.mode.binaries.assembler) {
+            await this.writeExecutable('/assembler', await readResourceBytes(this.mode.binaries.assembler.file))
+        }
         if (this.mode.binaries.linker) {
             await this.writeExecutable('/linker', await readResourceBytes(this.mode.binaries.linker.file))
         }
@@ -173,46 +181,197 @@ export class BlinkRuntime {
     }
 
     async compileProject(project: X86Project): Promise<X86CompileResult> {
+        return this.buildProject(project, { link: true })
+    }
+
+    /**
+     * Assembles without linking, for diagnostics. The linked executable is only
+     * needed to run or debug a program; a caller that just wants to know what is
+     * wrong with the source pays ~450ms for a link it never looks at.
+     *
+     * A mode with a `wasmAssembler` never touches blink here, so checking also
+     * leaves a loaded program - and anything paused in the debugger - alone.
+     */
+    async checkProject(project: X86Project): Promise<X86CompileResult> {
+        if (this.mode.wasmAssembler) return this.checkProjectWithWasmAssembler(project)
+        return this.buildProject(project, { link: false })
+    }
+
+    private async checkProjectWithWasmAssembler(project: X86Project): Promise<X86CompileResult> {
+        const sourceProject = copyX86Project(project)
+        const assembled = await this.mode.wasmAssembler!.assemble(sourceProject)
+        const report = assembled.stdout + assembled.stderr
+        const diagnostics = [
+            ...this.parseAssemblerDiagnostics(report, sourceProject),
+            ...this.entryPointDiagnostics(assembled.object, sourceProject),
+        ]
+        return toCompileResult(diagnostics, report)
+    }
+
+    private async buildProject(project: X86Project, options: { link: boolean }): Promise<X86CompileResult> {
         this.assertReadyForCompile()
-        const sourceProject: X86Project = {
-            entry: project.entry,
-            files: Object.fromEntries(
-                Object.entries(project.files).map(([path, contents]) => [
-                    path,
-                    contents instanceof Uint8Array ? contents.slice() : contents,
-                ]),
-            ),
-        }
-        stageX86Project(this.module.FS, sourceProject)
+        const sourceProject = copyX86Project(project)
         this.sourceProject = sourceProject
         this.stopReason = null
         this.assemblerLogs = ''
         this.assemblerErrors = []
+        this.assemblerDiagnostics = []
+        this.assembledObject = null
         this.sourceMap = null
-        this.setState(BlinkState.Assembling)
+        this.assembleOnly = !options.link
+
         try {
-            await defer()
-            this.setEmulationArgs('/assembler', this.mode.binaries.assembler.commands, '')
-            this.module._blinkenlib_run_fast()
-            await this.waitForState(
-                (state) => state !== BlinkState.Assembling && state !== BlinkState.Linking,
-            )
+            if (this.mode.wasmAssembler) {
+                await this.assembleWithWasmAssembler(sourceProject, options)
+            } else {
+                await this.assembleInBlink(sourceProject)
+            }
         } finally {
+            this.assembleOnly = false
             this.module.FS.chdir('/')
         }
 
-        if (this.state === BlinkState.ProgramLoaded) {
-            this.sourceMap = this.tryReadSourceMap()
-            return { ok: true, report: this.assemblerLogs }
-        }
-        return {
-            ok: false,
-            errors: this.assemblerErrors.map((error) => ({
-                ...error,
-                file: x86ProjectSourcePath(error.file, sourceProject),
+        const diagnostics = [
+            ...this.assemblerDiagnostics.map((diagnostic) => ({
+                ...diagnostic,
+                file: x86ProjectSourcePath(diagnostic.file, sourceProject),
             })),
-            report: this.assemblerLogs,
+            ...this.entryPointDiagnostics(this.takeAssembledObject(), sourceProject),
+        ]
+
+        if (this.state === BlinkState.ProgramLoaded) this.sourceMap = this.tryReadSourceMap()
+        return toCompileResult(diagnostics, this.assemblerLogs)
+    }
+
+    /**
+     * The object this build's assembler wrote, for the checks that read it
+     * rather than the assembler's own words. Null when the assembly failed, and
+     * when the assembler writes an executable directly and never produces one.
+     * Read once per build, so a previous build's object can never stand in for
+     * one that was never written.
+     */
+    private takeAssembledObject(): Uint8Array | null {
+        const object = this.assembledObject
+        this.assembledObject = null
+        return object
+    }
+
+    /**
+     * Nothing in the toolchain treats a missing entry point as a failure: NASM
+     * has no opinion on it and `ld` only warns, then starts the program at the
+     * top of its text segment, where it runs whatever happens to be first. That
+     * is the least explicable thing a program can do to someone learning, so it
+     * is reported as an error here and the mistake is usually a misspelling.
+     */
+    private entryPointDiagnostics(
+        object: Uint8Array | null,
+        sourceProject: X86Project,
+    ): X86CompilationDiagnostic[] {
+        if (!object || !this.mode.binaries.linker) return []
+        const globals = readDefinedGlobalSymbols(object)
+        if (globals.includes(DEFAULT_ENTRY_SYMBOL)) return []
+
+        const nearest = findNearestSymbol(DEFAULT_ENTRY_SYMBOL, globals)
+        const nearestHint = nearest
+            ? ` Did you mean \`${DEFAULT_ENTRY_SYMBOL}\` where you wrote \`${nearest}\`?`
+            : ''
+        const exportHint = globals.length
+            ? ''
+            : ` Defining the label is not enough on its own: \`global ${DEFAULT_ENTRY_SYMBOL}\` is what exports it.`
+
+        return [
+            {
+                line: 1,
+                file: sourceProject.entry,
+                severity: 'error',
+                warningClass: 'entry-point',
+                error:
+                    `no \`${DEFAULT_ENTRY_SYMBOL}\` to start from.` +
+                    `${nearestHint}${exportHint}`,
+            },
+        ]
+    }
+
+    private async assembleInBlink(sourceProject: X86Project): Promise<void> {
+        stageX86Project(this.module.FS, sourceProject)
+        this.setState(BlinkState.Assembling)
+        await defer()
+        this.setEmulationArgs('/assembler', this.mode.binaries.assembler!.commands, '')
+        this.module._blinkenlib_run_fast()
+        await this.waitForState(
+            (state) => state !== BlinkState.Assembling && state !== BlinkState.Linking,
+        )
+        if (this.assemblerErrors.length === 0) {
+            try {
+                this.assembledObject = this.module.FS.readFile('/program.o') as Uint8Array
+            } catch {
+                // An assembler that writes its executable directly, such as fasm,
+                // produces no object, and has no linker to need an entry symbol.
+            }
         }
+    }
+
+    /**
+     * Assembles outside blink and hands the object file to the linker inside it,
+     * which is where the state machine picks up again as if blink had produced
+     * the object itself.
+     */
+    private async assembleWithWasmAssembler(
+        sourceProject: X86Project,
+        options: { link: boolean },
+    ): Promise<void> {
+        this.setState(BlinkState.Assembling)
+        const assembled = await this.mode.wasmAssembler!.assemble(sourceProject)
+
+        // The assembler no longer writes through blink's stdout, so its output
+        // reaches the host's callbacks and the log the same way by hand.
+        this.emitAssemblerOutput(assembled.stdout, this.callbacks.stdout)
+        this.emitAssemblerOutput(assembled.stderr, this.callbacks.stderr)
+
+        this.collectAssemblerDiagnostics()
+        if (!assembled.object) {
+            this.setState(BlinkState.Ready)
+            return
+        }
+
+        if (!options.link) {
+            this.assembledObject = assembled.object
+            this.setState(BlinkState.Ready)
+            return
+        }
+
+        this.assembledObject = assembled.object
+        this.writeExecutableSync('/program.o', assembled.object)
+        this.setState(BlinkState.Linking)
+        await defer()
+        this.setEmulationArgs('/linker', this.mode.binaries.linker?.commands ?? '', '')
+        this.module._blinkenlib_run_fast()
+        await this.waitForState((state) => state !== BlinkState.Linking)
+    }
+
+    private collectAssemblerDiagnostics(): void {
+        this.assemblerDiagnostics = this.mode.diagnosticsParser?.(this.assemblerLogs) ?? []
+        this.assemblerErrors = this.assemblerDiagnostics.filter(
+            (diagnostic) => diagnostic.severity === 'error',
+        )
+    }
+
+    private emitAssemblerOutput(text: string, callback: (charCode: number) => MaybePromise<void>): void {
+        for (let index = 0; index < text.length; index += 1) {
+            const charCode = text.charCodeAt(index)
+            this.assemblerLogs += String.fromCharCode(charCode)
+            observeCallbackResult(callback(charCode))
+        }
+    }
+
+    private parseAssemblerDiagnostics(
+        report: string,
+        sourceProject: X86Project,
+    ): X86CompilationDiagnostic[] {
+        return (this.mode.diagnosticsParser?.(report) ?? []).map((error) => ({
+            ...error,
+            file: x86ProjectSourcePath(error.file, sourceProject),
+        }))
     }
 
     loadElf(data: ArrayBuffer | Uint8Array): void {
@@ -533,8 +692,16 @@ export class BlinkRuntime {
     }
 
     private handleAssemblerExit(code: number): void {
+        // Parsed either way: an assembler that succeeded still has warnings to
+        // report, and they are the ones nobody would otherwise see.
+        this.collectAssemblerDiagnostics()
         if (code !== 0) {
-            this.assemblerErrors = this.mode.diagnosticsParser?.(this.assemblerLogs) ?? []
+            this.setState(BlinkState.Ready)
+            return
+        }
+
+        // Checking wants the diagnostics, not a program to run.
+        if (this.assembleOnly) {
             this.setState(BlinkState.Ready)
             return
         }
@@ -648,4 +815,27 @@ function defaultScheduler(callback: () => void): void {
 
 function defer(): Promise<void> {
     return new Promise((resolve) => defaultScheduler(resolve))
+}
+
+/**
+ * A build succeeded when nothing in it was an error. Warnings ride along on both
+ * outcomes, because a program that assembles is exactly where they matter.
+ */
+function toCompileResult(diagnostics: X86CompilationDiagnostic[], report: string): X86CompileResult {
+    const errors = diagnostics.filter((diagnostic) => diagnostic.severity === 'error')
+    if (errors.length === 0) return { ok: true, report, diagnostics }
+    return { ok: false, errors, report, diagnostics }
+}
+
+/** Detaches a Project from the caller, who is free to mutate its own copy afterwards. */
+function copyX86Project(project: X86Project): X86Project {
+    return {
+        entry: project.entry,
+        files: Object.fromEntries(
+            Object.entries(project.files).map(([path, contents]) => [
+                path,
+                contents instanceof Uint8Array ? contents.slice() : contents,
+            ]),
+        ),
+    }
 }

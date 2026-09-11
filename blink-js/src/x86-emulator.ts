@@ -8,7 +8,7 @@ import {
     type MonacoError,
     type StackFrame,
 } from './interface'
-import { type AssemblerId, type AssemblerMode } from './assemblers'
+import { locateDiagnosticColumn, type AssemblerId, type AssemblerMode } from './assemblers'
 import { BlinkRuntime, type BlinkRuntimeCallbacks, type BlinkRuntimeOptions } from './blink-runtime'
 import {
     BlinkState,
@@ -196,23 +196,32 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.checkProject({ entry: 'assembly.s', files: { 'assembly.s': code } })
     }
 
+    /**
+     * Diagnostics only: this assembles but does not link, and for an assembler
+     * that runs as its own wasm module it does not touch blink at all, so a
+     * loaded or paused program survives a check.
+     */
     async checkProject(project: X86Project): Promise<MonacoError[]> {
-        const result = await this.compileProject(project)
-        const errors = result.ok === false ? result.errors : []
-        return errors.map((error) => {
-            const path = error.file ?? project.entry
-            const lineIndex = Math.max(0, error.line - 1)
+        // Warnings included: a program that assembles is where they matter, and
+        // dropping them here is what used to make them invisible.
+        const result = await this.runtime.checkProject(project)
+        return result.diagnostics.map((diagnostic) => {
+            const path = diagnostic.file ?? project.entry
+            const lineIndex = Math.max(0, diagnostic.line - 1)
             const lines = x86ProjectText(project, path).split(/\r?\n/)
+            const line = lines[lineIndex] ?? ''
             return {
                 file: path,
                 lineIndex,
-                column: 0,
+                column: locateDiagnosticColumn(diagnostic.error, line, diagnostic.warningClass),
                 line: {
-                    line: lines[lineIndex] ?? '',
+                    line,
                     line_index: lineIndex,
                 },
-                message: error.error,
-                formatted: error.error,
+                message: diagnostic.error,
+                formatted: diagnostic.error,
+                severity: diagnostic.severity,
+                ...(diagnostic.warningClass ? { code: diagnostic.warningClass } : {}),
             }
         })
     }

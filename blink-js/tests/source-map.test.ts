@@ -5,11 +5,13 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { parseSourceMap } from '../src/source-map'
+import { nasmWasmAssembler } from '../src/wasm-assembler'
 
+// NASM is no longer among these: it runs as a wasm module now, so the NASM case
+// below assembles in-process and only needs the linker as a native ELF.
 const assemblerTools = [
     fileURLToPath(new URL('../src/assets/assemblers/gnu-as.2.43.50.elf', import.meta.url)),
     fileURLToPath(new URL('../src/assets/assemblers/gnu-ld.2.43.50.elf', import.meta.url)),
-    fileURLToPath(new URL('../src/assets/assemblers/nasm.3.00.elf', import.meta.url)),
 ]
 const runElfToolTests = process.platform === 'linux' && assemblerTools.every((path) => {
     try {
@@ -44,24 +46,32 @@ describe.skipIf(!runElfToolTests)('source map parser', () => {
         }
     })
 
-    it('parses NASM DWARF line rows from a linked ELF', () => {
+    it('parses NASM DWARF line rows from a linked ELF', async () => {
         const tempDir = mkdtempSync(join(tmpdir(), 'x86-js-source-map-'))
         try {
-            const sourcePath = join(tempDir, 'assembly.s')
             const objectPath = join(tempDir, 'program.o')
             const programPath = join(tempDir, 'program')
-            writeFileSync(sourcePath, [
-                'global _start',
-                'section .text',
-                '_start:',
-                '  mov rax, 60',
-                '  xor rdi, rdi',
-                '  syscall',
-            ].join('\n'))
 
-            const assemblerPath = fileURLToPath(new URL('../src/assets/assemblers/nasm.3.00.elf', import.meta.url))
+            // The wasm assembler emits the object the linker consumes, which is
+            // the pipeline the emulator now runs: NASM outside blink, ld inside.
+            const assembled = await nasmWasmAssembler.assemble({
+                entry: 'assembly.s',
+                files: {
+                    'assembly.s': [
+                        'global _start',
+                        'section .text',
+                        '_start:',
+                        '  mov rax, 60',
+                        '  xor rdi, rdi',
+                        '  syscall',
+                    ].join('\n'),
+                },
+            })
+            expect(assembled.status).toBe(0)
+            expect(assembled.object).not.toBeNull()
+            writeFileSync(objectPath, assembled.object!)
+
             const linkerPath = fileURLToPath(new URL('../src/assets/assemblers/gnu-ld.2.43.50.elf', import.meta.url))
-            execFileSync(assemblerPath, ['-g', '-F', 'dwarf', '-felf64', sourcePath, '-o', objectPath])
             execFileSync(linkerPath, [objectPath, '-o', programPath])
 
             const sourceMap = parseSourceMap(readFileSync(programPath))

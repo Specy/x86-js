@@ -1,0 +1,49 @@
+Build fixes for cross-compiling NASM 3.00 to wasm32 with Emscripten.
+
+Both hunks only ever matter off x86: a native build takes the X86_MEMORY
+branch in bytesex.h, so neither line below is compiled and neither problem
+is visible upstream.
+
+1. include/bytesex.h - getu32() calls l32toh(), which is not defined
+   anywhere in NASM or in any libc; the name is a typo for le32toh(). The
+   two siblings on either side of it (getu16, getu64) call le16toh and
+   le64toh, so the intent is unambiguous. This is an upstream bug and the
+   fix is worth sending to the NASM maintainers.
+
+2. include/compiler.h - wasm32 is little-endian and permits unaligned
+   loads and stores on every memory instruction (the alignment immediate
+   is a hint, not a constraint), which is exactly the contract X86_MEMORY
+   describes. Claiming it lets NASM use direct unaligned accesses instead
+   of the packed-struct fallback, and sidesteps hunk 1 in the bargain.
+
+--- a/include/bytesex.h
++++ b/include/bytesex.h
+@@ -215,7 +215,7 @@
+ } __attribute__((packed));
+ static inline uint32_t getu32(const void *p)
+ {
+-    return l32toh(((const struct unaligned32 *)p)->v);
++    return le32toh(((const struct unaligned32 *)p)->v);
+ }
+ static inline uint32_t setu32(void *p, uint32_t v)
+ {
+@@ -253,7 +253,7 @@
+ static inline uint32_t getu32(const void *p)
+ {
+     const uint32_t _unaligned *pp = p;
+-    return l32toh(*pp);
++    return le32toh(*pp);
+ }
+ static inline uint32_t setu32(void *p, uint32_t v)
+ {
+--- a/include/compiler.h
++++ b/include/compiler.h
+@@ -147,7 +147,7 @@
+  * is safe to leave it defined to 0 even if that is true.
+  */
+ #if defined(__386__) || defined(__i386__) || defined(__x86_64__) \
+-    || defined(_M_IX86) || defined(_M_X64)
++    || defined(_M_IX86) || defined(_M_X64) || defined(__wasm__)
+ # define X86_MEMORY 1
+ # undef WORDS_BIGENDIAN
+ # undef WORDS_LITTLEENDIAN

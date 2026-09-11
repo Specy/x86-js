@@ -3,6 +3,8 @@ export type StatusRegister = {
     value: number
     prev: number
 }
+export type DiagnosticSeverity = 'error' | 'warning'
+
 export type MonacoError = {
     /** Project-relative source path when checking a virtual Project. */
     file?: string
@@ -14,6 +16,12 @@ export type MonacoError = {
     }
     message: string
     formatted: string
+    /** A warning still assembles; only an error stops the build. Absent means error. */
+    severity?: DiagnosticSeverity
+    /** The assembler's own name for the warning, such as `label-orphan`. */
+    code?: string
+    /** Help beyond what the assembler said, when this diagnostic has a known explanation. */
+    hint?: string
 }
 
 export type StackFrame = {
