@@ -52,7 +52,15 @@ export const nasmWasmAssembler: WasmAssembler = {
         })
 
         stageX86Project(module.FS, project)
+
+        // Emscripten's Node path sets `process.exitCode` from the status the
+        // module exits with, so an assembly that failed would leave the host
+        // process exiting non-zero for a reason of its own. NASM's status is a
+        // value this function returns, never the host's to inherit.
+        const host = (globalThis as { process?: { exitCode?: number | string | undefined } }).process
+        const hostExitCode = host?.exitCode
         const status = module.callMain([...NASM_ARGS])
+        if (host) host.exitCode = hostExitCode
 
         // NASM writes no object at all when it fails, and an instance is never
         // reused, so an existing file can only be the one this run produced.

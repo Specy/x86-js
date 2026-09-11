@@ -117,3 +117,20 @@ describe('nasm as a wasm module', () => {
         expect(Buffer.from(second.object!)).toEqual(Buffer.from(first.object!))
     })
 })
+
+describe('the host process', () => {
+    it('does not inherit the exit status of a failed assembly', async () => {
+        const before = process.exitCode
+
+        const { nasmWasmAssembler } = await import('../src/wasm-assembler')
+        const failed = await nasmWasmAssembler.assemble({
+            entry: 'assembly.s',
+            files: { 'assembly.s': 'bits 64\nsection .text\n  mov rax, nope nonsense' },
+        })
+
+        expect(failed.status).toBe(1)
+        // Emscripten sets process.exitCode from the module's status under Node,
+        // which would make a build that merely failed exit the whole process.
+        expect(process.exitCode).toBe(before)
+    })
+})
