@@ -3,6 +3,11 @@
   "type": "module",
   "version": "2.1.0",
   "description": "X86 Emulator for JavaScript using Blink",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Specy/x86-js.git",
+    "directory": "blink-js"
+  },
   "types": "./dist/index.d.mts",
   "exports": {
     ".": {
