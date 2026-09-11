@@ -1,0 +1,136 @@
+name: CD
+
+# This workflow publishes @specy/x86 to npm with trusted publishing (OIDC).
+#
+# IT CANNOT PUBLISH UNTIL the trusted publisher is registered on npmjs.com:
+# @specy/x86 -> Settings -> Trusted publisher -> GitHub Actions, repository
+# Specy/x86-js, workflow file cd.yml. The package has only ever been published
+# by hand, so until that is done the first tag will build everything and then
+# fail at the last step with no credential.
+#
+# Once registered, THIS FILE'S PATH AND FILENAME ARE LOAD-BEARING: they are
+# what npm matches against. Renaming or moving this workflow breaks
+# publishing, and the failure only shows up on the next release. Update the
+# package's trusted publisher settings on npmjs.com first if you must move it.
+
+on:
+  push:
+    tags:
+      # Release tags, e.g. v2.0.5. The tag must match the version in
+      # blink-js/package.json; the job below refuses to publish otherwise.
+      - v*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Tag refs are unique and this job publishes, so never cancel a run.
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish @specy/x86 to npm
+    # Only the repository owner can cut a release. A tag pushed by anyone else
+    # skips this job rather than failing it, so it never reaches the step that
+    # requests an OIDC token. Note that a skipped job is reported as a green
+    # run, so a tag pushed by someone else publishes nothing and says nothing.
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Lets GitHub mint the short-lived OIDC token that npm trades for a
+      # publish credential. Without this, trusted publishing cannot work.
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          # Full history, so the guard below can prove the tag is on the
+          # default branch.
+          fetch-depth: 0
+
+      # Tags are not branches: a tag can point at any commit, including one
+      # that was never reviewed or merged. Releasing only what the default
+      # branch contains keeps a side branch from being published.
+      - name: Verify tag is on the default branch
+        env:
+          # Read from the repository rather than hardcoded, so this works
+          # whether the default branch is libblink, main or master, and
+          # survives a rename.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags --quiet origin "$DEFAULT_BRANCH"
+          # FETCH_HEAD is what the fetch above just wrote; the remote-tracking
+          # ref is not reliably populated in a tag checkout.
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "Tag $GITHUB_REF_NAME points at a commit that is not on $DEFAULT_BRANCH; refusing to publish." >&2
+            exit 1
+          fi
+          echo "Tag $GITHUB_REF_NAME is contained in $DEFAULT_BRANCH"
+
+      # Second, and before anything is installed or built: a mistyped tag
+      # should cost seconds. The runner image's preinstalled node is enough to
+      # read a manifest, so this runs before actions/setup-node. POSIX test
+      # rather than bash's [[ ]], which would report "command not found" - and
+      # so read as false, letting a mismatched tag through - if this step ever
+      # ran under a plain sh.
+      - name: Verify tag matches package version
+        working-directory: blink-js
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          manifest="$(node -p "require('./package.json').version")"
+          if [ "$tagged" != "$manifest" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $manifest" >&2
+            exit 1
+          fi
+          echo "Publishing @specy/x86 $manifest"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          # npm >= 11.5.1 and Node >= 22.14.0 are required for trusted
+          # publishing; Node 24 ships a new enough npm.
+          node-version: 24
+          # Deliberately no registry-url: it makes setup-node write an .npmrc
+          # containing `_authToken=${NODE_AUTH_TOKEN}`. With no token set, npm
+          # sends an empty credential, considers itself authenticated, and so
+          # never performs the OIDC exchange - which fails the publish with a
+          # misleading 404. npm defaults to registry.npmjs.org anyway.
+          cache: npm
+          cache-dependency-path: blink-js/package-lock.json
+
+      - name: Install dependencies
+        working-directory: blink-js
+        run: npm ci
+
+      - name: Type-check
+        working-directory: blink-js
+        run: npm run type-check
+
+      - name: Run tests
+        working-directory: blink-js
+        run: npm test
+
+      # dist/ is generated and never committed (see blink-js/.gitignore), so
+      # what gets published is always bundled from the tagged sources rather
+      # than from whatever a working tree happened to contain. The wasm and the
+      # assembler ELFs it inlines and copies are the committed ones: this
+      # publishes the binaries that are in the tag, it does not rebuild them.
+      - name: Build the library
+        working-directory: blink-js
+        run: npm run build
+
+      - name: Run smoke test
+        working-directory: blink-js
+        run: npm run test:dist
+
+      # No NODE_AUTH_TOKEN: npm detects the OIDC environment and exchanges it
+      # for a short-lived, run-scoped credential. Provenance attestations are
+      # generated automatically for public packages, so --provenance is not
+      # passed explicitly. What lands in the tarball is the "files" allowlist
+      # in blink-js/package.json, not whatever .gitignore happens to say.
+      - name: Publish to npm
+        working-directory: blink-js
+        run: npm publish --access public

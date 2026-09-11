@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      # libblink is this repository's default branch; main and master are
+      # listed so a rename does not silently stop running CI.
+      - libblink
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      # Node is the whole toolchain here, unlike the MARS, RARS and s68k
+      # repositories, which compile a simulator before they can build their
+      # wrapper. blinkenlib.wasm and the assembler ELFs are committed under
+      # blink-js/src, so a build only bundles TypeScript around artifacts that
+      # are already in the tree. Rebuilding those needs Emscripten (blink) and
+      # a musl cross toolchain (nasm, GNU as and ld), which is minutes of work
+      # for inputs that change a few times a year; `npm run build:wasm` and the
+      # compile_musl_*.sh scripts are run by hand when the C sources move, and
+      # the result is committed. This job therefore cannot catch a break in
+      # those, only in everything above them.
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: blink-js/package-lock.json
+
+      - name: Install dependencies
+        working-directory: blink-js
+        run: npm ci
+
+      # tsdown emits declarations but does not type-check the test files, and
+      # the tests are where the wrapper's public surface is actually used. This
+      # runs first because a type error is the cheapest failure to read.
+      - name: Type-check
+        working-directory: blink-js
+        run: npm run type-check
+
+      # The unit and runtime tests, against src/. vitest loads the wasm through
+      # the plugin in vitest.config.ts, so this covers the emulator itself:
+      # assembling, running, breakpoints, undo and the source map.
+      - name: Run tests
+        working-directory: blink-js
+        run: npm test
+
+      # Bundles src/ into dist/ the way a release would: rolldown inlines
+      # blinkenlib.wasm and scripts/copy-assets.mjs puts the assembler ELFs
+      # beside it.
+      - name: Build the library
+        working-directory: blink-js
+        run: npm run build
+
+      # Assembles and runs programs through the built dist/, which is the one
+      # thing the tests above cannot see: they never load the inlined wasm or
+      # the copied assets, so both can break with every src test still green.
+      - name: Run smoke test
+        working-directory: blink-js
+        run: npm run test:dist

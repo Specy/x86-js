@@ -20,6 +20,7 @@
     "build:wasm": "../compile_blink.sh",
     "dev": "tsdown --watch",
     "test": "vitest run",
+    "test:dist": "node tests/dist-smoke.mjs",
     "type-check": "tsc --noEmit"
   },
   "devDependencies": {
