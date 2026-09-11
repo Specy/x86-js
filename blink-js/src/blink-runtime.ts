@@ -3,7 +3,15 @@ import initBlinkWasm from './wasm/blinkenlib.wasm?init'
 import { assemblers, DEFAULT_ASSEMBLER_ID, type AssemblerId, type AssemblerMode } from './assemblers'
 import { readResourceBytes } from './resources'
 import { parseSourceMap, type SourceMap } from './source-map'
-import { BlinkState, type StopReason, type X86CompileResult } from './types'
+import { stageX86Project, x86ProjectSourcePath } from './project'
+import {
+    BlinkState,
+    type StopReason,
+    type X86CompilationDiagnostic,
+    type X86CompileResult,
+    type X86Project,
+    type X86SourceLocation,
+} from './types'
 import { observeCallbackResult, type MaybePromise } from './callbacks'
 import type {
     BlinkenlibModule,
@@ -78,13 +86,14 @@ export class BlinkRuntime {
     state = BlinkState.NotReady
     stopReason: StopReason | null = null
     assemblerLogs = ''
-    assemblerErrors: Array<{ line: number; error: string }> = []
+    assemblerErrors: X86CompilationDiagnostic[] = []
 
     private readonly callbacks: Required<BlinkRuntimeCallbacks>
     private readonly scheduler: (callback: () => void) => void
     private readonly stateWaiters: StateWaiter[] = []
     private readonly stdinBytes: number[] = []
     private sourceMap: SourceMap | null = null
+    private sourceProject: X86Project | null = null
 
     private readonly defaultArgc = '/program'
     private readonly defaultArgv = ''
@@ -160,23 +169,50 @@ export class BlinkRuntime {
     }
 
     async compileAssembly(code: string): Promise<X86CompileResult> {
+        return this.compileProject({ entry: 'assembly.s', files: { 'assembly.s': code } })
+    }
+
+    async compileProject(project: X86Project): Promise<X86CompileResult> {
         this.assertReadyForCompile()
+        const sourceProject: X86Project = {
+            entry: project.entry,
+            files: Object.fromEntries(
+                Object.entries(project.files).map(([path, contents]) => [
+                    path,
+                    contents instanceof Uint8Array ? contents.slice() : contents,
+                ]),
+            ),
+        }
+        stageX86Project(this.module.FS, sourceProject)
+        this.sourceProject = sourceProject
         this.stopReason = null
         this.assemblerLogs = ''
         this.assemblerErrors = []
         this.sourceMap = null
-        this.module.FS.writeFile('/assembly.s', code)
         this.setState(BlinkState.Assembling)
-        await defer()
-        this.setEmulationArgs('/assembler', this.mode.binaries.assembler.commands, '')
-        this.module._blinkenlib_run_fast()
-        await this.waitForState((state) => state !== BlinkState.Assembling && state !== BlinkState.Linking)
+        try {
+            await defer()
+            this.setEmulationArgs('/assembler', this.mode.binaries.assembler.commands, '')
+            this.module._blinkenlib_run_fast()
+            await this.waitForState(
+                (state) => state !== BlinkState.Assembling && state !== BlinkState.Linking,
+            )
+        } finally {
+            this.module.FS.chdir('/')
+        }
 
         if (this.state === BlinkState.ProgramLoaded) {
             this.sourceMap = this.tryReadSourceMap()
             return { ok: true, report: this.assemblerLogs }
         }
-        return { ok: false, errors: this.assemblerErrors, report: this.assemblerLogs }
+        return {
+            ok: false,
+            errors: this.assemblerErrors.map((error) => ({
+                ...error,
+                file: x86ProjectSourcePath(error.file, sourceProject),
+            })),
+            report: this.assemblerLogs,
+        }
     }
 
     loadElf(data: ArrayBuffer | Uint8Array): void {
@@ -184,6 +220,7 @@ export class BlinkRuntime {
         this.writeExecutableSync('/program', data instanceof Uint8Array ? data : new Uint8Array(data))
         this.stopReason = null
         this.sourceMap = null
+        this.sourceProject = null
         this.setState(BlinkState.ProgramLoaded)
     }
 
@@ -311,33 +348,59 @@ export class BlinkRuntime {
     }
 
     getSourceLineForAddress(address: bigint): number | null {
-        return this.sourceMap?.getLineIndex(address) ?? null
+        return this.getSourceLocationForAddress(address)?.line ?? null
+    }
+
+    getSourceLocationForAddress(address: bigint): X86SourceLocation | null {
+        const location = this.sourceMap?.getLocation(address)
+        if (!location) return null
+        return {
+            path: this.sourceProject
+                ? x86ProjectSourcePath(location.file, this.sourceProject)
+                : (location.file ?? 'assembly.s'),
+            line: location.lineIndex,
+        }
     }
 
     getAddressesForSourceLine(lineIndex: number): bigint[] {
         return this.sourceMap?.getAddressesForLine(lineIndex) ?? []
     }
 
-    pauseForBreakpoint(address: bigint, lineNumber: number | undefined): void {
+    getAddressesForSourceLocation(location: X86SourceLocation): bigint[] {
+        if (!this.sourceMap || !this.sourceProject) return []
+        return this.sourceMap.getAddressesMatching(
+            location.line,
+            (file) => x86ProjectSourcePath(file, this.sourceProject!) === location.path,
+        )
+    }
+
+    getSourceMappedAddresses(): bigint[] {
+        return this.sourceMap?.getAddresses() ?? []
+    }
+
+    pauseForBreakpoint(address: bigint, location: X86SourceLocation | undefined): void {
         this.stopReason = {
             loadFail: false,
             exitCode: 0,
             kind: 'breakpoint',
             details: `execution paused at breakpoint 0x${address.toString(16)}`,
             address,
-            lineNumber,
+            lineNumber: location?.line,
+            file: location?.path,
         }
         this.setState(BlinkState.ProgramPaused)
     }
 
     pauseForLimit(address: bigint, executedInstructions: bigint): void {
+        const location = this.getSourceLocationForAddress(address)
         this.stopReason = {
             loadFail: false,
             exitCode: 0,
             kind: 'limit',
             details: `execution paused after ${executedInstructions.toString()} instructions`,
             address,
-            lineNumber: this.getSourceLineForAddress(address) ?? undefined,
+            lineNumber: location?.line,
+            file: location?.path,
             executedInstructions,
         }
         this.setState(BlinkState.ProgramPaused)
@@ -430,7 +493,7 @@ export class BlinkRuntime {
 
         if (code === SIGTRAP_CODES.BLINK_BREAKPOINT || code === SIGTRAP_CODES.BLINK_RUN_LIMIT) {
             const stop = this.module.blinkenlibGetRunStop()
-            const lineNumber = this.getSourceLineForAddress(stop.address) ?? undefined
+            const location = this.getSourceLocationForAddress(stop.address)
             this.stopReason = {
                 loadFail: false,
                 exitCode: 0,
@@ -440,7 +503,8 @@ export class BlinkRuntime {
                         ? `execution paused after ${stop.executedInstructions.toString()} instructions`
                         : `execution paused at breakpoint 0x${stop.address.toString(16)}`,
                 address: stop.address,
-                lineNumber,
+                lineNumber: location?.line,
+                file: location?.path,
                 executedInstructions: stop.executedInstructions,
             }
             this.setState(BlinkState.ProgramPaused)

@@ -18,6 +18,10 @@ export class SourceMap {
     }
 
     getLineIndex(address: bigint): number | null {
+        return this.getLocation(address)?.lineIndex ?? null
+    }
+
+    getLocation(address: bigint): SourceMapEntry | null {
         let left = 0
         let right = this.entries.length - 1
         let match: SourceMapEntry | null = null
@@ -34,18 +38,37 @@ export class SourceMap {
             }
         }
 
-        return match?.lineIndex ?? null
+        return match ? { ...match } : null
     }
 
     getAddressesForLine(lineIndex: number): bigint[] {
+        return this.getAddressesForLocation(lineIndex)
+    }
+
+    getAddressesForLocation(lineIndex: number, file?: string): bigint[] {
+        return this.getAddressesMatching(lineIndex, (candidate) => file === undefined || candidate === file)
+    }
+
+    getAddressesMatching(lineIndex: number, matchesFile: (file: string | undefined) => boolean): bigint[] {
         const addresses: bigint[] = []
         const seen = new Set<string>()
         for (const entry of this.entries) {
-            if (entry.lineIndex !== lineIndex) continue
+            if (entry.lineIndex !== lineIndex || !matchesFile(entry.file)) continue
             const key = entry.address.toString()
             if (seen.has(key)) continue
             seen.add(key)
             addresses.push(entry.address)
+        }
+        return addresses
+    }
+
+    getAddresses(): bigint[] {
+        const addresses: bigint[] = []
+        let previous: bigint | undefined
+        for (const entry of this.entries) {
+            if (entry.address === previous) continue
+            addresses.push(entry.address)
+            previous = entry.address
         }
         return addresses
     }
@@ -174,7 +197,11 @@ function parseDebugLine(bytes: Uint8Array): SourceMapEntry[] {
 
         const addRow = () => {
             const sourceFile = files[file]
-            entries.push({ address, lineIndex: Math.max(0, line - 1), file: sourceFile?.name })
+            entries.push({
+                address,
+                lineIndex: Math.max(0, line - 1),
+                file: dwarfSourcePath(sourceFile),
+            })
         }
 
         const advanceAddress = (operationAdvance: number) => {
@@ -278,6 +305,12 @@ function parseDebugLine(bytes: Uint8Array): SourceMapEntry[] {
     }
 
     return entries
+}
+
+function dwarfSourcePath(sourceFile: { name: string; directory?: string } | undefined): string | undefined {
+    if (!sourceFile?.name) return undefined
+    if (!sourceFile.directory || sourceFile.name.startsWith('/')) return sourceFile.name
+    return `${sourceFile.directory.replace(/\/$/, '')}/${sourceFile.name}`
 }
 
 function readU64Number(view: DataView, offset: number): number {

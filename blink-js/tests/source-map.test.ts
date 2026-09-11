@@ -1,12 +1,24 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { parseSourceMap } from '../src/source-map'
 
-const runElfToolTests = process.platform === 'linux'
+const assemblerTools = [
+    fileURLToPath(new URL('../src/assets/assemblers/gnu-as.2.43.50.elf', import.meta.url)),
+    fileURLToPath(new URL('../src/assets/assemblers/gnu-ld.2.43.50.elf', import.meta.url)),
+    fileURLToPath(new URL('../src/assets/assemblers/nasm.3.00.elf', import.meta.url)),
+]
+const runElfToolTests = process.platform === 'linux' && assemblerTools.every((path) => {
+    try {
+        accessSync(path, constants.X_OK)
+        return true
+    } catch {
+        return false
+    }
+})
 const assemblyFixturePath = fileURLToPath(new URL('./fixtures/assembly.s', import.meta.url))
 
 describe.skipIf(!runElfToolTests)('source map parser', () => {
@@ -26,6 +38,7 @@ describe.skipIf(!runElfToolTests)('source map parser', () => {
             const sourceMap = parseSourceMap(readFileSync(programPath))
             expect(sourceMap?.getAddressesForLine(3).length).toBeGreaterThan(0)
             expect(sourceMap?.getAddressesForLine(4).length).toBeGreaterThan(0)
+            expect(sourceMap?.getLocation(sourceMap.getAddressesForLine(3)[0]!)?.file).toContain('assembly.s')
         } finally {
             rmSync(tempDir, { recursive: true, force: true })
         }

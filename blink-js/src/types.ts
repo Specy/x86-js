@@ -43,13 +43,31 @@ export type StopReason = {
     kind?: StopReasonKind
     address?: bigint
     lineNumber?: number
+    file?: string
     executedInstructions?: bigint
 }
 
 export type X86CompilationDiagnostic = {
     line: number
     error: string
+    /** Project-relative source path when compiling a virtual Project. */
+    file?: string
 }
+
+export type X86ProjectFile = string | Uint8Array
+
+export type X86Project = {
+    entry: string
+    files: Readonly<Record<string, X86ProjectFile>>
+}
+
+export type X86SourceLocation = {
+    path: string
+    /** Zero-based source line. */
+    line: number
+}
+
+export type X86Breakpoint = number | X86SourceLocation
 
 export type X86CompileResult =
     | { ok: true; report: string }

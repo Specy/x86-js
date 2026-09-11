@@ -6,6 +6,7 @@ export interface Binary {
 }
 
 export interface DiagnosticLine {
+    file?: string
     line: number
     error: string
 }
@@ -80,13 +81,14 @@ export const DEFAULT_ASSEMBLER_ID: AssemblerId = 'NASM_trunk'
 export function nasmDiagnostics(str: string): DiagnosticLine[] {
     const diagnostics: DiagnosticLine[] = []
     const lines = str.split(/\r?\n/)
-    const regex = /^.*:(\d+): (error|warning): (.*)$/
+    const regex = /^(.*):(\d+): (error|warning): (.*)$/
     for (const line of lines) {
         const match = line.match(regex)
         if (match) {
             diagnostics.push({
-                line: Number.parseInt(match[1] ?? '0', 10),
-                error: (match[3] ?? '').trim(),
+                file: match[1] || undefined,
+                line: Number.parseInt(match[2] ?? '0', 10),
+                error: (match[4] ?? '').trim(),
             })
         }
     }
@@ -96,13 +98,14 @@ export function nasmDiagnostics(str: string): DiagnosticLine[] {
 export function gnuDiagnostics(str: string): DiagnosticLine[] {
     const diagnostics: DiagnosticLine[] = []
     const lines = str.split('\n')
-    const regex = /\/assembly\.s:(\d+): (Error: .+)/
+    const regex = /^(.*):(\d+): (Error: .+)$/
     for (const line of lines) {
         const match = line.match(regex)
         if (match) {
             diagnostics.push({
-                line: Number.parseInt(match[1] ?? '0', 10),
-                error: match[2] ?? '',
+                file: match[1] || undefined,
+                line: Number.parseInt(match[2] ?? '0', 10),
+                error: match[3] ?? '',
             })
         }
     }
@@ -111,18 +114,23 @@ export function gnuDiagnostics(str: string): DiagnosticLine[] {
 
 export function fasmDiagnostics(str: string): DiagnosticLine[] {
     const diagnostics: DiagnosticLine[] = []
-    const lineRegex = /\/assembly\.s \[(\d+)\]:/
+    const lineRegex = /^(.*) \[(\d+)\]:/
     const errorRegex = /error: .+/
     const lines = str.split('\n')
     let lineNumber: number | null = null
+    let file: string | undefined
 
     for (const line of lines) {
         const lineMatch = line.match(lineRegex)
         const errorMatch = line.match(errorRegex)
-        if (lineMatch) lineNumber = Number.parseInt(lineMatch[1] ?? '0', 10)
+        if (lineMatch) {
+            file = lineMatch[1] || undefined
+            lineNumber = Number.parseInt(lineMatch[2] ?? '0', 10)
+        }
         if (errorMatch && lineNumber !== null) {
-            diagnostics.push({ line: lineNumber, error: errorMatch[0] })
+            diagnostics.push({ file, line: lineNumber, error: errorMatch[0] })
             lineNumber = null
+            file = undefined
         }
     }
     return diagnostics

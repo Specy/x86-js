@@ -35,6 +35,82 @@ describe('wasm runtime integration', () => {
       emulator.dispose()
     })
 
+    it('lets NASM resolve macro-generated Project includes and retains their source identity', async () => {
+      const emulator = await createDefaultX86Emulator()
+      const result = await emulator.compileProject({
+        entry: 'src/main.asm',
+        files: {
+          'src/main.asm': [
+            'bits 64',
+            'global _start',
+            'section .text',
+            '%define implementation "parts/exit.asm"',
+            '%include implementation',
+          ].join('\n'),
+          'src/parts/exit.asm': [
+            '_start:',
+            '  mov rax, 60',
+            '  xor rdi, rdi',
+            '  syscall',
+          ].join('\n'),
+        },
+      })
+
+      expect(result.ok).toBe(true)
+      expect(emulator.getNextInstruction()).toEqual(
+        expect.objectContaining({ file: 'src/parts/exit.asm', lineNumber: 1 }),
+      )
+      expect(emulator.getCompiledInstructions()).toContainEqual(
+        expect.objectContaining({
+          file: 'src/parts/exit.asm',
+          lineNumber: 1,
+          bytes: new Uint8Array([0xb8, 0x3c, 0, 0, 0]),
+        }),
+      )
+      expect(
+        await emulator.run(undefined, [{ path: 'src/parts/exit.asm', line: 2 }]),
+      ).toBe(EmulatorStatus.Running)
+      expect(emulator.stopReason).toEqual(
+        expect.objectContaining({ kind: 'breakpoint', file: 'src/parts/exit.asm', lineNumber: 2 }),
+      )
+      emulator.dispose()
+    })
+
+    it('attributes NASM Project diagnostics to an included source file', async () => {
+      const emulator = await createDefaultX86Emulator()
+      const diagnostics = await emulator.checkProject({
+        entry: 'main.asm',
+        files: {
+          'main.asm': '%include "lib.asm"',
+          'lib.asm': 'mov rax, nope nonsense',
+        },
+      })
+
+      expect(diagnostics).toContainEqual(
+        expect.objectContaining({ file: 'lib.asm', lineIndex: 0 }),
+      )
+      emulator.dispose()
+    })
+
+    it('removes staged Files that are absent from the next Project', async () => {
+      const emulator = await createDefaultX86Emulator()
+      const first = await emulator.compileProject({
+        entry: 'main.asm',
+        files: {
+          'main.asm': '%include "temporary.asm"',
+          'temporary.asm': 'global _start\nsection .text\n_start:\n  ret',
+        },
+      })
+      expect(first.ok).toBe(true)
+
+      const second = await emulator.compileProject({
+        entry: 'main.asm',
+        files: { 'main.asm': '%include "temporary.asm"' },
+      })
+      expect(second.ok).toBe(false)
+      emulator.dispose()
+    })
+
     it('compiles and runs an exit syscall program', async () => {
         const emulator = await createX86Emulator()
         const result = await emulator.compile(`

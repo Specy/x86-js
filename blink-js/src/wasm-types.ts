@@ -8,6 +8,9 @@ export type EmscriptenFS = {
     close(stream: unknown): void
     chmod(path: string, mode: number): void
     readFile(path: string, options?: { encoding?: 'binary' | 'utf8' }): Uint8Array | string
+    mkdirTree(path: string): void
+    unlink(path: string): void
+    chdir(path: string): void
 }
 
 export type BlinkenlibModuleOptions = {

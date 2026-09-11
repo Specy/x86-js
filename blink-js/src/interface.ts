@@ -4,6 +4,8 @@ export type StatusRegister = {
     prev: number
 }
 export type MonacoError = {
+    /** Project-relative source path when checking a virtual Project. */
+    file?: string
     lineIndex: number
     column: number
     line: {
@@ -20,6 +22,7 @@ export type StackFrame = {
     destination: bigint
     sp: bigint
     line: number
+    file?: string
     color: string
 }
 
@@ -42,6 +45,7 @@ export type ExecutionStep = {
         bits: number
     }
     line: number
+    file?: string
 }
 
 export type MutationOperation =
@@ -111,6 +115,9 @@ export enum EmulatorStatus {
 export type Instruction = {
     address: bigint
     lineNumber: number
+    file?: string
+    size?: number
+    bytes?: Uint8Array
     code: string
 }
 
@@ -199,5 +206,8 @@ export abstract class BaseEmulator<
 
     abstract hasTerminated(): boolean
 
-    abstract run(limit?: number, breakpoints?: number[]): Promise<EmulatorStatus>;
+    abstract run(
+        limit?: number,
+        breakpoints?: Array<number | { path: string; line: number }>,
+    ): Promise<EmulatorStatus>;
 }

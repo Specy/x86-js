@@ -15,11 +15,14 @@ import {
     X86_REGISTER_NAMES,
     type StopReason,
     type X86CompileResult,
+    type X86Breakpoint,
     type X86EmulatorEventHandler,
     type X86EmulatorEventMap,
     type X86EmulatorEventName,
     type X86RegisterName,
+    type X86Project,
 } from './types'
+import { x86ProjectText } from './project'
 import type {
     BlinkenlibModule,
     NativeInstruction,
@@ -138,9 +141,13 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     async compile(code: string): Promise<X86CompileResult> {
+        return this.compileProject({ entry: 'assembly.s', files: { 'assembly.s': code } })
+    }
+
+    async compileProject(project: X86Project): Promise<X86CompileResult> {
         this.clearExecutionTrace()
-        this.lastSourceCode = code
-        this.lastCompileResult = await this.runtime.compileAssembly(code)
+        this.lastSourceCode = x86ProjectText(project, project.entry)
+        this.lastCompileResult = await this.runtime.compileProject(project)
         return this.lastCompileResult
     }
 
@@ -186,19 +193,28 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     async checkCode(code: string): Promise<MonacoError[]> {
-        const result = await this.compile(code)
+        return this.checkProject({ entry: 'assembly.s', files: { 'assembly.s': code } })
+    }
+
+    async checkProject(project: X86Project): Promise<MonacoError[]> {
+        const result = await this.compileProject(project)
         const errors = result.ok === false ? result.errors : []
-        const lines = code.split(/\r?\n/)
-        return errors.map((error) => ({
-            lineIndex: Math.max(0, error.line - 1),
-            column: 0,
-            line: {
-                line: lines[Math.max(0, error.line - 1)] ?? '',
-                line_index: Math.max(0, error.line - 1),
-            },
-            message: error.error,
-            formatted: error.error,
-        }))
+        return errors.map((error) => {
+            const path = error.file ?? project.entry
+            const lineIndex = Math.max(0, error.line - 1)
+            const lines = x86ProjectText(project, path).split(/\r?\n/)
+            return {
+                file: path,
+                lineIndex,
+                column: 0,
+                line: {
+                    line: lines[lineIndex] ?? '',
+                    line_index: lineIndex,
+                },
+                message: error.error,
+                formatted: error.error,
+            }
+        })
     }
 
     undo(): void {
@@ -288,11 +304,27 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     getInstructionAt(address: bigint): Instruction | null {
         const instruction = this.runtime.getInstructionAt(address)
         if (!instruction) return null
+        const location = this.runtime.getSourceLocationForAddress(instruction.address)
         return {
             address: instruction.address,
-            lineNumber: this.runtime.getSourceLineForAddress(instruction.address) ?? -1,
+            lineNumber: location?.line ?? -1,
+            file: location?.path,
+            size: instruction.size,
+            bytes: this.runtime.readMemoryBytes(instruction.address, BigInt(instruction.size)),
             code: instruction.code,
         }
+    }
+
+    /** Every instruction address represented in the linked program's DWARF source map. */
+    getCompiledInstructions(): Instruction[] {
+        // Compiling leaves the ELF on the virtual filesystem but does not map it into Blink's
+        // memory until execution starts. Load and pause at its entry before reading instruction
+        // bytes; callers commonly request build metadata before their first step.
+        if (this.runtime.state === BlinkState.ProgramLoaded) this.runtime.pauseAtEntry()
+        return this.runtime.getSourceMappedAddresses().flatMap((address) => {
+            const instruction = this.getInstructionAt(address)
+            return instruction ? [instruction] : []
+        })
     }
 
     getRegisterValues(): bigint[] {
@@ -320,7 +352,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.runtime.state === BlinkState.ProgramStopped
     }
 
-    async run(limit?: number, breakpoints: number[] = []): Promise<EmulatorStatus> {
+    async run(limit?: number, breakpoints: X86Breakpoint[] = []): Promise<EmulatorStatus> {
         this.validateRunLimit(limit)
         const breakpointAddresses = this.resolveBreakpointAddresses(breakpoints)
         if (this.isTracingEnabled()) return this.runWithHistory(limit, breakpointAddresses)
@@ -336,13 +368,18 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         }
     }
 
-    private resolveBreakpointAddresses(breakpoints: number[]): bigint[] {
+    private resolveBreakpointAddresses(breakpoints: X86Breakpoint[]): bigint[] {
         const addresses = new Map<string, bigint>()
-        for (const lineIndex of breakpoints) {
+        for (const breakpoint of breakpoints) {
+            const lineIndex = typeof breakpoint === 'number' ? breakpoint : breakpoint.line
             if (!Number.isSafeInteger(lineIndex) || lineIndex < 0) {
                 throw new Error(`Invalid breakpoint line index: ${lineIndex}`)
             }
-            for (const address of this.runtime.getAddressesForSourceLine(lineIndex)) {
+            const resolved =
+                typeof breakpoint === 'number'
+                    ? this.runtime.getAddressesForSourceLine(lineIndex)
+                    : this.runtime.getAddressesForSourceLocation(breakpoint)
+            for (const address of resolved) {
                 addresses.set(address.toString(), address)
             }
         }
@@ -359,7 +396,10 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         while (this.runtime.state === BlinkState.ProgramRunning) {
             const pc = this.getPc()
             if (breakpointSet.has(pc.toString())) {
-                this.runtime.pauseForBreakpoint(pc, this.runtime.getSourceLineForAddress(pc) ?? undefined)
+                this.runtime.pauseForBreakpoint(
+                    pc,
+                    this.runtime.getSourceLocationForAddress(pc) ?? undefined,
+                )
                 return this.getStatus()
             }
             if (hasLimit && executedInstructions >= limit) {
@@ -385,7 +425,10 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         while (this.runtime.state === BlinkState.ProgramRunning) {
             const pc = this.getPc()
             if (breakpointSet.has(pc.toString())) {
-                this.runtime.pauseForBreakpoint(pc, this.runtime.getSourceLineForAddress(pc) ?? undefined)
+                this.runtime.pauseForBreakpoint(
+                    pc,
+                    this.runtime.getSourceLocationForAddress(pc) ?? undefined,
+                )
                 return this.getStatus()
             }
             if (hasLimit && executedInstructions >= limit) {
@@ -466,13 +509,15 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         if (nativeStep.valid) {
             this.recordControlFlowMutation(nativeStep, instruction, mutations)
         }
+        const location = this.runtime.getSourceLocationForAddress(pcBefore)
 
         const entry: X86HistoryEntry = {
             mutations,
             pc: toHistoryPc(pcBefore),
             old_ccr: { bits: flagsBefore },
             new_ccr: { bits: flagsAfter },
-            line: this.runtime.getSourceLineForAddress(pcBefore) ?? -1,
+            line: location?.line ?? -1,
+            file: location?.path,
             registersBefore,
             flagsBefore,
             callStackBefore,
@@ -517,12 +562,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             const returnAddress = instruction ? instruction.address + BigInt(instruction.size) : step.pcBefore
             const symbol = this.runtime.resolveSymbol(step.pcAfter)
             const frameAddress = symbol?.address ?? step.pcAfter
+            const location = this.runtime.getSourceLocationForAddress(frameAddress)
             this.callStack.push({
                 name: symbol?.name ?? '',
                 address: frameAddress,
                 destination: returnAddress,
                 sp: step.spAfter,
-                line: this.runtime.getSourceLineForAddress(frameAddress) ?? -1,
+                line: location?.line ?? -1,
+                file: location?.path,
                 color: makeFrameColor(this.callStack.length, frameAddress),
             })
             mutations.push({ type: 'PushCallStack', value: { from: step.pcBefore, to: step.pcAfter } })

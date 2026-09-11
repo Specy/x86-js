@@ -106,6 +106,7 @@ export function stripPrivateHistory(entry: X86HistoryEntry): ExecutionStep {
         old_ccr: entry.old_ccr,
         new_ccr: entry.new_ccr,
         line: entry.line,
+        file: entry.file,
     }
 }
 
