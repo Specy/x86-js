@@ -1,6 +1,12 @@
 import blinkenlib from './wasm/blinkenlib.js'
 import initBlinkWasm from './wasm/blinkenlib.wasm?init'
-import { assemblers, DEFAULT_ASSEMBLER_ID, type AssemblerId, type AssemblerMode } from './assemblers'
+import {
+    assemblers,
+    DEFAULT_ASSEMBLER_ID,
+    ldDiagnostics,
+    type AssemblerId,
+    type AssemblerMode,
+} from './assemblers'
 import { readResourceBytes } from './resources'
 import { parseSourceMap, type SourceMap } from './source-map'
 import { stageX86Project, x86ProjectSourcePath } from './project'
@@ -99,7 +105,9 @@ export class BlinkRuntime {
     private sourceMap: SourceMap | null = null
     private sourceProject: X86Project | null = null
     private assembleOnly = false
-    private assembledObject: Uint8Array | null = null
+    private assembledObjects: Uint8Array[] = []
+    /** What the linker said, kept apart from the assembler's log so `ld`'s own parser reads it. */
+    private linkerLogs: string | null = null
 
     private readonly defaultArgc = '/program'
     private readonly defaultArgv = ''
@@ -203,7 +211,10 @@ export class BlinkRuntime {
         const report = assembled.stdout + assembled.stderr
         const diagnostics = [
             ...this.parseAssemblerDiagnostics(report, sourceProject),
-            ...this.entryPointDiagnostics(assembled.object, sourceProject),
+            ...this.entryPointDiagnostics(
+                assembled.units.map((unit) => unit.object),
+                sourceProject,
+            ),
         ]
         return toCompileResult(diagnostics, report)
     }
@@ -216,7 +227,8 @@ export class BlinkRuntime {
         this.assemblerLogs = ''
         this.assemblerErrors = []
         this.assemblerDiagnostics = []
-        this.assembledObject = null
+        this.assembledObjects = []
+        this.linkerLogs = null
         this.sourceMap = null
         this.assembleOnly = !options.link
 
@@ -236,7 +248,8 @@ export class BlinkRuntime {
                 ...diagnostic,
                 file: x86ProjectSourcePath(diagnostic.file, sourceProject),
             })),
-            ...this.entryPointDiagnostics(this.takeAssembledObject(), sourceProject),
+            ...this.entryPointDiagnostics(this.takeAssembledObjects(), sourceProject),
+            ...this.linkDiagnostics(sourceProject),
         ]
 
         if (this.state === BlinkState.ProgramLoaded) this.sourceMap = this.tryReadSourceMap()
@@ -244,16 +257,44 @@ export class BlinkRuntime {
     }
 
     /**
-     * The object this build's assembler wrote, for the checks that read it
-     * rather than the assembler's own words. Null when the assembly failed, and
+     * The objects this build's assembler wrote, for the checks that read them
+     * rather than the assembler's own words. Empty when the assembly failed, and
      * when the assembler writes an executable directly and never produces one.
-     * Read once per build, so a previous build's object can never stand in for
-     * one that was never written.
+     * Read once per build, so a previous build's objects can never stand in for
+     * ones that were never written.
      */
-    private takeAssembledObject(): Uint8Array | null {
-        const object = this.assembledObject
-        this.assembledObject = null
-        return object
+    private takeAssembledObjects(): Uint8Array[] {
+        const objects = this.assembledObjects
+        this.assembledObjects = []
+        return objects
+    }
+
+    /**
+     * What the link had to say. A link that failed leaves no program to run, so a build that
+     * reported nothing would hand the caller a success it cannot act on - the state stays `Ready`
+     * and the next step or run fails with a message about the emulator rather than the mistake.
+     * The fallback covers a linker that fails in a way its parser does not recognise, so a failed
+     * link is always visible as an error whatever `ld` chose to say about it.
+     */
+    private linkDiagnostics(sourceProject: X86Project): X86CompilationDiagnostic[] {
+        if (this.linkerLogs === null) return []
+        const diagnostics = ldDiagnostics(this.linkerLogs).map((diagnostic) => ({
+            ...diagnostic,
+            file: x86ProjectSourcePath(diagnostic.file, sourceProject),
+        }))
+        const linked = this.state === BlinkState.ProgramLoaded
+        if (linked || diagnostics.some((diagnostic) => diagnostic.severity === 'error')) {
+            return diagnostics
+        }
+        return [
+            ...diagnostics,
+            {
+                line: 1,
+                file: sourceProject.entry,
+                severity: 'error',
+                error: 'linking failed, so there is no program to run.',
+            },
+        ]
     }
 
     /**
@@ -264,11 +305,13 @@ export class BlinkRuntime {
      * is reported as an error here and the mistake is usually a misspelling.
      */
     private entryPointDiagnostics(
-        object: Uint8Array | null,
+        objects: readonly Uint8Array[],
         sourceProject: X86Project,
     ): X86CompilationDiagnostic[] {
-        if (!object || !this.mode.binaries.linker) return []
-        const globals = readDefinedGlobalSymbols(object)
+        if (!objects.length || !this.mode.binaries.linker) return []
+        // Any translation unit may be the one that exports the entry point, so the question is
+        // whether the Project as a whole defines it, not whether the Entry File does.
+        const globals = objects.flatMap((object) => readDefinedGlobalSymbols(object))
         if (globals.includes(DEFAULT_ENTRY_SYMBOL)) return []
 
         const nearest = findNearestSymbol(DEFAULT_ENTRY_SYMBOL, globals)
@@ -303,7 +346,7 @@ export class BlinkRuntime {
         )
         if (this.assemblerErrors.length === 0) {
             try {
-                this.assembledObject = this.module.FS.readFile('/program.o') as Uint8Array
+                this.assembledObjects = [this.module.FS.readFile('/program.o') as Uint8Array]
             } catch {
                 // An assembler that writes its executable directly, such as fasm,
                 // produces no object, and has no linker to need an entry symbol.
@@ -329,24 +372,39 @@ export class BlinkRuntime {
         this.emitAssemblerOutput(assembled.stderr, this.callbacks.stderr)
 
         this.collectAssemblerDiagnostics()
-        if (!assembled.object) {
+        if (!assembled.units.length) {
             this.setState(BlinkState.Ready)
             return
         }
 
+        this.assembledObjects = assembled.units.map((unit) => unit.object)
         if (!options.link) {
-            this.assembledObject = assembled.object
             this.setState(BlinkState.Ready)
             return
         }
 
-        this.assembledObject = assembled.object
-        this.writeExecutableSync('/program.o', assembled.object)
-        this.setState(BlinkState.Linking)
+        // One object per translation unit, named by position so the linker command never has to
+        // carry a Project path. The Entry leads, which is the order the units were assembled in.
+        const objectPaths = assembled.units.map((_, index) =>
+            index === 0 ? '/program.o' : `/program.${index}.o`,
+        )
+        assembled.units.forEach((unit, index) => this.writeExecutableSync(objectPaths[index]!, unit.object))
+
+        this.beginLinking()
         await defer()
-        this.setEmulationArgs('/linker', this.mode.binaries.linker?.commands ?? '', '')
+        this.setEmulationArgs('/linker', this.mode.binaries.linker?.link(objectPaths) ?? '', '')
         this.module._blinkenlib_run_fast()
         await this.waitForState((state) => state !== BlinkState.Linking)
+    }
+
+    /**
+     * Starts the link, and starts a log of its own for it. The assembler's parser cannot read
+     * `ld`'s diagnostics and `ld`'s cannot read the assembler's, so what each of them said has to
+     * stay separable even though both reach the caller as one report.
+     */
+    private beginLinking(): void {
+        this.linkerLogs = ''
+        this.setState(BlinkState.Linking)
     }
 
     private collectAssemblerDiagnostics(): void {
@@ -612,9 +670,10 @@ export class BlinkRuntime {
     }
 
     private collectAssemblerLog(charCode: number): void {
-        if (this.state === BlinkState.Assembling || this.state === BlinkState.Linking) {
-            this.assemblerLogs += String.fromCharCode(charCode)
-        }
+        if (this.state !== BlinkState.Assembling && this.state !== BlinkState.Linking) return
+        const character = String.fromCharCode(charCode)
+        this.assemblerLogs += character
+        if (this.state === BlinkState.Linking && this.linkerLogs !== null) this.linkerLogs += character
     }
 
     private handleSignal(signal: number, code: number): void {
@@ -712,9 +771,9 @@ export class BlinkRuntime {
             return
         }
 
-        this.setState(BlinkState.Linking)
+        this.beginLinking()
         this.scheduler(() => {
-            this.setEmulationArgs('/linker', this.mode.binaries.linker?.commands ?? '', '')
+            this.setEmulationArgs('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '', '')
             this.module._blinkenlib_run_fast()
         })
     }

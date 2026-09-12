@@ -7,6 +7,15 @@ export interface Binary {
     commands: string
 }
 
+export interface LinkerBinary {
+    file: ResourceSource
+    /**
+     * The command that links however many objects the Project's translation units produced. Every
+     * path it is given is one this package generated, so none of them needs escaping.
+     */
+    link(objects: readonly string[]): string
+}
+
 export interface DiagnosticLine {
     file?: string
     line: number
@@ -36,7 +45,7 @@ export interface AssemblerMode {
          * portable C. Fasm is written in x86 assembly and has no such build.
          */
         assembler?: Binary
-        linker?: Binary
+        linker?: LinkerBinary
     }
     /** Runs outside blink, and takes precedence over `binaries.assembler`. */
     wasmAssembler?: WasmAssembler
@@ -44,6 +53,8 @@ export interface AssemblerMode {
 
 const assemblerAsset = (filename: string) =>
     new URL(`./assets/assemblers/${filename}`, import.meta.url)
+
+const linkCommand = (objects: readonly string[]) => `/linker ${objects.join(' ')} -o /program`
 
 export const assemblers = {
     GNU_trunk: {
@@ -58,7 +69,7 @@ export const assemblers = {
             },
             linker: {
                 file: assemblerAsset('gnu-ld.2.43.50.elf'),
-                commands: '/linker /program.o -o /program',
+                link: linkCommand,
             },
         },
     },
@@ -82,7 +93,7 @@ export const assemblers = {
         binaries: {
             linker: {
                 file: assemblerAsset('gnu-ld.2.43.50.elf'),
-                commands: '/linker /program.o -o /program',
+                link: linkCommand,
             },
         },
         wasmAssembler: nasmWasmAssembler,
@@ -154,6 +165,46 @@ export function fasmDiagnostics(str: string): DiagnosticLine[] {
             lineNumber = null
             file = undefined
         }
+    }
+    return diagnostics
+}
+
+/**
+ * What `ld` said, as diagnostics. Nothing else in the toolchain reports a symbol that no
+ * translation unit defines: NASM accepts every `extern` on the author's word, and the mistake
+ * only surfaces here. Without this the link simply failed and the build looked like it had
+ * succeeded, leaving the program unrunnable and nothing on screen to say why.
+ *
+ * `ld` writes a location as `file:line:(section+offset):`, and writes the notes that introduce an
+ * error - "in function `_start':" - as lines ending in a colon, which are skipped in favour of
+ * the error itself.
+ */
+export function ldDiagnostics(str: string): DiagnosticLine[] {
+    const diagnostics: DiagnosticLine[] = []
+    // `file:line:` optionally followed by the `(.text+0x6)` that names where in the section it is.
+    const locatedRegex = /^(.*?):(\d+):(?:\([^)]*\))?:\s*(.+)$/
+    for (const line of str.split(/\r?\n/)) {
+        // `ld` prefixes some of its messages with its own name and others not at all; dropping it
+        // keeps a prefixed location from being read as part of the file path.
+        const text = line.trim().replace(/^\/linker:\s*/, '')
+        // Blink echoes the command it is about to run, and a note ending in a colon belongs to
+        // the message on the line after it.
+        if (!text || text.startsWith('$ ') || text.endsWith(':')) continue
+
+        const located = text.match(locatedRegex)
+        const message = (located?.[3] ?? text).trim()
+        if (!message) continue
+        // The missing entry point is reported against the source with a far better explanation
+        // than `ld` can give, so its warning here would only say the same thing twice.
+        if (message.includes('cannot find entry symbol')) continue
+
+        const isWarning = message.startsWith('warning:')
+        diagnostics.push({
+            ...(located?.[1] ? { file: located[1] } : {}),
+            line: located ? Number.parseInt(located[2] ?? '0', 10) : 1,
+            error: isWarning ? message.slice('warning:'.length).trim() : message,
+            severity: isWarning ? 'warning' : 'error',
+        })
     }
     return diagnostics
 }

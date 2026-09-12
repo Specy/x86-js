@@ -55,6 +55,17 @@ export function stageX86Project(fs: EmscriptenFS, project: X86Project): void {
     stagedFiles.set(fs, current)
 }
 
+/**
+ * Points the assembler at one staged Project File and leaves that File's own directory as the
+ * working directory, so its `%include`s and `incbin`s resolve from where it was written rather
+ * than from wherever the Entry happens to live. The Entry keeps its `/assembly.s` identity, which
+ * is the path its existing diagnostics and source maps are written in terms of.
+ */
+export function selectX86Source(fs: EmscriptenFS, project: X86Project, path: string): string {
+    fs.chdir(projectDirectory(path))
+    return path === project.entry ? '/assembly.s' : `${X86_PROJECT_ROOT}/${path}`
+}
+
 /** Maps a path emitted by NASM or DWARF back to the exact Project path. */
 export function x86ProjectSourcePath(
     sourcePath: string | undefined,
