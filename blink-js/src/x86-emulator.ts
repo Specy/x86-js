@@ -8,7 +8,7 @@ import {
     type MonacoError,
     type StackFrame,
 } from './interface'
-import { locateDiagnosticColumn, type AssemblerId, type AssemblerMode } from './assemblers'
+import { locateDiagnosticSpan, type AssemblerId, type AssemblerMode } from './assemblers'
 import { BlinkRuntime, type BlinkRuntimeCallbacks, type BlinkRuntimeOptions } from './blink-runtime'
 import {
     BlinkState,
@@ -219,10 +219,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             const lineIndex = Math.max(0, diagnostic.line - 1)
             const lines = x86ProjectText(project, path).split(/\r?\n/)
             const line = lines[lineIndex] ?? ''
+            const span = locateDiagnosticSpan(diagnostic.error, line, diagnostic.warningClass)
             return {
                 file: path,
                 lineIndex,
-                column: locateDiagnosticColumn(diagnostic.error, line, diagnostic.warningClass),
+                column: span.column,
+                ...(span.endColumn === undefined ? {} : { endColumn: span.endColumn }),
                 line: {
                     line,
                     line_index: lineIndex,

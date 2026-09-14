@@ -10,6 +10,12 @@ export type MonacoError = {
     file?: string
     lineIndex: number
     column: number
+    /**
+     * One-based and exclusive, so the squiggle covers the whole name the
+     * assembler complained about. Absent when the message named nothing that
+     * could be found in the line.
+     */
+    endColumn?: number
     line: {
         line: string
         line_index: number

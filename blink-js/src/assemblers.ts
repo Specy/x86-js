@@ -209,29 +209,63 @@ export function ldDiagnostics(str: string): DiagnosticLine[] {
     return diagnostics
 }
 
+/** Where in a line a diagnostic belongs, in one-based columns. */
+export type DiagnosticSpan = {
+    column: number
+    /**
+     * One-based and exclusive. Absent when nothing in the line could be
+     * identified, which leaves how much to underline to the caller.
+     */
+    endColumn?: number
+}
+
 /**
- * The one-based column a diagnostic belongs on. NASM reports a line and no
+ * Which part of a line a diagnostic belongs on. NASM reports a line and no
  * column, but it names the thing it is complaining about: `msg' in "symbol
  * `msg' not defined", `.data' in a section warning. Finding that name in the
- * line turns a whole-line squiggle into one under the mistake itself.
+ * line turns a whole-line squiggle into one under the mistake itself, and the
+ * name's own length is how far the squiggle runs.
  *
- * Falls back to the first column, which is what the caller would have used
- * anyway, so a message that names nothing findable is no worse off.
+ * Falls back to the first column and no extent, which is what the caller would
+ * have used anyway, so a message that names nothing findable is no worse off.
  */
-export function locateDiagnosticColumn(message: string, line: string, warningClass?: string): number {
+export function locateDiagnosticSpan(message: string, line: string, warningClass?: string): DiagnosticSpan {
     // A label alone on a line is the line's first token, and NASM does not
     // quote it because the whole line is the problem.
     if (warningClass === 'label-orphan') {
         const leading = line.search(/\S/)
-        return leading < 0 ? 1 : leading + 1
+        if (leading < 0) return { column: 1 }
+        return span(leading, identifierLength(line, leading))
     }
 
     const quoted = message.match(/`([^'`]+)'/)?.[1]
-    if (!quoted) return 1
+    if (!quoted) return { column: 1 }
 
     const index = findIdentifier(line, quoted)
-    return index < 0 ? 1 : index + 1
+    return index < 0 ? { column: 1 } : span(index, quoted.length)
 }
+
+/** The one-based column a diagnostic belongs on. */
+export function locateDiagnosticColumn(message: string, line: string, warningClass?: string): number {
+    return locateDiagnosticSpan(message, line, warningClass).column
+}
+
+function span(index: number, length: number): DiagnosticSpan {
+    // A zero length underlines nothing at all, so it is left to the caller
+    // rather than handed back as an empty range.
+    if (length <= 0) return { column: index + 1 }
+    return { column: index + 1, endColumn: index + 1 + length }
+}
+
+/** How far the identifier starting at `from` runs, zero when none starts there. */
+function identifierLength(line: string, from: number): number {
+    let length = 0
+    while (isIdentifierChar(line[from + length])) length += 1
+    return length
+}
+
+const isIdentifierChar = (character: string | undefined) =>
+    character !== undefined && /[\w$#@~.?]/.test(character)
 
 /**
  * Where a name appears in a line as itself, rather than inside a longer one.
@@ -239,9 +273,6 @@ export function locateDiagnosticColumn(message: string, line: string, warningCla
  * merely contains the name.
  */
 function findIdentifier(line: string, name: string): number {
-    const isIdentifierChar = (character: string | undefined) =>
-        character !== undefined && /[\w$#@~.?]/.test(character)
-
     let from = 0
     while (from <= line.length - name.length) {
         const index = line.indexOf(name, from)

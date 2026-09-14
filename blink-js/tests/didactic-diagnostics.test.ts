@@ -2,7 +2,7 @@
 // these; the value is in them reaching the editor at all, with the severity and
 // the class NASM gave them, on the column the mistake is written at.
 import { describe, expect, it } from 'vitest'
-import { locateDiagnosticColumn } from '../src/assemblers'
+import { locateDiagnosticColumn, locateDiagnosticSpan } from '../src/assemblers'
 import { findNearestSymbol, readDefinedGlobalSymbols } from '../src/elf-symbols'
 import { nasmWasmAssembler } from '../src/wasm-assembler'
 import { createX86Emulator } from '../src/x86-emulator'
@@ -179,5 +179,35 @@ describe('where a diagnostic points', () => {
 
     it('falls back to the first column when the message names nothing', () => {
         expect(locateDiagnosticColumn('byte exceeds bounds', '  mov al, 300')).toBe(1)
+    })
+
+    it('runs the span to the end of the symbol the message names', () => {
+        expect(locateDiagnosticSpan("symbol `msg' not defined", '  mov rsi, msg')).toEqual({
+            column: 12,
+            endColumn: 15,
+        })
+    })
+
+    it('runs the span to the end of the label when the whole line is the mistake', () => {
+        expect(locateDiagnosticSpan('label alone on a line', '    _start', 'label-orphan')).toEqual({
+            column: 5,
+            endColumn: 11,
+        })
+    })
+
+    it('leaves the extent to the caller when the message names nothing', () => {
+        expect(locateDiagnosticSpan('byte exceeds bounds', '  mov al, 300')).toEqual({ column: 1 })
+        expect(locateDiagnosticSpan("symbol `msg' not defined", '  mov rsi, msg_length')).toEqual({
+            column: 1,
+        })
+    })
+
+    it('leaves the extent to the caller for a blank line and a line with no identifier', () => {
+        expect(locateDiagnosticSpan('label alone on a line', '   ', 'label-orphan')).toEqual({
+            column: 1,
+        })
+        expect(locateDiagnosticSpan('label alone on a line', '  %endif', 'label-orphan')).toEqual({
+            column: 3,
+        })
     })
 })
