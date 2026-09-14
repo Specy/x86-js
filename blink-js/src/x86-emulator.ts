@@ -45,6 +45,15 @@ import {
     type X86HistoryEntry,
 } from './x86-emulator-utils'
 import { observeCallbackResult } from './callbacks'
+import {
+    X86_SSE_REGISTERS,
+    X86_X87_REGISTERS,
+    decodeFpuState,
+    encodeFpuState,
+    fpuStateBlocksEqual,
+    readLogicalStBits,
+    type X86FpuState,
+} from './fpu-state'
 
 export type X86EmulatorOptions = Omit<BlinkRuntimeOptions, 'callbacks' | 'mode'> & {
     mode?: AssemblerMode | AssemblerId
@@ -241,6 +250,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         for (const register of X86_REGISTER_NAMES) {
             this.runtime.setRegister(register, entry.registersBefore[register])
         }
+        this.runtime.setFpuStateRaw(entry.fpuBefore)
         this.runtime.setFlags(entry.flagsBefore)
         this.callStack = cloneCallStack(entry.callStackBefore)
         this.runtime.resumeAfterStateMutation()
@@ -355,6 +365,26 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const masked = maskRegisterValue(value, size)
         const preserved = size === RegisterSize.Double ? masked : (current & ~maskForSize(size)) | masked
         this.runtime.setRegister(register, preserved)
+    }
+
+    /**
+     * The SSE and x87 register files: `xmm0..xmm15` and `mxcsr`, and the x87
+     * stack in logical order with its control, status and tag words. Read as
+     * one block through a single bridge call. `X86_SSE_REGISTERS` and
+     * `X86_X87_REGISTERS` name the values in order.
+     */
+    getFpuState(): X86FpuState {
+        return decodeFpuState(this.runtime.getFpuStateRaw())
+    }
+
+    /**
+     * Presets the SSE and x87 register files. The write goes straight into the
+     * machine, like `setRegisterValue`, so it never becomes an undo entry; the
+     * x87 op, instruction and data pointers are left as the machine had them.
+     */
+    setFpuState(state: X86FpuState): void {
+        this.runtime.setFpuStateRaw(encodeFpuState(state, this.runtime.getFpuStateRaw()))
+        this.runtime.resumeAfterStateMutation()
     }
 
     hasTerminated(): boolean {
@@ -475,19 +505,23 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     private captureStep(): void {
         this.prepareOneInstructionRun()
         const before = this.runtime.getRegisterSnapshot()
+        const fpuBefore = this.runtime.getFpuStateRaw()
         const instruction = this.runtime.getInstructionAt(before.pc)
         const callStackBefore = cloneCallStack(this.callStack)
 
         this.runtime.step()
 
         const after = this.runtime.getRegisterSnapshot()
+        const fpuAfter = this.runtime.getFpuStateRaw()
         const nativeStep = this.runtime.getLastStepInfo()
-        this.recordStep(before, after, nativeStep, instruction, callStackBefore)
+        this.recordStep(before, after, fpuBefore, fpuAfter, nativeStep, instruction, callStackBefore)
     }
 
     private recordStep(
         before: RegisterSnapshot,
         after: RegisterSnapshot,
+        fpuBefore: Uint8Array,
+        fpuAfter: Uint8Array,
         nativeStep: NativeStepInfo,
         instruction: NativeInstruction | null,
         callStackBefore: StackFrame[],
@@ -514,6 +548,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             }
         }
 
+        this.recordFpuMutations(fpuBefore, fpuAfter, mutations)
+
         const memoryWrites = nativeStep.valid ? this.recordMemoryMutations(nativeStep.memoryWrites, mutations) : []
         if (nativeStep.valid) {
             this.recordControlFlowMutation(nativeStep, instruction, mutations)
@@ -529,12 +565,71 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             file: location?.path,
             registersBefore,
             flagsBefore,
+            fpuBefore,
             callStackBefore,
             memoryWrites,
             reversible: !nativeStep.valid || !nativeStep.truncatedMemoryWrites,
         }
 
         this.history.push(entry)
+    }
+
+    /**
+     * Notes the SSE and x87 registers the step wrote. Most instructions touch
+     * none of them, and that case costs one byte comparison: only a block that
+     * actually differs is decoded and diffed register by register.
+     */
+    private recordFpuMutations(
+        fpuBefore: Uint8Array,
+        fpuAfter: Uint8Array,
+        mutations: ExecutionStep['mutations'],
+    ): void {
+        if (fpuStateBlocksEqual(fpuBefore, fpuAfter)) return
+
+        const stateBefore = decodeFpuState(fpuBefore)
+        const stateAfter = decodeFpuState(fpuAfter)
+
+        for (let index = 0; index < stateBefore.xmm.length; index += 1) {
+            if (stateBefore.xmm[index] === stateAfter.xmm[index]) continue
+            mutations.push({
+                type: 'WriteRegister',
+                value: {
+                    register: X86_SSE_REGISTERS[index]!,
+                    old: stateBefore.xmm[index]!,
+                    size: RegisterSize.Quad,
+                },
+            })
+        }
+        if (stateBefore.mxcsr !== stateAfter.mxcsr) {
+            mutations.push({
+                type: 'WriteRegister',
+                value: { register: 'mxcsr', old: BigInt(stateBefore.mxcsr), size: RegisterSize.Long },
+            })
+        }
+
+        // Compared as bit patterns, in logical order: a push or a pop moves TOP,
+        // so st(0) can change without any physical slot being written.
+        const stBitsBefore = readLogicalStBits(fpuBefore)
+        const stBitsAfter = readLogicalStBits(fpuAfter)
+        for (let index = 0; index < stBitsBefore.length; index += 1) {
+            if (stBitsBefore[index] === stBitsAfter[index]) continue
+            mutations.push({
+                type: 'WriteRegister',
+                value: {
+                    register: X86_X87_REGISTERS[index]!,
+                    old: stBitsBefore[index]!,
+                    size: RegisterSize.Double,
+                },
+            })
+        }
+
+        for (const word of ['fctrl', 'fstat', 'ftag'] as const) {
+            if (stateBefore[word] === stateAfter[word]) continue
+            mutations.push({
+                type: 'WriteRegister',
+                value: { register: word, old: BigInt(stateBefore[word]), size: RegisterSize.Word },
+            })
+        }
     }
 
     private recordMemoryMutations(

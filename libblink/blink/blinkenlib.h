@@ -132,6 +132,46 @@ u32 blinkenlib_get_flags();
 void blinkenlib_set_flags(u32 flags);
 void blinkenlib_set_step_recording(bool enabled);
 u64 blinkenlib_get_input_max_bytes();
+
+/**
+ * Packed little-endian layout of the machine's FPU register file, as copied
+ * by blinkenlib_get_fpu_state() and restored by blinkenlib_set_fpu_state().
+ *
+ * The block is a fixed, packed, byte-addressed image with no padding; every
+ * field is stored little-endian regardless of host endianness, so the
+ * javascript side can decode it with a DataView and a hardcoded offset table.
+ *
+ *   offset  size  field
+ *   ------  ----  ---------------------------------------------------------
+ *        0   256  xmm[16][16], xmm0..xmm15, 16 bytes each, lane 0 first
+ *      256     4  mxcsr
+ *      260    64  fpu.st[0..7], IEEE-754 binary64, PHYSICAL array order
+ *      324     4  fpu.sw   (x87 status word, holds TOP in bits 11..13)
+ *      328     4  fpu.tw   (x87 tag word)
+ *      332     4  fpu.op   (last x87 opcode)
+ *      336     4  fpu.cw   (x87 control word)
+ *      340     8  fpu.ip   (last x87 instruction pointer)
+ *      348     8  fpu.dp   (last x87 data pointer)
+ *
+ * st[] is stored in PHYSICAL order, exactly as struct MachineFpu holds it.
+ * The logical stack register st(i) the programmer sees lives at
+ * st[(i + TOP) & 7] with TOP = (sw >> 11) & 7, which is what the FpuSt()
+ * macro in blink/fpu.h computes; rotating physical to logical is the
+ * caller's job, so that the block round trips byte for byte.
+ */
+#define BLINKENLIB_FPU_STATE_XMM_OFFSET   0
+#define BLINKENLIB_FPU_STATE_MXCSR_OFFSET 256
+#define BLINKENLIB_FPU_STATE_ST_OFFSET    260
+#define BLINKENLIB_FPU_STATE_SW_OFFSET    324
+#define BLINKENLIB_FPU_STATE_TW_OFFSET    328
+#define BLINKENLIB_FPU_STATE_OP_OFFSET    332
+#define BLINKENLIB_FPU_STATE_CW_OFFSET    336
+#define BLINKENLIB_FPU_STATE_IP_OFFSET    340
+#define BLINKENLIB_FPU_STATE_DP_OFFSET    348
+#define BLINKENLIB_FPU_STATE_SIZE         356
+
+bool blinkenlib_get_fpu_state(u8 *out);
+bool blinkenlib_set_fpu_state(const u8 *in);
 bool blinkenlib_read_memory_byte(u64 virtual_address, u8 *value);
 bool blinkenlib_write_memory_byte(u64 virtual_address, u8 value);
 void blinkenlib_set_run_instruction_limit(u64 limit);

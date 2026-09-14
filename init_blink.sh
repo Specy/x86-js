@@ -39,7 +39,14 @@ emscripten_flags="\
 -sEXPORT_NAME=\"blinkenlib\" \
 -sEXPORTED_RUNTIME_METHODS='[$exported_runtime_methods_str]' \
 "
+# --disable-all turns off everything blink can do without, which suits a
+# sandboxed wasm build; --enable-x87 puts one thing back. The x87 stack is a
+# register file the emulator exposes (blinkenlib_get_fpu_state), and without
+# it struct MachineFpu has no st[] at all and every x87 instruction raises
+# SIGILL, so the order of these two flags is load-bearing: --disable-all first,
+# then the exception.
 emconfigure ./configure \
   --disable-all \
+  --enable-x87 \
   LDFLAGS="$emscripten_flags" \
   CPPFLAGS="-DHTML -D_FILE_OFFSET_BITS=64 -D_DARWIN_C_SOURCE -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_GNU_SOURCE"

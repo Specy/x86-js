@@ -110,6 +110,10 @@ export type BlinkenlibModule = {
     blinkenlibSetFlags(flags: number): void
     blinkenlibSetStepRecording(enabled: boolean): void
     blinkenlibGetRegisterSnapshot(): RegisterSnapshot
+    /** A copy of the packed FPU state block; empty when there is no machine. */
+    blinkenlibGetFpuState(): Uint8Array
+    /** Restores the whole packed FPU state block; false when there is no machine or the length is wrong. */
+    blinkenlibSetFpuState(bytes: Uint8Array | number[]): boolean
     blinkenlibReadMemoryBytes(address: bigint, length: number): MemoryReadResult
     blinkenlibWriteMemoryBytes(address: bigint, bytes: Uint8Array | number[]): MemoryWriteResult
     blinkenlibGetDisassembly(): DisassemblySnapshot

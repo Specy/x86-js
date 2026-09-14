@@ -109,6 +109,29 @@ val WriteMemoryBytes(uint64_t address, val bytes) {
   return result;
 }
 
+val GetFpuState() {
+  // typed_memory_view hands javascript a live view into wasm memory, which
+  // memory growth detaches; slice() copies it into a fresh Uint8Array that
+  // outlives any later allocation.
+  uint8_t block[BLINKENLIB_FPU_STATE_SIZE];
+  if (!blinkenlib_get_fpu_state(block)) {
+    return val::global("Uint8Array").new_(0);
+  }
+  val view = val(emscripten::typed_memory_view(
+      static_cast<size_t>(BLINKENLIB_FPU_STATE_SIZE), block));
+  return view.call<val>("slice");
+}
+
+bool SetFpuState(val bytes) {
+  uint8_t block[BLINKENLIB_FPU_STATE_SIZE];
+  uint32_t length = bytes["length"].as<uint32_t>();
+  if (length != BLINKENLIB_FPU_STATE_SIZE) return false;
+  for (uint32_t index = 0; index < length; ++index) {
+    block[index] = static_cast<uint8_t>(bytes[index].as<uint32_t>() & 0xff);
+  }
+  return blinkenlib_set_fpu_state(block);
+}
+
 val GetDisassemblySnapshot() {
   val result = val::object();
   val lines = val::array();
@@ -261,6 +284,8 @@ EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
   emscripten::function("blinkenlibSetFlags", &SetFlags);
   emscripten::function("blinkenlibSetStepRecording", &SetStepRecording);
   emscripten::function("blinkenlibGetRegisterSnapshot", &GetRegisterSnapshot);
+  emscripten::function("blinkenlibGetFpuState", &GetFpuState);
+  emscripten::function("blinkenlibSetFpuState", &SetFpuState);
   emscripten::function("blinkenlibReadMemoryBytes", &ReadMemoryBytes);
   emscripten::function("blinkenlibWriteMemoryBytes", &WriteMemoryBytes);
   emscripten::function("blinkenlibGetDisassembly", &GetDisassemblySnapshot);

@@ -18,7 +18,7 @@ if (!existsSync(fileURLToPath(dist))) {
     process.exit(1)
 }
 
-const { createX86Emulator, EmulatorStatus } = await import(dist)
+const { createX86Emulator, EmulatorStatus, RegisterSize, X86_SSE_REGISTERS, X86_X87_REGISTERS, X86_FPU_STATE_SIZE, decodeFpuState, encodeFpuState } = await import(dist)
 
 // ---------------------------------------------------------------------------
 // Assembling and running
@@ -103,6 +103,82 @@ assert.equal(project.stopReason.lineNumber, 2)
 project.dispose()
 
 // ---------------------------------------------------------------------------
+// The SSE and x87 register files
+// ---------------------------------------------------------------------------
+
+// getFpuState() reaches all the way into the wasm bridge, so it only works in
+// the published bundle if the embind facade survived the build. This covers
+// both files in one program: an SSE write, an x87 push and add, the undo that
+// rolls both back, and a preset written straight into the machine.
+assert.equal(X86_SSE_REGISTERS.length, 17, 'xmm0..xmm15 plus mxcsr')
+assert.equal(X86_SSE_REGISTERS[0], 'xmm0')
+assert.equal(X86_SSE_REGISTERS[16], 'mxcsr')
+assert.deepEqual([...X86_X87_REGISTERS].slice(8), ['fctrl', 'fstat', 'ftag'])
+assert.equal(X86_FPU_STATE_SIZE, 356)
+assert.equal(RegisterSize.Quad, 16, 'an SSE register is 16 bytes wide')
+
+const fpu = await createX86Emulator({ mode: 'GNU_trunk' })
+const fpuBuilt = await fpu.compile([
+    '.global _start',
+    '.text',
+    '_start:',
+    '  movabs $0x4010000000000000, %rax',
+    '  movq %rax, %xmm0',
+    '  fld1',
+    '  fld1',
+    '  faddp',
+    '  mov $60, %rax',
+    '  xor %rdi, %rdi',
+    '  syscall',
+].join('\n'))
+assert.equal(fpuBuilt.ok, true, `the FPU program should assemble: ${fpuBuilt.report}`)
+
+fpu.initialize(8)
+await fpu.step()
+await fpu.step()
+assert.equal(fpu.getFpuState().xmm[0], 0x4010000000000000n, 'movq wrote 4.0 into xmm0')
+
+const xmmWrite = fpu
+    .getUndoHistory(1)[0]
+    .mutations.find((mutation) => mutation.type === 'WriteRegister' && mutation.value.register === 'xmm0')
+assert.ok(xmmWrite, 'the step names xmm0 as a register write')
+assert.equal(xmmWrite.value.size, RegisterSize.Quad, 'an xmm write is 16 bytes wide')
+assert.equal(xmmWrite.value.old, 0n)
+
+await fpu.step()
+await fpu.step()
+await fpu.step()
+assert.equal(fpu.getFpuState().st[0], 2, 'fld1; fld1; faddp leaves 2 on top of the x87 stack')
+
+fpu.undo()
+assert.equal(fpu.getFpuState().st[0], 1, 'undo puts the stack back as faddp found it')
+assert.equal(fpu.getFpuState().st[1], 1)
+fpu.undo()
+fpu.undo()
+assert.equal(fpu.getFpuState().xmm[0], 0x4010000000000000n, 'undoing the x87 steps left xmm0 alone')
+
+// A preset goes straight into the machine, so it is not something to undo.
+const historyLength = fpu.getUndoHistory(8).length
+const preset = fpu.getFpuState()
+preset.xmm[7] = (0xaaaaaaaaaaaaaaaan << 64n) | 0x5555555555555555n
+preset.st[0] = -0.5
+fpu.setFpuState(preset)
+const presetBack = fpu.getFpuState()
+assert.equal(presetBack.xmm[7], (0xaaaaaaaaaaaaaaaan << 64n) | 0x5555555555555555n)
+assert.equal(presetBack.st[0], -0.5)
+assert.equal(fpu.getUndoHistory(8).length, historyLength, 'a preset adds no undo entry')
+
+// The pure codec is exported beside the emulator, and round trips the block.
+const rawBlock = fpu.runtime.getFpuStateRaw()
+assert.equal(rawBlock.length, X86_FPU_STATE_SIZE)
+assert.deepEqual(
+    Array.from(encodeFpuState(decodeFpuState(rawBlock), rawBlock)),
+    Array.from(rawBlock),
+    'decode then encode reproduces the block byte for byte'
+)
+fpu.dispose()
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
@@ -118,4 +194,4 @@ assert.equal(failed.errors[0].line, 5, 'the diagnostic points at the line it is 
 assert.equal(typeof failed.errors[0].error, 'string')
 broken.dispose()
 
-console.log(`ok - ran a program to exit code 7, a two-file project to a breakpoint, and read ${failed.errors.length} diagnostic(s)`)
+console.log(`ok - ran a program to exit code 7, a two-file project to a breakpoint, the SSE and x87 register files through undo, and read ${failed.errors.length} diagnostic(s)`)

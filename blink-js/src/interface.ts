@@ -40,7 +40,9 @@ export enum RegisterSize {
     Byte = 1,
     Word = 2,
     Long = 4,
-    Double = 8
+    Double = 8,
+    /** 16 bytes, the width of an SSE register. */
+    Quad = 16
 }
 
 export type ExecutionStep = {

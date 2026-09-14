@@ -1,6 +1,7 @@
 export * from './assemblers'
 export * from './blink-runtime'
 export * from './callbacks'
+export * from './fpu-state'
 export * from './interface'
 export * from './project'
 export * from './resources'

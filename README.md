@@ -88,6 +88,22 @@ const rax = emulator.getRegisterValue('rax')
 const bytes = emulator.readMemoryBytes(address, length)
 ```
 
+### Read the SSE and x87 register files
+
+`getFpuState()` reads Blink's whole floating-point register file in one call: the SSE registers `xmm0..xmm15` and `mxcsr`, and the x87 stack with its control, status and tag words. `X86_SSE_REGISTERS` and `X86_X87_REGISTERS` name the values in the order they come in.
+
+```ts
+const fpu = emulator.getFpuState()
+fpu.xmm[0]   // an unsigned 128-bit bigint; lane 0 is the least significant part
+fpu.mxcsr
+fpu.st[0]    // st(0), the top of the x87 stack, whatever TOP happens to be
+fpu.fctrl    // and fstat, ftag: the 16-bit control, status and tag words
+```
+
+`st` is in logical order, so `st[0]` is always the top of the stack; the rotation by TOP that Blink's physical array needs is applied for you. Blink keeps the x87 stack as 64-bit doubles rather than 80-bit extended values, so `st` entries are exactly the doubles the machine holds and long-double precision is not modelled.
+
+`setFpuState(state)` writes the file back. Like `setRegisterValue`, it goes straight into the machine and is never recorded as an undoable step; the x87 opcode, instruction and data pointers are left as the machine had them. Writes to these registers made by instructions *are* recorded: a step that touches them names them as `WriteRegister` mutations (`xmm0` at `RegisterSize.Quad`, `st0` at `RegisterSize.Double`, `fctrl`/`fstat`/`ftag` at `RegisterSize.Word`), and `undo()` restores the whole file.
+
 ### Undo history and call stack
 
 Undo recording is opt-in. Call `initialize(undoSize)` after loading or compiling a program and before execution. `undoSize` is the maximum number of reversible instructions kept in history; internally this is a fixed-size circular buffer, so older entries are discarded when the buffer fills.
@@ -148,7 +164,15 @@ Callbacks passed to `createX86Emulator()` and handlers registered with `on()` ma
 
 Prerequisites: [Emscripten](https://emscripten.org/docs/getting_started/downloads.html), `make`. The build script must run inside WSL (or a Linux shell) because it invokes `emmake`.
 
-**1. Compile the wasm artifacts**
+**1. Configure libblink** (once per checkout; `libblink/config.h` is generated and not committed)
+
+```sh
+./init_blink.sh
+```
+
+This runs `libblink`'s `./configure` under Emscripten with `--disable-all --enable-x87`. The x87 exception matters: with it off, `struct MachineFpu` has no stack at all and every x87 instruction raises SIGILL, so `getFpuState()` would report nothing and the x87 tests would fail.
+
+**2. Compile the wasm artifacts**
 
 ```sh
 ./compile_blink.sh
@@ -156,7 +180,7 @@ Prerequisites: [Emscripten](https://emscripten.org/docs/getting_started/download
 
 This builds `libblink` with Emscripten and copies `blinkenlib.wasm` and `blinkenlib.js` into `blink-js/src/wasm/`.
 
-**1b. Compile NASM to wasm** (optional; only when changing NASM versions)
+**2b. Compile NASM to wasm** (optional; only when changing NASM versions)
 
 ```sh
 ./compile_wasm_nasm.sh
@@ -164,7 +188,7 @@ This builds `libblink` with Emscripten and copies `blinkenlib.wasm` and `blinken
 
 The assemblers under `blink-js/src/assets/assemblers/` are x86-64 ELF binaries that blink interprets one instruction at a time.
 
-**2. Build and test the TypeScript package**
+**3. Build and test the TypeScript package**
 
 ```sh
 cd blink-js

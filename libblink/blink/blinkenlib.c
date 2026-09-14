@@ -725,6 +725,83 @@ u64 blinkenlib_get_input_max_bytes() {
   return blinkenlib_get_register_u64(BLINKENLIB_REG_RDX);
 }
 
+_Static_assert(BLINKENLIB_FPU_STATE_SIZE ==
+                   BLINKENLIB_FPU_STATE_DP_OFFSET + 8,
+               "the fpu state block must end just past dp");
+
+/*
+ * Copies the machine's FPU register file into the packed little-endian block
+ * documented in blinkenlib.h. The whole file travels as one block so that the
+ * javascript side pays one bridge call per step whatever the instruction
+ * touched, rather than one call per register.
+ *
+ * st[] is written in PHYSICAL order; the caller applies the TOP rotation that
+ * turns it into st(0)..st(7).
+ */
+bool blinkenlib_get_fpu_state(u8 *out) {
+  int i;
+  if (!m || !out) return false;
+  memcpy(out + BLINKENLIB_FPU_STATE_XMM_OFFSET, m->xmm, sizeof(m->xmm));
+  Write32(out + BLINKENLIB_FPU_STATE_MXCSR_OFFSET, m->mxcsr);
+#ifndef DISABLE_X87
+  for (i = 0; i < 8; ++i) {
+    u64 bits;
+    double value = m->fpu.st[i];
+    memcpy(&bits, &value, sizeof(bits));
+    Write64(out + BLINKENLIB_FPU_STATE_ST_OFFSET + i * 8, bits);
+  }
+  Write32(out + BLINKENLIB_FPU_STATE_SW_OFFSET, m->fpu.sw);
+  Write32(out + BLINKENLIB_FPU_STATE_TW_OFFSET, (u32)m->fpu.tw);
+  Write32(out + BLINKENLIB_FPU_STATE_OP_OFFSET, (u32)m->fpu.op);
+  Write64(out + BLINKENLIB_FPU_STATE_IP_OFFSET, (u64)m->fpu.ip);
+#else
+  for (i = 0; i < 8; ++i) {
+    Write64(out + BLINKENLIB_FPU_STATE_ST_OFFSET + i * 8, 0);
+  }
+  Write32(out + BLINKENLIB_FPU_STATE_SW_OFFSET, 0);
+  Write32(out + BLINKENLIB_FPU_STATE_TW_OFFSET, 0);
+  Write32(out + BLINKENLIB_FPU_STATE_OP_OFFSET, 0);
+  Write64(out + BLINKENLIB_FPU_STATE_IP_OFFSET, 0);
+#endif
+  Write32(out + BLINKENLIB_FPU_STATE_CW_OFFSET, m->fpu.cw);
+  Write64(out + BLINKENLIB_FPU_STATE_DP_OFFSET, (u64)m->fpu.dp);
+  return true;
+}
+
+/*
+ * Restores every field blinkenlib_get_fpu_state() copied out, so that undo of
+ * a recorded step puts the FPU back exactly as it was: the status word carries
+ * TOP, the tag word says which stack slots are live, and op/ip/dp are what the
+ * next fsave would report.
+ *
+ * The write goes straight into the machine struct, like
+ * blinkenlib_set_register_u64(), so a value the caller presets never becomes a
+ * recorded mutation of its own.
+ */
+bool blinkenlib_set_fpu_state(const u8 *in) {
+  int i;
+  if (!m || !in) return false;
+  memcpy(m->xmm, in + BLINKENLIB_FPU_STATE_XMM_OFFSET, sizeof(m->xmm));
+  m->mxcsr = Read32(in + BLINKENLIB_FPU_STATE_MXCSR_OFFSET);
+#ifndef DISABLE_X87
+  for (i = 0; i < 8; ++i) {
+    double value;
+    u64 bits = Read64(in + BLINKENLIB_FPU_STATE_ST_OFFSET + i * 8);
+    memcpy(&value, &bits, sizeof(value));
+    m->fpu.st[i] = value;
+  }
+  m->fpu.sw = Read32(in + BLINKENLIB_FPU_STATE_SW_OFFSET);
+  m->fpu.tw = (int)Read32(in + BLINKENLIB_FPU_STATE_TW_OFFSET);
+  m->fpu.op = (int)Read32(in + BLINKENLIB_FPU_STATE_OP_OFFSET);
+  m->fpu.ip = (i64)Read64(in + BLINKENLIB_FPU_STATE_IP_OFFSET);
+#else
+  (void)i;
+#endif
+  m->fpu.cw = Read32(in + BLINKENLIB_FPU_STATE_CW_OFFSET);
+  m->fpu.dp = (i64)Read64(in + BLINKENLIB_FPU_STATE_DP_OFFSET);
+  return true;
+}
+
 bool blinkenlib_read_memory_byte(u64 virtual_address, u8 *value) {
   u8 *ptr = 0;
   if (!m || !value || IsShadow(virtual_address)) return false;

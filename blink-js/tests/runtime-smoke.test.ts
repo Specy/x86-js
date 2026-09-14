@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { EmulatorStatus } from '../src/interface'
+import { X86_FPU_STATE_SIZE, decodeFpuState } from '../src/fpu-state'
 import { createX86Emulator as createDefaultX86Emulator, type X86EmulatorOptions } from '../src/x86-emulator'
 
 const createX86Emulator = (options: X86EmulatorOptions = {}) =>
@@ -380,6 +381,41 @@ _start:
         expect(Array.from(emulator.readMemoryBytes(stackPointer + 14n, 4n))).toEqual(Array.from(expected.slice(14, 18)))
 
         emulator.writeMemoryBytes(stackPointer, original)
+        emulator.dispose()
+    })
+
+    it('copies the FPU state block out of wasm memory rather than viewing it', async () => {
+        const emulator = await createX86Emulator()
+        const result = await emulator.compile(`
+.global _start
+.text
+_start:
+  movabs $0x3ff0000000000000, %rax
+  movq %rax, %xmm1
+  mov $60, %rax
+  xor %rdi, %rdi
+  syscall
+`)
+
+        expect(result.ok).toBe(true)
+        await emulator.step()
+        await emulator.step()
+
+        const first = emulator.runtime.getFpuStateRaw()
+        expect(first).toBeInstanceOf(Uint8Array)
+        expect(first.length).toBe(X86_FPU_STATE_SIZE)
+        expect(decodeFpuState(first).xmm[1]).toBe(0x3ff0000000000000n)
+
+        // A live typed_memory_view would alias wasm memory, so scribbling on the
+        // returned array would corrupt the machine and show up in the next read.
+        first.fill(0xff)
+        const second = emulator.runtime.getFpuStateRaw()
+        expect(decodeFpuState(second).xmm[1]).toBe(0x3ff0000000000000n)
+        expect(emulator.getFpuState().xmm[1]).toBe(0x3ff0000000000000n)
+
+        // And the setter takes exactly this block back.
+        emulator.runtime.setFpuStateRaw(second)
+        expect(emulator.getFpuState().xmm[1]).toBe(0x3ff0000000000000n)
         emulator.dispose()
     })
 })

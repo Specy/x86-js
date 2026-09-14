@@ -20,6 +20,7 @@ import {
     type X86SourceLocation,
 } from './types'
 import { observeCallbackResult, type MaybePromise } from './callbacks'
+import { X86_FPU_STATE_SIZE, emptyFpuStateBlock } from './fpu-state'
 import type {
     BlinkenlibModule,
     DisassemblySnapshot,
@@ -525,6 +526,28 @@ export class BlinkRuntime {
     setRegister(register: keyof RegisterSnapshot['registers'], value: bigint): void {
         if (!this.module.blinkenlibSetRegister(register, value)) {
             throw new Error(`Unknown x86 register: ${register}`)
+        }
+    }
+
+    /**
+     * A copy of the whole packed FPU state block: `xmm0..xmm15`, `mxcsr`, the
+     * x87 stack and its control, status and tag words. One bridge call reads
+     * the lot, so a per-step snapshot costs the same whatever the instruction
+     * touched. Before a program is loaded there is no machine, and the block
+     * reads as zeros.
+     */
+    getFpuStateRaw(): Uint8Array {
+        const raw = this.module.blinkenlibGetFpuState()
+        return raw.length === X86_FPU_STATE_SIZE ? raw : emptyFpuStateBlock()
+    }
+
+    /**
+     * Restores a block read by `getFpuStateRaw()`. The write goes straight
+     * into the machine, so it is never recorded as a step of its own.
+     */
+    setFpuStateRaw(bytes: Uint8Array): void {
+        if (!this.module.blinkenlibSetFpuState(bytes)) {
+            throw new Error('Cannot write the x86 FPU state: no machine is loaded')
         }
     }
 

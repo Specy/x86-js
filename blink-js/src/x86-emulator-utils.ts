@@ -12,6 +12,12 @@ export type UndoMemoryWrite = {
 export type X86HistoryEntry = ExecutionStep & {
     registersBefore: RegisterValues
     flagsBefore: number
+    /**
+     * The whole packed FPU state block as it stood before the step, kept
+     * undecoded. Undo writes it back in one bridge call, so the snapshot costs
+     * the same whatever the instruction touched.
+     */
+    fpuBefore: Uint8Array
     callStackBefore: StackFrame[]
     memoryWrites: UndoMemoryWrite[]
     reversible: boolean
