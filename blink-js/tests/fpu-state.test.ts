@@ -18,6 +18,7 @@ import {
     X86_SSE_REGISTERS,
     X86_X87_REGISTERS,
     decodeFpuState,
+    emptyFpuStateBlock,
     encodeFpuState,
     fpuStateBlocksEqual,
     readLogicalStBits,
@@ -143,6 +144,14 @@ describe('x86 FPU state block', () => {
         expect(view.getUint32(X86_FPU_STATE_OP_OFFSET, true)).toBe(0x07de)
         expect(view.getBigUint64(X86_FPU_STATE_IP_OFFSET, true)).toBe(0x401000n)
         expect(view.getBigUint64(X86_FPU_STATE_DP_OFFSET, true)).toBe(0x402000n)
+    })
+
+    it('reports every x87 slot empty in the block used before a program exists', () => {
+        const raw = emptyFpuStateBlock()
+        expect(raw).toHaveLength(X86_FPU_STATE_SIZE)
+        // A reset x87 has tw = -1: empty slots, not eight valid zeros.
+        expect(readLogicalStTags(raw)).toEqual([3, 3, 3, 3, 3, 3, 3, 3])
+        expect(decodeFpuState(raw).ftag).toBe(0xffff)
     })
 
     it('rejects a block that is not the documented size', () => {

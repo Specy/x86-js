@@ -554,9 +554,17 @@ export class BlinkRuntime {
 
     /**
      * Restores a block read by `getFpuStateRaw()`. The write goes straight
-     * into the machine, so it is never recorded as a step of its own.
+     * into the machine, so it is never recorded as a step of its own. A block
+     * of any other length is rejected here, before the bridge, so that a
+     * layout mistake does not read as a missing machine.
      */
     setFpuStateRaw(bytes: Uint8Array): void {
+        // The bridge answers false for a wrong length as well as for a missing
+        // machine; check the length here so a hand-built block is named for
+        // what it is instead of sending the caller hunting for the machine.
+        if (bytes.length !== X86_FPU_STATE_SIZE) {
+            throw new Error(`An x86 FPU state block must be ${X86_FPU_STATE_SIZE} bytes, got ${bytes.length}`)
+        }
         if (!this.module.blinkenlibSetFpuState(bytes)) {
             throw new Error('Cannot write the x86 FPU state: no machine is loaded')
         }

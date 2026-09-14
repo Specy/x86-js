@@ -459,6 +459,38 @@ _start:
         emulator.dispose()
     })
 
+    it('loses an FPU preset made before the first step, exactly as a register preset is lost', async () => {
+        const emulator = await createX86Emulator()
+        const result = await emulator.compile(`
+.global _start
+.text
+_start:
+  mov $1, %rax
+  mov $60, %rax
+  xor %rdi, %rdi
+  syscall
+`)
+
+        expect(result.ok).toBe(true)
+        emulator.initialize(8)
+
+        // The first step starts the program, which builds the machine afresh,
+        // so anything preset beforehand is wiped. Pinned here because a
+        // Testcase that presets values before running depends on knowing it.
+        const state = emulator.getFpuState()
+        state.xmm[0] = 123n
+        state.st[0] = 3.5
+        emulator.setFpuState(state)
+        emulator.setRegisterValue('rbx', 0x1234n)
+        expect(emulator.getFpuState().xmm[0]).toBe(123n)
+
+        await emulator.step()
+
+        expect(emulator.getFpuState().xmm[0]).toBe(0n)
+        expect(emulator.getRegisterValue('rbx')).toBe(0n)
+        emulator.dispose()
+    })
+
     it('does not resurrect a terminated program when the FPU state is preset', async () => {
         const emulator = await createX86Emulator()
         const result = await emulator.compile(`

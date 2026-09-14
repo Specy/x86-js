@@ -244,7 +244,15 @@ export function fpuStateBlocksEqual(a: Uint8Array, b: Uint8Array): boolean {
     return true
 }
 
-/** An all-zero block, the state the panel shows before a program is built. */
+/**
+ * The block the panel shows before a program is built: zeros everywhere except
+ * the tag word, which reads `0xffff`, every slot empty. That is what a reset
+ * x87 holds - `FpuInit()` in blink/fpu.c sets `tw = -1` - and a zero tag word
+ * would instead claim all eight slots hold valid `0.0` values, so the panel
+ * would render a full stack for a machine that does not exist yet.
+ */
 export function emptyFpuStateBlock(): Uint8Array {
-    return new Uint8Array(X86_FPU_STATE_SIZE)
+    const raw = new Uint8Array(X86_FPU_STATE_SIZE)
+    viewOf(raw).setUint32(X86_FPU_STATE_TW_OFFSET, 0xffffffff, true)
+    return raw
 }

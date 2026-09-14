@@ -385,6 +385,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * Like the other setters it does NOT resume the machine: presetting a
      * register on a terminated or paused program must not erase why it
      * stopped. The next step resumes a paused machine on its own.
+     *
+     * A preset made before the FIRST step does not survive it: the first step
+     * starts the program, which builds the machine afresh, so the values are
+     * wiped. This is exactly how `setRegisterValue` behaves; a caller that
+     * wants to preset state must step once first.
      */
     setFpuState(state: X86FpuState): void {
         this.runtime.setFpuStateRaw(encodeFpuState(state, this.runtime.getFpuStateRaw()))
