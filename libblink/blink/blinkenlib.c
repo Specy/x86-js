@@ -730,6 +730,23 @@ _Static_assert(BLINKENLIB_FPU_STATE_SIZE ==
                "the fpu state block must end just past dp");
 
 /*
+ * The two bulk fields are copied by size rather than field by field, so the
+ * block layout has to keep matching the structs it images: if blink ever
+ * widens its vector or x87 file, these fail the build instead of overrunning
+ * the caller's BLINKENLIB_FPU_STATE_SIZE buffer.
+ */
+_Static_assert(sizeof(((struct Machine *)0)->xmm) ==
+                   BLINKENLIB_FPU_STATE_MXCSR_OFFSET -
+                       BLINKENLIB_FPU_STATE_XMM_OFFSET,
+               "the xmm file no longer fills its slot in the fpu state block");
+#ifndef DISABLE_X87
+_Static_assert(sizeof(((struct Machine *)0)->fpu.st) ==
+                   BLINKENLIB_FPU_STATE_SW_OFFSET -
+                       BLINKENLIB_FPU_STATE_ST_OFFSET,
+               "the x87 stack no longer fills its slot in the fpu state block");
+#endif
+
+/*
  * Copies the machine's FPU register file into the packed little-endian block
  * documented in blinkenlib.h. The whole file travels as one block so that the
  * javascript side pays one bridge call per step whatever the instruction

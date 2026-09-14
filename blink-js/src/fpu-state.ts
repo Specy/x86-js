@@ -95,7 +95,14 @@ export type X86FpuState = {
     fctrl: number
     /** The 16-bit x87 status word. TOP lives in bits 11..13. */
     fstat: number
-    /** The 16-bit x87 tag word, two bits per PHYSICAL stack slot. */
+    /**
+     * The 16-bit x87 tag word, two bits per PHYSICAL stack slot: the tag for
+     * logical `st[i]` is bits `2 * ((i + TOP) & 7)` of this word, with
+     * `TOP = (fstat >> 11) & 7`. A tag of `0b11` means the slot is empty and
+     * the matching `st[i]` value is meaningless - Blink leaves whatever the
+     * slot last held there, which commonly reads back as a NaN.
+     * `readLogicalStTags()` does that rotation for you.
+     */
     ftag: number
 }
 
@@ -208,6 +215,24 @@ export function readLogicalStBits(raw: Uint8Array): bigint[] {
         bits[logical] = view.getBigUint64(X86_FPU_STATE_ST_OFFSET + (((logical + top) & 7) * 8), true)
     }
     return bits
+}
+
+/**
+ * The two-bit x87 tag of each stack slot, in LOGICAL order to match
+ * `X86FpuState.st`: `readLogicalStTags(raw)[0]` tags `st(0)`. `0b00` is a
+ * valid value, `0b01` zero, `0b10` a special (NaN or infinity) and `0b11` an
+ * empty slot whose `st` value must not be shown as a number.
+ */
+export function readLogicalStTags(raw: Uint8Array): number[] {
+    assertBlockSize(raw, 'an x86 FPU state block')
+    const view = viewOf(raw)
+    const top = topOfStack(view.getUint32(X86_FPU_STATE_SW_OFFSET, true) & WORD_MASK)
+    const tagWord = view.getUint32(X86_FPU_STATE_TW_OFFSET, true) & WORD_MASK
+    const tags: number[] = new Array(ST_COUNT)
+    for (let logical = 0; logical < ST_COUNT; logical += 1) {
+        tags[logical] = (tagWord >> (2 * ((logical + top) & 7))) & 3
+    }
+    return tags
 }
 
 /** True when two blocks hold the same bytes. The common step changes nothing, and this is all it costs. */

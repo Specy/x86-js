@@ -533,12 +533,23 @@ export class BlinkRuntime {
      * A copy of the whole packed FPU state block: `xmm0..xmm15`, `mxcsr`, the
      * x87 stack and its control, status and tag words. One bridge call reads
      * the lot, so a per-step snapshot costs the same whatever the instruction
-     * touched. Before a program is loaded there is no machine, and the block
-     * reads as zeros.
+     * touched. Before a program is loaded there is no machine, the bridge
+     * answers with an empty array, and the block reads as zeros.
+     *
+     * Any other length means the wasm and this package disagree about the
+     * layout, which would silently degrade every read to zeros, every step to
+     * "the FPU did not change" and every undo to writing a zeroed FPU file, so
+     * it throws instead.
      */
     getFpuStateRaw(): Uint8Array {
         const raw = this.module.blinkenlibGetFpuState()
-        return raw.length === X86_FPU_STATE_SIZE ? raw : emptyFpuStateBlock()
+        if (raw.length === 0) return emptyFpuStateBlock()
+        if (raw.length !== X86_FPU_STATE_SIZE) {
+            throw new Error(
+                `The x86 FPU bridge returned ${raw.length} bytes, expected ${X86_FPU_STATE_SIZE}: the wasm and blink-js are out of step`,
+            )
+        }
+        return raw
     }
 
     /**

@@ -126,9 +126,14 @@ bool SetFpuState(val bytes) {
   uint8_t block[BLINKENLIB_FPU_STATE_SIZE];
   uint32_t length = bytes["length"].as<uint32_t>();
   if (length != BLINKENLIB_FPU_STATE_SIZE) return false;
-  for (uint32_t index = 0; index < length; ++index) {
-    block[index] = static_cast<uint8_t>(bytes[index].as<uint32_t>() & 0xff);
-  }
+  // One bulk copy through TypedArray.prototype.set into a view over the
+  // destination, rather than the 356 separate property reads WriteMemoryBytes
+  // does: undo writes this whole block back on every step it rolls back, so
+  // this sits on an interactive path. The view is only alive for the call, so
+  // memory growth cannot detach it.
+  val(emscripten::typed_memory_view(
+          static_cast<size_t>(BLINKENLIB_FPU_STATE_SIZE), block))
+      .call<void>("set", bytes);
   return blinkenlib_set_fpu_state(block);
 }
 

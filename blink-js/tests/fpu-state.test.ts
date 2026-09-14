@@ -21,6 +21,7 @@ import {
     encodeFpuState,
     fpuStateBlocksEqual,
     readLogicalStBits,
+    readLogicalStTags,
 } from '../src/fpu-state'
 
 /** Builds a block whose every field is distinguishable, so a swapped offset shows up. */
@@ -88,6 +89,17 @@ describe('x86 FPU state block', () => {
             return buffer.getFloat64(0, true)
         })
         expect(asDoubles).toEqual([7, 8, 1, 2, 3, 4, 5, 6])
+    })
+
+    it('rotates the tag word into logical order beside the stack values', () => {
+        // 0b11 (empty) for physical slots 0 and 1, 0b00 (valid) for the rest.
+        const raw = makeBlock({ top: 6 })
+        new DataView(raw.buffer).setUint32(X86_FPU_STATE_TW_OFFSET, 0b1111, true)
+
+        // TOP = 6, so logical st(0) is physical 6 and st(2) is physical 0.
+        expect(readLogicalStTags(raw)).toEqual([0, 0, 3, 3, 0, 0, 0, 0])
+        // The raw word stays physical, as ftag is documented to be.
+        expect(decodeFpuState(raw).ftag).toBe(0b1111)
     })
 
     it('round trips a block byte for byte through decode and encode', () => {

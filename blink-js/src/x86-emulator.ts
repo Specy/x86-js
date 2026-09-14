@@ -381,10 +381,13 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * Presets the SSE and x87 register files. The write goes straight into the
      * machine, like `setRegisterValue`, so it never becomes an undo entry; the
      * x87 op, instruction and data pointers are left as the machine had them.
+     *
+     * Like the other setters it does NOT resume the machine: presetting a
+     * register on a terminated or paused program must not erase why it
+     * stopped. The next step resumes a paused machine on its own.
      */
     setFpuState(state: X86FpuState): void {
         this.runtime.setFpuStateRaw(encodeFpuState(state, this.runtime.getFpuStateRaw()))
-        this.runtime.resumeAfterStateMutation()
     }
 
     hasTerminated(): boolean {
@@ -578,6 +581,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * Notes the SSE and x87 registers the step wrote. Most instructions touch
      * none of them, and that case costs one byte comparison: only a block that
      * actually differs is decoded and diffed register by register.
+     *
+     * The block carries three fields `X86FpuState` does not name - the last
+     * x87 opcode and the instruction and data pointers - so a step that moves
+     * only those decodes both blocks and then names no register. Undo stays
+     * exact either way, because it restores the whole block rather than
+     * replaying the mutations.
      */
     private recordFpuMutations(
         fpuBefore: Uint8Array,
@@ -608,7 +617,10 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         }
 
         // Compared as bit patterns, in logical order: a push or a pop moves TOP,
-        // so st(0) can change without any physical slot being written.
+        // so st(0) can change without any physical slot being written. The
+        // consequence is that one push renames every live slot, and a single
+        // `fld` onto a non-empty stack reports st0, st1, st2... - the names are
+        // what the register panel shows, not the slot the instruction wrote.
         const stBitsBefore = readLogicalStBits(fpuBefore)
         const stBitsAfter = readLogicalStBits(fpuAfter)
         for (let index = 0; index < stBitsBefore.length; index += 1) {

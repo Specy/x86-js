@@ -459,6 +459,37 @@ _start:
         emulator.dispose()
     })
 
+    it('does not resurrect a terminated program when the FPU state is preset', async () => {
+        const emulator = await createX86Emulator()
+        const result = await emulator.compile(`
+.global _start
+.text
+_start:
+  mov $60, %rax
+  mov $3, %rdi
+  syscall
+`)
+
+        expect(result.ok).toBe(true)
+        emulator.initialize(8)
+        await stepUntil(emulator, () => emulator.hasTerminated())
+        expect(emulator.getStatus()).toBe(EmulatorStatus.Terminated)
+
+        // A setter presets state; it must not clear the reason the program
+        // stopped, exactly as setRegisterValue does not.
+        emulator.setRegisterValue('rbx', 1n)
+        expect(emulator.hasTerminated()).toBe(true)
+        expect(emulator.getStatus()).toBe(EmulatorStatus.Terminated)
+
+        const state = emulator.getFpuState()
+        state.xmm[0] = 7n
+        emulator.setFpuState(state)
+        expect(emulator.getFpuState().xmm[0]).toBe(7n)
+        expect(emulator.hasTerminated()).toBe(true)
+        expect(emulator.getStatus()).toBe(EmulatorStatus.Terminated)
+        emulator.dispose()
+    })
+
     it('records no FPU mutations for a step that touches no FPU state', async () => {
         const emulator = await createX86Emulator()
         const result = await emulator.compile(`

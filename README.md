@@ -102,7 +102,9 @@ fpu.fctrl    // and fstat, ftag: the 16-bit control, status and tag words
 
 `st` is in logical order, so `st[0]` is always the top of the stack; the rotation by TOP that Blink's physical array needs is applied for you. Blink keeps the x87 stack as 64-bit doubles rather than 80-bit extended values, so `st` entries are exactly the doubles the machine holds and long-double precision is not modelled.
 
-`setFpuState(state)` writes the file back. Like `setRegisterValue`, it goes straight into the machine and is never recorded as an undoable step; the x87 opcode, instruction and data pointers are left as the machine had them. Writes to these registers made by instructions *are* recorded: a step that touches them names them as `WriteRegister` mutations (`xmm0` at `RegisterSize.Quad`, `st0` at `RegisterSize.Double`, `fctrl`/`fstat`/`ftag` at `RegisterSize.Word`), and `undo()` restores the whole file.
+`ftag` is the raw tag word, indexed by *physical* slot; `readLogicalStTags(raw)` rotates it so that entry `i` tags `st[i]`. A tag of `0b11` means the slot is empty and the matching `st[i]` value is meaningless - Blink leaves whatever the slot last held there, which commonly reads back as a NaN.
+
+`setFpuState(state)` writes the file back. Like `setRegisterValue`, it goes straight into the machine and is never recorded as an undoable step, and like the other setters it does not resume a program that has terminated or paused; the x87 opcode, instruction and data pointers are left as the machine had them. Writes to these registers made by instructions *are* recorded: a step that touches them names them as `WriteRegister` mutations (`xmm0` at `RegisterSize.Quad`, `st0` at `RegisterSize.Double`, `fctrl`/`fstat`/`ftag` at `RegisterSize.Word`), and `undo()` restores the whole file. Because `st` mutations are named logically, one push renames every live slot: a single `fld` onto a non-empty stack reports `st0`, `st1`, `st2`... rather than only the slot the instruction wrote.
 
 ### Undo history and call stack
 
