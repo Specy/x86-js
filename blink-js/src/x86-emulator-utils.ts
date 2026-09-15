@@ -9,6 +9,22 @@ export type UndoMemoryWrite = {
     old: number[]
 }
 
+/**
+ * The state a `beginPoke()` transaction captured, kept until `endPoke()` diffs
+ * it into one history entry. Registers and the FPU block are diffed from the
+ * snapshots, so the setters themselves stay untouched; only memory has to be
+ * journaled as it is written, because the bytes it overwrote are gone
+ * afterwards.
+ */
+export type OpenPokeTransaction = {
+    registersBefore: RegisterValues
+    flagsBefore: number
+    fpuBefore: Uint8Array
+    callStackBefore: StackFrame[]
+    /** The ranges written inside the transaction, oldest first, each with the bytes it overwrote. */
+    memoryWrites: UndoMemoryWrite[]
+}
+
 export type X86HistoryEntry = ExecutionStep & {
     registersBefore: RegisterValues
     flagsBefore: number
@@ -107,12 +123,14 @@ export function cloneCallStack(stack: StackFrame[]): StackFrame[] {
 
 export function stripPrivateHistory(entry: X86HistoryEntry): ExecutionStep {
     return {
+        kind: entry.kind,
         mutations: entry.mutations,
         pc: entry.pc,
         old_ccr: entry.old_ccr,
         new_ccr: entry.new_ccr,
         line: entry.line,
         file: entry.file,
+        ...(entry.writes ? { writes: entry.writes } : {}),
     }
 }
 

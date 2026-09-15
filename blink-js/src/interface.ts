@@ -51,7 +51,34 @@ export enum RegisterSize {
     Quad = 16
 }
 
+/**
+ * What produced a history entry: an instruction the program ran, or a Poke,
+ * one or more register and memory values the host changed between two
+ * instructions. Always present on an entry, so a reader never has to infer it.
+ */
+export type ExecutionStepKind = 'instruction' | 'poke'
+
+/**
+ * One value a Poke changed, with what the emulator held when the write was
+ * made and what it holds when the transaction closes. Register names are the
+ * ones this package already uses: `rax`, `xmm3`, `st0`, `mxcsr` and so on.
+ */
+export type PokeWrite =
+    | {
+          type: 'register'
+          name: string
+          old: bigint
+          new: bigint
+      }
+    | {
+          type: 'memory'
+          address: bigint
+          old: number[]
+          new: number[]
+      }
+
 export type ExecutionStep = {
+    kind: ExecutionStepKind
     mutations: MutationOperation[]
     pc: number
     old_ccr: {
@@ -62,6 +89,8 @@ export type ExecutionStep = {
     }
     line: number
     file?: string
+    /** Present only on a `poke` entry: the values the host wrote, old and new. */
+    writes?: PokeWrite[]
 }
 
 export type MutationOperation =
