@@ -37,6 +37,7 @@ import {
     cloneCallStack,
     cloneRegisterValues,
     deferToHost,
+    isRecordableWrite,
     makeFrameColor,
     maskForSize,
     maskRegisterValue,
@@ -342,7 +343,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             if (old === value) continue
             mutations.push({
                 type: 'WriteRegister',
-                value: { register, old, size: RegisterSize.Double },
+                value: { register, old, new: value, size: RegisterSize.Double },
             })
             writes.push({ type: 'register', name: register, old, new: value })
         }
@@ -696,6 +697,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const flagsAfter = nativeStep.valid ? nativeStep.flagsAfter : after.flags
         const mutations: ExecutionStep['mutations'] = []
 
+        // Both sides come from the two snapshots the step already takes, so a
+        // write reports what it left without any extra read of the machine.
         for (const register of X86_REGISTER_NAMES) {
             if (register === 'rip') continue
             if (registersBefore[register] !== registersAfter[register]) {
@@ -704,6 +707,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                     value: {
                         register,
                         old: registersBefore[register],
+                        new: registersAfter[register],
                         size: RegisterSize.Double,
                     },
                 })
@@ -766,6 +770,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 value: {
                     register: X86_SSE_REGISTERS[index]!,
                     old: stateBefore.xmm[index]!,
+                    new: stateAfter.xmm[index]!,
                     size: RegisterSize.Quad,
                 },
             })
@@ -779,7 +784,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         if (stateBefore.mxcsr !== stateAfter.mxcsr) {
             mutations.push({
                 type: 'WriteRegister',
-                value: { register: 'mxcsr', old: BigInt(stateBefore.mxcsr), size: RegisterSize.Long },
+                value: {
+                    register: 'mxcsr',
+                    old: BigInt(stateBefore.mxcsr),
+                    new: BigInt(stateAfter.mxcsr),
+                    size: RegisterSize.Long,
+                },
             })
             writes?.push({
                 type: 'register',
@@ -803,6 +813,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 value: {
                     register: X86_X87_REGISTERS[index]!,
                     old: stBitsBefore[index]!,
+                    new: stBitsAfter[index]!,
                     size: RegisterSize.Double,
                 },
             })
@@ -818,7 +829,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             if (stateBefore[word] === stateAfter[word]) continue
             mutations.push({
                 type: 'WriteRegister',
-                value: { register: word, old: BigInt(stateBefore[word]), size: RegisterSize.Word },
+                value: {
+                    register: word,
+                    old: BigInt(stateBefore[word]),
+                    new: BigInt(stateAfter[word]),
+                    size: RegisterSize.Word,
+                },
             })
             writes?.push({
                 type: 'register',
@@ -877,7 +893,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             undoWrites.push(range)
             mutations.push({
                 type: 'WriteMemoryBytes',
-                value: { address: range.address, old: [...range.old] },
+                value: { address: range.address, old: [...range.old], new: [...current] },
             })
             writes.push({
                 type: 'memory',
@@ -889,13 +905,43 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return undoWrites
     }
 
+    /**
+     * The memory a step wrote. The native journal hands over the bytes each
+     * store REPLACED, captured in the machine at that store; it records
+     * nothing about what a store PUT there. So `old` is the machine's own
+     * capture, taken at the write, while `new` is read out of the machine as
+     * the entry is recorded - the step has finished and nothing has run since,
+     * so those addresses still hold what the step left.
+     *
+     * The read costs one page lookup per store: one for the single store
+     * almost every store-bearing instruction journals, and none at all for the
+     * majority of instructions, which write no memory. It goes through the
+     * machine's own page lookup rather than the byte-by-byte bridge (see
+     * `BlinkRuntime.spyMemoryBytes`), which keeps it far below the cost of
+     * tracing the step around it.
+     *
+     * What reading rather than journaling costs: were one step to store twice
+     * over the same address, both entries would report the bytes the step
+     * ENDED with rather than the bytes each store left. No x86 instruction
+     * reachable here does that - blink coalesces a `rep` into one record, and
+     * push, call, ret, enter, leave, `xchg` with memory and read-modify-write
+     * arithmetic each journal a single store - so nothing observable turns on
+     * it today. Only a post-image in the native journal would close it, and
+     * that needs the wasm rebuilt, which this package does not do.
+     *
+     * A range the machine refuses to read back - a step can unmap what it
+     * wrote - leaves that entry with no new bytes rather than a guess, and the
+     * read never throws out of recording. Truncated writes keep their existing
+     * `Other` shape and stay out of the undo journal.
+     */
     private recordMemoryMutations(
         writes: NativeMemoryWrite[],
         mutations: ExecutionStep['mutations'],
     ): UndoMemoryWrite[] {
         const undoWrites: UndoMemoryWrite[] = []
-        for (const write of writes) {
-            if (write.truncated || write.old.length !== write.size) {
+        const written = this.writtenBytes(writes)
+        for (const [index, write] of writes.entries()) {
+            if (!isRecordableWrite(write)) {
                 mutations.push({
                     type: 'Other',
                     value: `Wrote ${write.size} bytes to 0x${write.address.toString(16)}`,
@@ -908,10 +954,39 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 value: {
                     address: write.address,
                     old: [...write.old],
+                    new: written[index] ?? [],
                 },
             })
         }
         return undoWrites
+    }
+
+    /**
+     * The bytes each of a step's stores left, by the index of that store: what
+     * the addresses that store wrote hold now, at the width of the write. One
+     * lookup per store it can account for, and none for a store it cannot.
+     */
+    private writtenBytes(writes: NativeMemoryWrite[]): number[][] {
+        return writes.map((write) =>
+            isRecordableWrite(write) ? this.readBytes(write.address, write.size) : [],
+        )
+    }
+
+    /**
+     * One read of the machine that answers with nothing rather than throwing,
+     * so recording a step can never fail after the instruction already ran.
+     * It takes the machine's own page lookup when that can answer for the
+     * whole range and the byte-by-byte bridge otherwise; the two read the same
+     * memory the same way.
+     */
+    private readBytes(address: bigint, length: number): number[] {
+        const spied = this.runtime.spyMemoryBytes(address, length)
+        if (spied) return Array.from(spied)
+        try {
+            return [...this.runtime.readMemoryBytes(address, BigInt(length))]
+        } catch {
+            return []
+        }
     }
 
     private recordControlFlowMutation(

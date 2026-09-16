@@ -30,6 +30,19 @@ import type {
     RegisterSnapshot,
 } from './wasm-types'
 
+/** The machine's page size: a page is contiguous in the host heap, the next page need not be. */
+const BLINK_PAGE_SIZE = 4096
+
+/**
+ * The shadow-memory range blink keeps for its own bookkeeping, which the
+ * memory bridge refuses to read. Kept in step with `IsShadow` in
+ * `blink/blinkenlib.c`, so the fast read path refuses exactly what the bridge
+ * refuses.
+ */
+export function isShadowAddress(address: bigint): boolean {
+    return address >= 0x7fff8000n && address < 0x100080000000n
+}
+
 const SIGNALS = {
     SIGTRAP: 5,
     SIGXCPU: 24,
@@ -89,6 +102,8 @@ type StateWaiter = {
 
 export class BlinkRuntime {
     readonly module: BlinkenlibModule
+    /** Cached view over the wasm heap, for `spyMemoryBytes`; growth invalidates it. */
+    private heapView: Uint8Array | null = null
 
     mode: AssemblerMode
     state = BlinkState.NotReady
@@ -500,6 +515,52 @@ export class BlinkRuntime {
         const result = this.module.blinkenlibReadMemoryBytes(address, size)
         if (!result.ok) throw new Error(`${result.error}: 0x${address.toString(16)}`)
         return Uint8Array.from(result.bytes)
+    }
+
+    /**
+     * The bytes at `address` read straight out of the machine's own pages,
+     * or null when the machine cannot answer for the whole range.
+     *
+     * `blinkenlibReadMemoryBytes` looks each byte up and then builds a
+     * JavaScript array inside the bridge, which costs about four times as much
+     * as this does; recording a step reads only addresses the step just wrote,
+     * so it takes this path and falls back to the bridge whenever this one
+     * declines. The two agree byte for byte because they do the same lookup:
+     * `blinkenlib_spy_address` IS the lookup `blinkenlib_read_memory_byte`
+     * makes, and the shadow-memory range the bridge refuses is refused here
+     * too. A page is contiguous in the host heap and the next page need not
+     * be, so the read stops at every page boundary and looks the next one up.
+     */
+    spyMemoryBytes(address: bigint, length: number): Uint8Array | null {
+        const spy = this.module._blinkenlib_spy_address
+        if (!spy || !this.module.wasmExports?.memory) return null
+        if (!Number.isSafeInteger(length) || length <= 0) return null
+        // Without a machine there are no pages to look into, and the bridge
+        // answers that case with an error rather than a pointer.
+        if (this.state === BlinkState.NotReady || this.state === BlinkState.Ready) return null
+
+        const bytes = new Uint8Array(length)
+        let offset = 0
+        while (offset < length) {
+            const target = address + BigInt(offset)
+            if (isShadowAddress(target)) return null
+            const pointer = spy.call(this.module, target) >>> 0
+            if (pointer === 0) return null
+            const take = Math.min(BLINK_PAGE_SIZE - Number(target & 4095n), length - offset)
+            bytes.set(this.heapBytes().subarray(pointer, pointer + take), offset)
+            offset += take
+        }
+        return bytes
+    }
+
+    /**
+     * A view over the wasm heap, rebuilt only when growth has replaced the
+     * buffer the last one was taken from.
+     */
+    private heapBytes(): Uint8Array {
+        const buffer = this.module.wasmExports!.memory!.buffer
+        if (!this.heapView || this.heapView.buffer !== buffer) this.heapView = new Uint8Array(buffer)
+        return this.heapView
     }
 
     writeMemoryBytes(address: bigint, data: Uint8Array): void {

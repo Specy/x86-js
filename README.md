@@ -130,6 +130,8 @@ if (emulator.canUndo()) {
 
 History entries include register writes, memory writes, flag changes, and call-stack mutations. `getUndoHistory(max)` returns the newest entries first, as `ExecutionStep[]`, which is useful for instruction-history UIs.
 
+Every write mutation carries both sides of the change: `old`, the value it replaced, and `new`, the value it left. A `WriteRegister` reports the WHOLE register on both sides, whatever width the store was - `mov $0xff, %al` on an `rax` of `0x1122334455667788` reports `old: 0x1122334455667788n, new: 0x11223344556677ffn` - and a `WriteMemoryBytes` reports the bytes at the width of the write, the ones it overwrote and the ones it left there. Register and FPU values come from the two snapshots the step already takes, so they cost nothing extra. Memory is different: the machine's write journal captures the bytes a store replaced, at that store, but records nothing about what it put there, so `new` is read back out of the machine as the entry is recorded, with the step over and nothing run since. That read is one page lookup per contiguous run of written addresses, and none at all for an instruction that writes no memory. It has one consequence: were one step ever to store twice over the same address, both entries would report the bytes the step ENDED with - no reachable x86 instruction journals two stores to one address, and closing it for good would need a post-image in the native journal, which means rebuilding the wasm. Once recorded, an entry keeps saying what its own step wrote however much has happened afterwards.
+
 ```ts
 for (const step of emulator.getUndoHistory(10)) {
   console.log(step.pc, step.mutations)

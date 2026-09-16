@@ -114,6 +114,15 @@ export type BlinkenlibModule = {
     blinkenlibGetFpuState(): Uint8Array
     /** Restores the whole packed FPU state block; false when there is no machine or the length is wrong. */
     blinkenlibSetFpuState(bytes: Uint8Array | number[]): boolean
+    /**
+     * The host address of a guest byte inside the wasm heap, or 0 when the
+     * address is not mapped - the same lookup `blinkenlibReadMemoryBytes` does
+     * per byte, without building a JavaScript array. Optional: a build whose
+     * bridge does not export it simply has no fast read path.
+     */
+    _blinkenlib_spy_address?(address: bigint): number
+    /** The wasm instance's own exports; `memory.buffer` is the heap `_blinkenlib_spy_address` points into. */
+    wasmExports?: { memory?: { buffer: ArrayBuffer } }
     blinkenlibReadMemoryBytes(address: bigint, length: number): MemoryReadResult
     blinkenlibWriteMemoryBytes(address: bigint, bytes: Uint8Array | number[]): MemoryWriteResult
     blinkenlibGetDisassembly(): DisassemblySnapshot

@@ -144,6 +144,7 @@ const xmmWrite = fpu
 assert.ok(xmmWrite, 'the step names xmm0 as a register write')
 assert.equal(xmmWrite.value.size, RegisterSize.Quad, 'an xmm write is 16 bytes wide')
 assert.equal(xmmWrite.value.old, 0n)
+assert.equal(xmmWrite.value.new, 0x4010000000000000n, 'the write reports the value it wrote as well as the one it replaced')
 
 await fpu.step()
 await fpu.step()
@@ -179,6 +180,43 @@ assert.deepEqual(
 fpu.dispose()
 
 // ---------------------------------------------------------------------------
+// What a memory write left
+// ---------------------------------------------------------------------------
+
+// The memory half of the write values: a store's history entry names the bytes
+// it replaced and the bytes it left, at the width of the store.
+const stores = await createX86Emulator({ mode: 'GNU_trunk' })
+const storesBuilt = await stores.compile([
+    '.global _start',
+    '.data',
+    'buffer: .quad 0x1122334455667788',
+    '.text',
+    '_start:',
+    '  lea buffer(%rip), %rbx',
+    '  movw $0xbeef, (%rbx)',
+    '  mov $60, %rax',
+    '  xor %rdi, %rdi',
+    '  syscall',
+].join('\n'))
+assert.equal(storesBuilt.ok, true, `the store program should assemble: ${storesBuilt.report}`)
+
+stores.initialize(8)
+await stores.step()
+const bufferAddress = stores.getRegisterValue('rbx')
+await stores.step()
+const memoryWrite = stores
+    .getUndoHistory(1)[0]
+    .mutations.find((mutation) => mutation.type === 'WriteMemoryBytes')
+assert.ok(memoryWrite, 'the step names the memory it wrote')
+assert.equal(memoryWrite.value.address, bufferAddress)
+assert.deepEqual(memoryWrite.value.old, [0x88, 0x77], 'the two bytes the store replaced')
+assert.deepEqual(memoryWrite.value.new, [0xef, 0xbe], 'the two bytes it left, at the width of the store')
+assert.deepEqual(Array.from(stores.readMemoryBytes(bufferAddress, 2n)), memoryWrite.value.new)
+stores.undo()
+assert.deepEqual(Array.from(stores.readMemoryBytes(bufferAddress, 2n)), [0x88, 0x77], 'undo puts the old bytes back')
+stores.dispose()
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
@@ -194,4 +232,4 @@ assert.equal(failed.errors[0].line, 5, 'the diagnostic points at the line it is 
 assert.equal(typeof failed.errors[0].error, 'string')
 broken.dispose()
 
-console.log(`ok - ran a program to exit code 7, a two-file project to a breakpoint, the SSE and x87 register files through undo, and read ${failed.errors.length} diagnostic(s)`)
+console.log(`ok - ran a program to exit code 7, a two-file project to a breakpoint, the SSE and x87 register files through undo, checked both sides of a store, and read ${failed.errors.length} diagnostic(s)`)

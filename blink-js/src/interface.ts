@@ -93,12 +93,23 @@ export type ExecutionStep = {
     writes?: PokeWrite[]
 }
 
+/**
+ * What a history entry says an instruction or a Poke changed. Every write
+ * carries BOTH sides of the change: `old`, the value it replaced, and `new`,
+ * the value it left, each as this package reports that value elsewhere -
+ * a whole 64-bit register as a bigint, memory as a byte array. An entry is
+ * fixed when it is recorded and keeps saying what its own step did however
+ * much has happened since.
+ */
 export type MutationOperation =
     | {
           type: 'WriteRegister'
           value: {
               register: string
+              /** The WHOLE register before the write, whatever width the store was. */
               old: bigint
+              /** The whole register after it, from the same post-step snapshot the entry was diffed from. */
+              new: bigint
               size: RegisterSize
           }
       }
@@ -107,6 +118,7 @@ export type MutationOperation =
           value: {
               address: bigint
               old: bigint
+              new: bigint
               size: RegisterSize
           }
       }
@@ -114,7 +126,20 @@ export type MutationOperation =
           type: 'WriteMemoryBytes'
           value: {
               address: bigint
+              /** The bytes the write replaced, at the width of the write. */
               old: number[]
+              /**
+               * The bytes the write left at that address, at the same width.
+               * The machine's write journal captures only the bytes a store
+               * replaced, so these are read out of the machine as the entry is
+               * recorded - the step has finished and nothing has run since,
+               * which is why they are still the bytes that step left. Were one
+               * step ever to store twice over the same address, both entries
+               * would report the bytes the step ENDED with; no x86 instruction
+               * reachable here journals two stores to one address. Empty when
+               * the machine refused to read the range back.
+               */
+              new: number[]
           }
       }
     | {

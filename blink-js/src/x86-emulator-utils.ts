@@ -1,6 +1,6 @@
 import { RegisterSize, type ExecutionStep, type StackFrame } from './interface'
 import { X86_REGISTER_NAMES, type X86RegisterName } from './types'
-import type { RegisterSnapshot } from './wasm-types'
+import type { NativeMemoryWrite, RegisterSnapshot } from './wasm-types'
 
 export type RegisterValues = Record<X86RegisterName, bigint>
 
@@ -23,6 +23,15 @@ export type OpenPokeTransaction = {
     callStackBefore: StackFrame[]
     /** The ranges written inside the transaction, oldest first, each with the bytes it overwrote. */
     memoryWrites: UndoMemoryWrite[]
+}
+
+/**
+ * Whether a native memory write is one a history entry can report in full:
+ * the machine captured every byte it replaced. A write that overflowed the
+ * native journal keeps its `Other` shape instead and stays out of undo.
+ */
+export function isRecordableWrite(write: NativeMemoryWrite): boolean {
+    return !write.truncated && write.old.length === write.size
 }
 
 export type X86HistoryEntry = ExecutionStep & {
