@@ -58,6 +58,16 @@ import {
     type X86FpuState,
 } from './fpu-state'
 
+/** What {@link X86Emulator.run} does with the breakpoint the program counter is on. */
+export type X86RunOptions = {
+    /**
+     * `true` (the default) runs the instruction the program counter is on even
+     * when a breakpoint names it, which is what continuing from a breakpoint
+     * needs; `false` stops before it, having run nothing.
+     */
+    skipBreakpointAtPc?: boolean
+}
+
 export type X86EmulatorOptions = Omit<BlinkRuntimeOptions, 'callbacks' | 'mode'> & {
     mode?: AssemblerMode | AssemblerId
     callbacks?: BlinkRuntimeCallbacks
@@ -540,15 +550,35 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.runtime.state === BlinkState.ProgramStopped
     }
 
-    async run(limit?: number, breakpoints: X86Breakpoint[] = []): Promise<EmulatorStatus> {
+    /**
+     * Runs until the program stops for input, hits one of `breakpoints`, runs
+     * `limit` instructions or ends.
+     *
+     * `options.skipBreakpointAtPc` says what a breakpoint on the instruction
+     * the program counter is *already* on does, and only that one. It defaults
+     * to `true`, which runs it anyway: without that, a run resumed from a
+     * breakpoint stops on the same breakpoint again having executed nothing,
+     * and the program never moves. A caller that resumes mid-program some
+     * other way - after feeding the program its input, or after its own budget
+     * ran out - passes `false`, because the instruction it is about to run has
+     * not run yet.
+     */
+    async run(
+        limit?: number,
+        breakpoints: X86Breakpoint[] = [],
+        options: X86RunOptions = {},
+    ): Promise<EmulatorStatus> {
         this.assertNoOpenPoke('run')
         this.validateRunLimit(limit)
         const breakpointAddresses = this.resolveBreakpointAddresses(breakpoints)
         const wasExecuting = this.executing
         this.executing = true
         try {
-            if (this.isTracingEnabled()) return await this.runWithHistory(limit, breakpointAddresses)
-            if (breakpointAddresses.length) return await this.runWithBreakpoints(limit, breakpointAddresses)
+            //the instruction loop is what records history and what stops on a
+            //breakpoint; the runtime's own loop is only for a run with neither
+            if (this.isTracingEnabled() || breakpointAddresses.length) {
+                return await this.runInstructions(limit, breakpointAddresses, options)
+            }
             await this.runtime.runUntilBlocked({ limit, breakpointAddresses })
             return this.getStatus()
         } finally {
@@ -585,16 +615,35 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return [...addresses.values()]
     }
 
-    private async runWithBreakpoints(limit: number | undefined, breakpointAddresses: bigint[]): Promise<EmulatorStatus> {
+    /**
+     * One instruction at a time, which is what a breakpoint and the execution
+     * history both need: `step` records the history when tracing is on, and a
+     * breakpoint is checked before the instruction it names executes, so the
+     * program stops with that instruction still to run.
+     */
+    private async runInstructions(
+        limit: number | undefined,
+        breakpointAddresses: bigint[],
+        options: X86RunOptions,
+    ): Promise<EmulatorStatus> {
         const breakpointSet = new Set(breakpointAddresses.map((address) => address.toString()))
         const hasLimit = limit !== undefined && limit > 0
         let executedInstructions = 0
 
+        //before the program counter is read: a program that has not started has
+        //no meaningful one, and `starti` runs no instruction, so this leaves it
+        //on the instruction the run is about to execute either way
         this.prepareOneInstructionRun()
+
+        //the breakpoint the run starts on, which `skipBreakpointAtPc` runs past:
+        //null once the first instruction has been executed, so the same address
+        //reached again later - a loop closing on it - stops the run
+        let skipAt: string | null =
+            (options.skipBreakpointAtPc ?? true) ? this.getPc().toString() : null
 
         while (this.runtime.state === BlinkState.ProgramRunning) {
             const pc = this.getPc()
-            if (breakpointSet.has(pc.toString())) {
+            if (breakpointSet.has(pc.toString()) && pc.toString() !== skipAt) {
                 this.runtime.pauseForBreakpoint(
                     pc,
                     this.runtime.getSourceLocationForAddress(pc) ?? undefined,
@@ -607,35 +656,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             }
 
             await this.step()
-            executedInstructions += 1
-            if (executedInstructions % 10000 === 0) await deferToHost()
-        }
-
-        return this.getStatus()
-    }
-
-    private async runWithHistory(limit: number | undefined, breakpointAddresses: bigint[]): Promise<EmulatorStatus> {
-        const breakpointSet = new Set(breakpointAddresses.map((address) => address.toString()))
-        const hasLimit = limit !== undefined && limit > 0
-        let executedInstructions = 0
-
-        this.prepareOneInstructionRun()
-
-        while (this.runtime.state === BlinkState.ProgramRunning) {
-            const pc = this.getPc()
-            if (breakpointSet.has(pc.toString())) {
-                this.runtime.pauseForBreakpoint(
-                    pc,
-                    this.runtime.getSourceLocationForAddress(pc) ?? undefined,
-                )
-                return this.getStatus()
-            }
-            if (hasLimit && executedInstructions >= limit) {
-                this.runtime.pauseForLimit(pc, BigInt(executedInstructions))
-                return this.getStatus()
-            }
-
-            await this.step()
+            skipAt = null
             executedInstructions += 1
             if (executedInstructions % 10000 === 0) await deferToHost()
         }

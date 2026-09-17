@@ -279,5 +279,6 @@ export abstract class BaseEmulator<
     abstract run(
         limit?: number,
         breakpoints?: Array<number | { path: string; line: number }>,
+        options?: { skipBreakpointAtPc?: boolean },
     ): Promise<EmulatorStatus>;
 }

@@ -203,6 +203,66 @@ _start:
         emulator.dispose()
     })
 
+    it('continues past the breakpoint it is parked on, and stops at the next one', async () => {
+        //the editor hands the same breakpoints to every run, so a run resumed
+        //from a breakpoint used to stop on it again having executed nothing and
+        //the program never moved
+        const emulator = await createX86Emulator()
+        const result = await emulator.compile([
+            '.global _start',
+            '.text',
+            '_start:',
+            '  mov $1, %rax',
+            '  mov $2, %rbx',
+            '  mov $3, %rcx',
+            '  mov $60, %rax',
+            '  xor %rdi, %rdi',
+            '  syscall',
+        ].join('\n'))
+        expect(result.ok).toBe(true)
+
+        const breakpoints = [4, 5]
+        expect(await emulator.run(undefined, breakpoints)).toBe(EmulatorStatus.Running)
+        expect(emulator.getInstructionAt(emulator.getPc())?.lineNumber).toBe(4)
+
+        expect(await emulator.run(undefined, breakpoints)).toBe(EmulatorStatus.Running)
+        expect(emulator.stopReason?.kind).toBe('breakpoint')
+        expect(emulator.getInstructionAt(emulator.getPc())?.lineNumber).toBe(
+            5,
+        )
+        expect(emulator.getRegisterValue('rbx')).toBe(2n)
+
+        expect(await emulator.run(undefined, breakpoints)).toBe(EmulatorStatus.Terminated)
+        emulator.dispose()
+    })
+
+    it('stops on the breakpoint at the program counter when told not to skip it', async () => {
+        const emulator = await createX86Emulator()
+        const result = await emulator.compile([
+            '.global _start',
+            '.text',
+            '_start:',
+            '  mov $1, %rax',
+            '  mov $2, %rbx',
+            '  mov $60, %rax',
+            '  xor %rdi, %rdi',
+            '  syscall',
+        ].join('\n'))
+        expect(result.ok).toBe(true)
+
+        expect(await emulator.run(undefined, [4])).toBe(EmulatorStatus.Running)
+        expect(emulator.getRegisterValue('rbx')).toBe(0n)
+
+        //nothing runs: the caller has not come from this breakpoint, so the
+        //instruction it names still has to stop the run
+        expect(
+            await emulator.run(undefined, [4], { skipBreakpointAtPc: false }),
+        ).toBe(EmulatorStatus.Running)
+        expect(emulator.getInstructionAt(emulator.getPc())?.lineNumber).toBe(4)
+        expect(emulator.getRegisterValue('rbx')).toBe(0n)
+        emulator.dispose()
+    })
+
     it('captures stdout from a running program', async () => {
         let stdout = ''
         const emulator = await createX86Emulator({
