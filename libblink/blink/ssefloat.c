@@ -356,31 +356,39 @@ void OpRcpps(P) {
   IGNORE_RACES_END();
 }
 
-static void ComissKernel(const u8 rxr[8], const u8 reg[8], struct Machine *m) {
-  bool zf, cf;
-  union DoublePun xd, yd;
-  m->mxcsr &= ~kMxcsrIe;
-  xd.i = Read64(rxr);
-  yd.i = Read64(reg);
-  if (!isunordered(xd.f, yd.f)) {
-    zf = xd.f == yd.f;
-    cf = xd.f < yd.f;
-    m->flags = SetFlag(m->flags, FLAGS_ZF, zf);
-    m->flags = SetFlag(m->flags, FLAGS_CF, cf);
-    m->flags = SetFlag(m->flags, FLAGS_PF, false);
-    m->flags = SetFlag(m->flags, FLAGS_SF, false);
-    m->flags = SetFlag(m->flags, FLAGS_OF, false);
-  } else {
-    m->flags = SetFlag(m->flags, FLAGS_ZF, true);
-    m->flags = SetFlag(m->flags, FLAGS_CF, true);
-    m->flags = SetFlag(m->flags, FLAGS_PF, true);
-    m->flags = SetFlag(m->flags, FLAGS_SF, false);
-    m->flags = SetFlag(m->flags, FLAGS_OF, false);
+static void ComisFlags(struct Machine *m, bool zf, bool cf, bool pf, bool ie) {
+  // MXCSR exception flags are sticky. An unmasked exception suppresses every
+  // EFLAGS update, including clearing OF/SF/AF (SDM COMIS*/UCOMIS*).
+  if (ie) {
     m->mxcsr |= kMxcsrIe;
     if (!(m->mxcsr & kMxcsrIm)) {
       HaltMachine(m, kMachineSimdException);
     }
   }
+  m->flags = SetFlag(m->flags, FLAGS_ZF, zf);
+  m->flags = SetFlag(m->flags, FLAGS_CF, cf);
+  m->flags = SetFlag(m->flags, FLAGS_PF, pf);
+  m->flags = SetFlag(m->flags, FLAGS_SF, false);
+  m->flags = SetFlag(m->flags, FLAGS_OF, false);
+  m->flags = SetFlag(m->flags, FLAGS_AF, false);
+}
+
+static bool ComisNan32(u32 x) {
+  return (x & 0x7fffffff) > 0x7f800000;
+}
+
+static bool ComisNan64(u64 x) {
+  return (x & 0x7fffffffffffffff) > 0x7ff0000000000000;
+}
+
+static void ComissKernel(const u8 rxr[8], const u8 reg[8], struct Machine *m) {
+  bool unordered;
+  union DoublePun xd, yd;
+  xd.i = Read64(rxr);
+  yd.i = Read64(reg);
+  unordered = ComisNan64(xd.i) || ComisNan64(yd.i);
+  ComisFlags(m, unordered || xd.f == yd.f, unordered || xd.f < yd.f,
+             unordered, unordered);
 }
 
 void OpComissVsWs(P) {
@@ -392,25 +400,33 @@ void OpComissVsWs(P) {
     union FloatPun xf, yf;
     xf.i = Read32(XmmRexrReg(m, rde));
     yf.i = Read32(GetModrmRegisterXmmPointerRead4(A));
-    if (!isunordered(xf.f, yf.f)) {
+    bool nx = ComisNan32(xf.i);
+    bool ny = ComisNan32(yf.i);
+    if (!nx && !ny) {
       zf = xf.f == yf.f;
       cf = xf.f < yf.f;
       pf = false;
       ie = false;
     } else {
-      zf = cf = pf = ie = true;
+      zf = cf = pf = true;
+      ie = !isucomiss || (nx && !(xf.i & 0x00400000)) ||
+           (ny && !(yf.i & 0x00400000));
     }
   } else {
     union DoublePun xd, yd;
     xd.i = Read64(XmmRexrReg(m, rde));
     yd.i = Read64(GetModrmRegisterXmmPointerRead8(A));
-    if (!isunordered(xd.f, yd.f)) {
+    bool nx = ComisNan64(xd.i);
+    bool ny = ComisNan64(yd.i);
+    if (!nx && !ny) {
       zf = xd.f == yd.f;
       cf = xd.f < yd.f;
       pf = false;
       ie = false;
     } else {
-      zf = cf = pf = ie = true;
+      zf = cf = pf = true;
+      ie = !isucomiss || (nx && !(xd.i & 0x0008000000000000)) ||
+           (ny && !(yd.i & 0x0008000000000000));
     }
     if (IsMakingPath(m) && !isucomiss) {
       Jitter(A,
@@ -424,20 +440,7 @@ void OpComissVsWs(P) {
              ComissKernel);
     }
   }
-  m->flags = SetFlag(m->flags, FLAGS_ZF, zf);
-  m->flags = SetFlag(m->flags, FLAGS_PF, pf);
-  m->flags = SetFlag(m->flags, FLAGS_CF, cf);
-  m->flags = SetFlag(m->flags, FLAGS_SF, false);
-  m->flags = SetFlag(m->flags, FLAGS_OF, false);
-  if (!isucomiss) {
-    m->mxcsr &= ~kMxcsrIe;
-    if (ie) {
-      m->mxcsr |= kMxcsrIe;
-      if (!(m->mxcsr & kMxcsrIm)) {
-        HaltMachine(m, kMachineSimdException);
-      }
-    }
-  }
+  ComisFlags(m, zf, cf, pf, ie);
   IGNORE_RACES_END();
 }
 

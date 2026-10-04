@@ -2,7 +2,11 @@ import type { BlinkRuntime } from './blink-runtime'
 import { RegisterSize, type ExecutionStep, type PokeWrite, type StackFrame } from './interface'
 import { X86_REGISTER_NAMES } from './types'
 import { X86_FPU_STATE_SIZE } from './fpu-state'
+import type { BlinkenlibModule } from './wasm-types'
 import { makeFrameColor, toHistoryPc } from './x86-emulator-utils'
+
+/** The version of debughistory.c's packets this reader decodes. */
+const PACKET_VERSION = 1
 
 type FpuMutations = (
     before: Uint8Array,
@@ -15,8 +19,27 @@ type FpuMutations = (
 export class NativeHistory {
     private cache = new Map<bigint, ExecutionStep>()
 
-    static available(runtime: BlinkRuntime): boolean {
-        return runtime.module._blinkenlib_history_version?.() === 1
+    /**
+     * The undo history is recorded inside the wasm and nowhere else, and runs
+     * go in the bounded slices it is recorded in. A blinkenlib.wasm built
+     * without either, or with packets of another version, is refused when the
+     * emulator is created instead of failing at the first step.
+     */
+    static assertSupported(module: BlinkenlibModule): void {
+        const version = module._blinkenlib_history_version?.()
+        if (version === undefined) {
+            throw new Error(
+                'This blinkenlib.wasm records no undo history: @specy/x86 needs a build with debughistory.c',
+            )
+        }
+        if (version !== PACKET_VERSION) {
+            throw new Error(
+                `This blinkenlib.wasm records undo history version ${version}, and @specy/x86 reads version ${PACKET_VERSION}`,
+            )
+        }
+        if (!module._blinkenlib_run_slice) {
+            throw new Error('This blinkenlib.wasm cannot run in bounded slices: it has no _blinkenlib_run_slice')
+        }
     }
 
     constructor(
@@ -121,7 +144,7 @@ export class NativeHistory {
 
     private decode(pointer: number, length: number): ExecutionStep {
         const view = this.view(pointer, length)
-        if (view.getUint32(0, true) !== 1) throw new Error('Unsupported x86 history packet')
+        if (view.getUint32(0, true) !== PACKET_VERSION) throw new Error('Unsupported x86 history packet')
         const poke = Boolean(view.getUint32(16, true))
         const pcBefore = view.getBigUint64(24, true)
         const pcAfter = view.getBigUint64(32, true)

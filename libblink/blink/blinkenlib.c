@@ -10,6 +10,7 @@
 #include "blink/dis.h"
 #include "blink/debughistory.h"
 #include "blink/endian.h"
+#include "blink/flags.h"
 #include "blink/high.h"
 #include "blink/loader.h"
 #include "blink/machine.h"
@@ -324,7 +325,7 @@ static void BeginRecordedStep(u32 control_flow) {
   DebugHistoryBegin(control_flow, Oplength(m->xedd->op.rde));
 }
 
-static void FinishRecordedStep(void) {
+static void FinishRecordedStep(bool exited) {
   if (!active_step || !m) return;
   last_step_info.valid = true;
   last_step_info.pc_before = active_pc_before;
@@ -336,7 +337,7 @@ static void FinishRecordedStep(void) {
   last_step_info.control_flow = active_control_flow;
   last_step_info.memory_write_count = m->writeoldcount;
   last_step_info.memory_truncated = m->writeoldtruncated;
-  DebugHistoryFinish();
+  DebugHistoryFinish(exited);
   active_step = false;
 }
 
@@ -460,7 +461,7 @@ void runLoop() {
 
       BeginRecordedStep(GetControlFlowKind());
       ExecuteInstruction(m);
-      FinishRecordedStep();
+      FinishRecordedStep(false);
       run_instruction_count += 1;
 
       if (single_stepping) {
@@ -493,12 +494,24 @@ void runLoop() {
     printf("handling machine interrupt: %d \n", interrupt);
     puts("--");
 #endif
+    if (interrupt == kMachineExitTrap) {
+      /* Exit abandons OpSyscall's stack. Release its temporary state as
+       * Blink() does after a halt, so undo can resume ordinary instructions
+       * without retaining syscall page locks or nesting depth. */
+      m->sysdepth = 0;
+      m->sigdepth = 0;
+      m->canhalt = false;
+      m->nofault = false;
+      m->insyscall = false;
+      CollectPageLocks(m);
+      CollectGarbage(m, 0);
+    }
     // A blocked read has not executed yet. Retain its before-state until the
     // resumed syscall completes, so input is one reversible instruction.
     if (interrupt != kMachineFakeTTYtrap || !DebugHistoryPending())
-      FinishRecordedStep();
+      FinishRecordedStep(interrupt == kMachineExitTrap);
     if (interrupt == kMachineExitTrap) {
-      if (signal_callback) {
+      if (exit_callback) {
         update_clstruct(m);
         exit_callback(m->system->exitcode);
       }
@@ -649,7 +662,8 @@ void blinkenlib_start() {
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_stepi() {
   if (s->exited) {
-    unassert(!"Invalid state");
+    if (exit_callback) exit_callback(s->exitcode);
+    return;
   }
   // run a single step
   single_stepping = true;
@@ -662,6 +676,10 @@ void blinkenlib_stepi() {
  * asynchronous preemption continuing after the caller thinks its slice ended. */
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_run_slice(u32 budget, bool skip_at_pc) {
+  if (s->exited) {
+    if (exit_callback) exit_callback(s->exitcode);
+    return;
+  }
   if (!budget) budget = 1;
   single_stepping = false;
   native_slice = true;
@@ -674,7 +692,8 @@ void blinkenlib_run_slice(u32 budget, bool skip_at_pc) {
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_continue() {
   if (s->exited) {
-    unassert(!"Invalid state");
+    if (exit_callback) exit_callback(s->exitcode);
+    return;
   }
   single_stepping = false;
   runLoop();
@@ -683,7 +702,8 @@ void blinkenlib_continue() {
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_preempt_resume() {
   if (s->exited) {
-    unassert(!"Invalid state");
+    if (exit_callback) exit_callback(s->exitcode);
+    return;
   }
   runLoop();
 }
@@ -691,7 +711,8 @@ void blinkenlib_preempt_resume() {
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_faketty_resume() {
   if (s->exited) {
-    unassert(!"Invalid state");
+    if (exit_callback) exit_callback(s->exitcode);
+    return;
   }
   if (!m->fakettycanhalt) {
     unassert(!"Invalid state (tty)");
@@ -740,9 +761,20 @@ u64 blinkenlib_get_sp() {
   return m ? Read64(m->sp) : 0;
 }
 
+/* Blink keeps PF lazily: bit 2 of m->flags is not maintained, and PF is the
+ * parity of the byte in bits 24..31 (FLAGS_LP), the low byte of the last
+ * result. Every flags word JavaScript reads is the architectural one that
+ * PUSHF pushes: ExportFlags() computes PF and drops the lazy byte, and
+ * PUSHF's mask drops RF and VM. */
+static u32 ArchitecturalFlags(u32 flags) {
+  return m ? ExportFlags(m, flags) & 0xFCFFFF : 0;
+}
+
+/* The architectural RFLAGS (see ArchitecturalFlags()); the register snapshot
+ * and the debugger history read the flags through here too. */
 EMSCRIPTEN_KEEPALIVE
 u32 blinkenlib_get_flags() {
-  return m ? m->flags : 0;
+  return m ? ArchitecturalFlags(m->flags) : 0;
 }
 
 /* Fixed little-endian wasm32 layout: register IDs 0..16, PC, flags.
@@ -764,8 +796,12 @@ const u8 *blinkenlib_get_fpu_snapshot() {
   return blinkenlib_get_fpu_state(snapshot) ? snapshot : 0;
 }
 
+/* Takes architectural flags, the way POPF does: ImportFlags() reads PF from
+ * bit 2 and re-encodes Blink's lazy parity byte (bits 24..31) to match, so
+ * the next JP, SETP or PUSHF sees the PF written here. Bits POPF cannot
+ * change are left as they were. */
 void blinkenlib_set_flags(u32 flags) {
-  if (m) m->flags = flags;
+  if (m) ImportFlags(m, flags);
 }
 
 void blinkenlib_set_step_recording(bool enabled) {
@@ -875,12 +911,15 @@ bool blinkenlib_set_fpu_state(const u8 *in) {
   return true;
 }
 
+/* Blink maps a page lazily: until the program first touches it, a page is
+ * only reserved, and SpyAddress() under NO_PAGE_FAULTS declines it as if
+ * nothing were there. The debugger goes through PageInAddress() instead,
+ * which faults such a page in exactly as the program's first access would,
+ * so the debugger sees, and the program later finds, the same bytes. */
 bool blinkenlib_read_memory_byte(u64 virtual_address, u8 *value) {
   u8 *ptr = 0;
   if (!m || !value || IsShadow(virtual_address)) return false;
-  BEGIN_NO_PAGE_FAULTS;
-  ptr = SpyAddress(m, virtual_address);
-  END_NO_PAGE_FAULTS;
+  ptr = PageInAddress(m, virtual_address);
   if (!ptr) return false;
   *value = *ptr;
   return true;
@@ -889,9 +928,7 @@ bool blinkenlib_read_memory_byte(u64 virtual_address, u8 *value) {
 bool blinkenlib_write_memory_byte(u64 virtual_address, u8 value) {
   u8 *ptr = 0;
   if (!m || IsShadow(virtual_address)) return false;
-  BEGIN_NO_PAGE_FAULTS;
-  ptr = SpyAddress(m, virtual_address);
-  END_NO_PAGE_FAULTS;
+  ptr = PageInAddress(m, virtual_address);
   if (!ptr) return false;
   DebugHistoryPokeByte(virtual_address, *ptr);
   *ptr = value;
@@ -936,9 +973,15 @@ u64 blinkenlib_get_last_run_instruction_count() {
   return run_instruction_count;
 }
 
+/* The step recorded m->flags as Blink keeps it, lazy parity byte and all;
+ * the flags handed out are architectural (see ArchitecturalFlags()). They are
+ * converted here rather than while recording, which keeps the extra call out
+ * of runLoop()'s sigsetjmp() body. */
 bool blinkenlib_get_last_step_info(struct blinkenlib_step_info *info) {
   if (!info || !last_step_info.valid) return false;
   *info = last_step_info;
+  info->flags_before = ArchitecturalFlags(last_step_info.flags_before);
+  info->flags_after = ArchitecturalFlags(last_step_info.flags_after);
   return true;
 }
 
@@ -1046,14 +1089,12 @@ void *blinkenlib_get_progname_string() {
   return &progname_string;
 }
 
+/* Faults in a page the program hasn't touched yet, as reading a byte does
+ * (see blinkenlib_read_memory_byte()). */
 EMSCRIPTEN_KEEPALIVE
 u8 *blinkenlib_spy_address(u64 virtual_address) {
-  u8 *pointer;
   if (!m || IsShadow(virtual_address)) return 0;
-  BEGIN_NO_PAGE_FAULTS;
-  pointer = SpyAddress(m, virtual_address);
-  END_NO_PAGE_FAULTS;
-  return pointer;
+  return PageInAddress(m, virtual_address);
 }
 
 EMSCRIPTEN_KEEPALIVE

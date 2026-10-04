@@ -372,6 +372,73 @@ u8 *SpyAddress(struct Machine *m, i64 virt) {
   return LookupAddress2(m, virt, 0, 0);
 }
 
+// walks the page table to the entry of the page holding virt, as done by
+// FindPageTableEntry(), but without faulting the page in, locking it, or
+// caching it in the tlb, and without touching m->segvcode
+// @return raw page table entry, or zero if nothing is mapped at virt
+static u64 PeekPageTableEntry(struct Machine *m, i64 virt, u8 **out_pslot) {
+  u8 *pslot;
+  i64 table;
+  u64 entry, page;
+  unsigned level, index;
+  page = virt & -4096;
+  if (!(-0x800000000000 <= (i64)page && (i64)page < 0x800000000000)) return 0;
+  if (!(entry = m->system->cr3)) return 0;
+  level = 39;
+  do {
+    table = entry;
+    index = (page >> level) & 511;
+    if (!(pslot = GetPageAddress(m->system, table, level == 39))) return 0;
+    pslot += index * 8;
+    entry = LoadPte(pslot);
+    if (!(entry & PAGE_V)) return 0;
+    if (m->metal) {
+      entry &= ~(u64)(PAGE_RSRV | PAGE_HOST | PAGE_MAP | PAGE_GROW | PAGE_MUG |
+                      PAGE_FILE);
+    }
+    if ((entry & PAGE_PS) && level > 12) {
+      u64 submask = ((u64)1 << level) - 4096;
+      entry &= ~submask;
+      entry |= page & submask;
+      break;
+    }
+  } while ((level -= 9) >= 12);
+  *out_pslot = pslot;
+  return entry;
+}
+
+/**
+ * Translates virtual address into pointer for a debugger, like SpyAddress()
+ * under NO_PAGE_FAULTS, but including the pages the guest hasn't touched.
+ *
+ * Until its first access a page is only reserved (PAGE_RSRV), and this
+ * faults it in exactly as that access would: a file page keeps the bytes
+ * already sitting in its host page, an anonymous one gets a zeroed page.
+ * The guest finds the same bytes either way, so it can't tell a debugger
+ * looked. Unlike the guest's own access, this takes no page locks, raises
+ * nothing, and leaves m->segvcode as it was, even when it fails.
+ *
+ * @return pointer, or null if unmapped or memory couldn't be allocated
+ */
+u8 *PageInAddress(struct Machine *m, i64 virt) {
+  i8 segvcode;
+  bool nofault;
+  u8 *host, *pslot;
+  u64 entry;
+  if (!(entry = PeekPageTableEntry(m, virt, &pslot))) return 0;
+  if (entry & PAGE_RSRV) {
+    segvcode = m->segvcode;
+    nofault = m->nofault;
+    m->nofault = false;
+    entry = HandlePageFault(m, pslot, entry);
+    m->nofault = nofault;
+    m->segvcode = segvcode;
+    if (!entry) return 0;
+  }
+  host = GetPageAddress(m->system, entry, false);
+  return host ? host + (virt & 4095) : 0;
+}
+
 u8 *ResolveAddress(struct Machine *m, i64 v) {
   u8 *r;
   if ((r = GetAddress(m, v))) return r;

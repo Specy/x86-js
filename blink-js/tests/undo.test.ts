@@ -261,7 +261,7 @@ base:
         emulator.dispose()
     })
 
-    it('uses traced stepping for run limits when history is enabled', async () => {
+    it('records every instruction of a limited run when history is enabled', async () => {
         const emulator = await createX86Emulator()
         const result = await emulator.compile(`
 .global _start

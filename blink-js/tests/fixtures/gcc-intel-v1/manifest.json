@@ -1,0 +1,1126 @@
+{
+  "profile": "gcc-intel-v1",
+  "description": "The corpus for the x86 compiler-output translator's milestone 0: every program, what it exercises and its intended outcome. scripts/capture-gcc-fixtures.mjs compiles each program with Compiler Explorer at each level into cases/<program>-O<level>.json.gz, and builds the x87 matrix into x87/<form>.json.gz. Every program is compiled as `sourcePaths[language]` with the flag groups below at each of `optimizations`, unless the program narrows its own `optimizations`, replaces a flag (`flags.replace`) or adds some (`flags.add`). Headers are sent at the request's root; `files` are NASM Files beside the source in the Project. An `exit` value is the full value Blink reports; the native status is its low byte. `outcomes` overrides `outcome` for one level. A program meant to fail translation may name a `referenceOutcome`, the outcome its GNU as reference must still reach, built at capture time to show the program itself works as written; `note` explains an outcome. `x87Matrix` lists the hand-written x87 forms.",
+  "compilerExplorer": {
+    "endpoint": "https://godbolt.org/api/compiler/<compiler>/compile",
+    "compilers": {
+      "c": "cg142",
+      "cpp": "g142"
+    },
+    "sourcePaths": {
+      "c": "src/main.c",
+      "cpp": "src/main.cpp"
+    }
+  },
+  "flags": {
+    "translation": [
+      "-masm=intel",
+      "-fno-pie",
+      "-fno-stack-protector",
+      "-fcf-protection=none",
+      "-fno-verbose-asm"
+    ],
+    "locations": [
+      "-g1"
+    ],
+    "target": [
+      "-march=x86-64",
+      "-mtune=generic"
+    ],
+    "language": {
+      "c": [
+        "-std=c17"
+      ],
+      "cpp": [
+        "-std=c++17",
+        "-fno-exceptions",
+        "-fno-rtti"
+      ]
+    },
+    "driver": [
+      "-O<level>",
+      "-fdiagnostics-color=never",
+      "-fno-section-anchors",
+      "-ffreestanding",
+      "-iquote .",
+      "-I ."
+    ],
+    "driverCpp": [
+      "-fno-threadsafe-statics"
+    ]
+  },
+  "optimizations": [
+    "0",
+    "1",
+    "2",
+    "3",
+    "s"
+  ],
+  "programs": [
+    {
+      "name": "fixture",
+      "language": "c",
+      "exercises": "The editor's fixture: local header, global array, loop",
+      "source": "#include \"values.h\"\nint total;\nint values[4] = {1, 2, 3, 4};\nint main(void) {\n    int sum = 0;\n    for (int i = 0; i < 4; i++) sum += twice(values[i]);\n    total = sum;\n    return total;\n}\n",
+      "headers": {
+        "values.h": "static inline int twice(int value) { return value * 2; }\n"
+      },
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 20
+      }
+    },
+    {
+      "name": "broad",
+      "language": "c",
+      "exercises": "Struct copy, switch, recursion, function pointer, 64-bit division, SSE doubles, string",
+      "source": "typedef struct { int x, y; } point;\nstatic const char message[] = \"hello\";\nlong long big = 1234567890123LL;\ndouble scale = 1.5;\nint counter;\nstatic int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }\nstatic int classify(int v) {\n    switch (v) { case 0: return 10; case 1: return 20; case 2: return 30; case 3: return 40; case 4: return 50; default: return -1; }\n}\nstatic int apply(int (*f)(int), int v) { return f(v); }\nstatic int length(const char *s) { int n = 0; while (s[n]) n++; return n; }\nint main(void) {\n    point a = {3, 4}, b = a;\n    int arr[64] = {0};\n    for (int i = 0; i < 64; i++) arr[i] = i;\n    long long q = big / 7;\n    double d = scale * a.x + b.y;\n    counter += (int)d;\n    int r = fib(10) + classify(counter % 5) + apply(classify, 2) + length(message) + arr[63] + (int)(q % 100);\n    return r;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 239
+      }
+    },
+    {
+      "name": "noreturn",
+      "language": "cpp",
+      "exercises": "`main` without `return`",
+      "source": "int value = 7;\nint main() { value++; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 0
+      }
+    },
+    {
+      "name": "memset",
+      "language": "c",
+      "exercises": "Clear and copy loops",
+      "source": "int buffer[256];\nvoid clear(int *p, int n) { for (int i = 0; i < n; i++) p[i] = 0; }\nvoid copy(int *d, const int *s, int n) { for (int i = 0; i < n; i++) d[i] = s[i]; }\nint other[256];\nint main(void) { buffer[3] = 9; clear(buffer, 256); other[3] = 5; copy(buffer, other, 256); return buffer[3]; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 5
+      }
+    },
+    {
+      "name": "bigcopy",
+      "language": "c",
+      "exercises": "8 KB struct copies",
+      "source": "typedef struct { int cells[2000]; } grid;\ngrid a, b;\nstatic grid make(int seed) { grid g; for (int i = 0; i < 2000; i++) g.cells[i] = seed + i; return g; }\nint main(void) { a = make(3); b = a; grid c = b; return c.cells[1999] % 256; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 210
+      }
+    },
+    {
+      "name": "varargs",
+      "language": "c",
+      "exercises": "Variadic doubles",
+      "source": "#include <stdarg.h>\nstatic double total(int count, ...) {\n    va_list ap; va_start(ap, count); double s = 0;\n    for (int i = 0; i < count; i++) s += va_arg(ap, double);\n    va_end(ap); return s;\n}\nint main(void) { return (int)(total(3, 1.5, 2.5, 6.0) * 5); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 50
+      }
+    },
+    {
+      "name": "keywords",
+      "language": "c",
+      "exercises": "C names NASM reserves or reads as registers",
+      "source": "int si = 3, count = 4;\nint add(int a, int b) { return a + b; }\nint div(int a, int b) { return a / b; }\nint abs(int v) { return v < 0 ? -v : v; }\nint byte(int v) { return v & 0xff; }\nint rel = 5;\nint main(void) { return add(si, count) + div(100, 10) + abs(-7) + byte(0x1ff) + rel; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 284
+      }
+    },
+    {
+      "name": "x87",
+      "language": "c",
+      "exercises": "`long double`, unsigned to double",
+      "source": "long double third = 1.0L / 3.0L;\nunsigned long big = 3000000000UL;\nint main(void) { long double x = third * 3.0L; double y = (double)x; double z = (double)big / 1e9; return (int)(y * 100.0 + 0.5) + (int)z; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 103
+      }
+    },
+    {
+      "name": "strings",
+      "language": "c",
+      "exercises": "String escapes, a backquote",
+      "source": "static const char text[] = \"tab\\there\\nquote\\\"back\\\\slash`tick\\x01\\377\";\nint main(void) { int s = 0; for (const char *p = text; *p; p++) s += (unsigned char)*p; return s % 251; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 141
+      }
+    },
+    {
+      "name": "statics",
+      "language": "c",
+      "exercises": "Static locals (`.local`, `.comm`), constant 2-D table",
+      "source": "static int calls;\nstatic int counter(void) { static int n; return ++n + calls++; }\nconst int table[3][3] = {{1,2,3},{4,5,6},{7,8,9}};\nint grid[4][4];\nint main(void) {\n    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) grid[i][j] = table[i % 3][j % 3];\n    int s = 0; for (int k = 0; k < 3; k++) s += counter();\n    return s + grid[3][3] + grid[2][1];\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 18
+      }
+    },
+    {
+      "name": "jumptable",
+      "language": "c",
+      "exercises": "Dense switches",
+      "source": "int classify(int v) { switch (v) { case 0: return 11; case 1: return 22; case 2: return 33; case 3: return 44; case 4: return 55; case 5: return 66; case 6: return 77; case 7: return 88; default: return 0; } }\nint pick(int v) { switch (v) { case 0: return v + 1; case 1: return v * 3; case 2: return v - 7; case 3: return v << 2; case 4: return v ^ 5; case 5: return 9; case 6: return v * v; default: return 1; } }\nint main(void) { int s = 0; for (int i = 0; i < 10; i++) s += classify(i) + pick(i); return (s - 1 - 3 + 5 - 12 - 1 - 9 - 36 - 3) % 256; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 140
+      }
+    },
+    {
+      "name": "cppclasses",
+      "language": "cpp",
+      "exercises": "Function template, member function",
+      "source": "template <typename T> T maxOf(T a, T b) { return a > b ? a : b; }\nstruct Point { int x, y; int dot(const Point &o) const { return x * o.x + y * o.y; } };\nint main() {\n    Point p{3, 4};\n    return maxOf(p.dot(p), 5);\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 25
+      }
+    },
+    {
+      "name": "cppfull",
+      "language": "cpp",
+      "exercises": "Namespace, operator overloading, class template, lambda",
+      "source": "namespace geo { struct Vec { int x, y; Vec operator+(const Vec &o) const { return {x + o.x, y + o.y}; } }; }\ntemplate <typename T, int N> struct Array { T data[N]; T &operator[](int i) { return data[i]; } int size() const { return N; } };\nstatic int apply(int (*f)(int), int v) { return f(v); }\nint main() {\n    geo::Vec a{1, 2}, b{3, 4}; geo::Vec c = a + b;\n    Array<int, 5> arr{}; for (int i = 0; i < arr.size(); i++) arr[i] = i * i;\n    auto square = [](int v) { return v * v; };\n    return c.x + c.y + arr[4] + apply(square, 3) + square(2);\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 39
+      }
+    },
+    {
+      "name": "cppalias",
+      "language": "cpp",
+      "exercises": "Constructor aliases (`.set`), weak COMDAT",
+      "source": "struct Counter { int n; Counter(int start) : n(start) {} int next() { return ++n; } };\nint main() { Counter c(10); c.next(); return c.next(); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 12
+      }
+    },
+    {
+      "name": "ctor",
+      "language": "cpp",
+      "exercises": "Global object built by a constructor (`.init_array`)",
+      "source": "static int compute(int x) { return x * 6; }\nstruct Config { int value; explicit Config(int x) : value(compute(x)) {} };\nint seven = 7;\nConfig config(seven);\nint main() { return config.value; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 42
+      }
+    },
+    {
+      "name": "callsasm",
+      "language": "c",
+      "exercises": "C calling a NASM function",
+      "source": "extern int asm_add(int a, int b);\nint main(void) { return asm_add(40, 2); }\n",
+      "headers": {},
+      "files": {
+        "src/math.asm": "global asm_add\nsection .text\nasm_add:\n    lea eax, [rdi+rsi]\n    ret\n"
+      },
+      "outcome": {
+        "kind": "exit",
+        "value": 42
+      }
+    },
+    {
+      "name": "asmcallsc",
+      "language": "c",
+      "exercises": "NASM calling a C function",
+      "source": "int triple(int v) { return v * 3; }\nextern int call_triple(int v);\nint main(void) { return call_triple(10); }\n",
+      "headers": {},
+      "files": {
+        "src/glue.asm": "extern triple\nglobal call_triple\nsection .text\ncall_triple:\n    sub rsp, 8\n    call triple\n    add rsp, 8\n    ret\n"
+      },
+      "outcome": {
+        "kind": "exit",
+        "value": 30
+      }
+    },
+    {
+      "name": "large",
+      "language": "c",
+      "exercises": "80 generated functions",
+      "source": "static int f0(int n) { int s = 0; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 1; else s -= j; } return s; }\nstatic int f1(int n) { int s = 1; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 2; else s -= j; } return s; }\nstatic int f2(int n) { int s = 2; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 3; else s -= j; } return s; }\nstatic int f3(int n) { int s = 3; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 4; else s -= j; } return s; }\nstatic int f4(int n) { int s = 4; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 5; else s -= j; } return s; }\nstatic int f5(int n) { int s = 5; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 6; else s -= j; } return s; }\nstatic int f6(int n) { int s = 6; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 7; else s -= j; } return s; }\nstatic int f7(int n) { int s = 7; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 8; else s -= j; } return s; }\nstatic int f8(int n) { int s = 8; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 9; else s -= j; } return s; }\nstatic int f9(int n) { int s = 9; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 10; else s -= j; } return s; }\nstatic int f10(int n) { int s = 10; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 11; else s -= j; } return s; }\nstatic int f11(int n) { int s = 11; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 12; else s -= j; } return s; }\nstatic int f12(int n) { int s = 12; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 13; else s -= j; } return s; }\nstatic int f13(int n) { int s = 13; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 14; else s -= j; } return s; }\nstatic int f14(int n) { int s = 14; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 15; else s -= j; } return s; }\nstatic int f15(int n) { int s = 15; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 16; else s -= j; } return s; }\nstatic int f16(int n) { int s = 16; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 17; else s -= j; } return s; }\nstatic int f17(int n) { int s = 17; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 18; else s -= j; } return s; }\nstatic int f18(int n) { int s = 18; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 19; else s -= j; } return s; }\nstatic int f19(int n) { int s = 19; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 20; else s -= j; } return s; }\nstatic int f20(int n) { int s = 20; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 21; else s -= j; } return s; }\nstatic int f21(int n) { int s = 21; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 22; else s -= j; } return s; }\nstatic int f22(int n) { int s = 22; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 23; else s -= j; } return s; }\nstatic int f23(int n) { int s = 23; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 24; else s -= j; } return s; }\nstatic int f24(int n) { int s = 24; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 25; else s -= j; } return s; }\nstatic int f25(int n) { int s = 25; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 26; else s -= j; } return s; }\nstatic int f26(int n) { int s = 26; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 27; else s -= j; } return s; }\nstatic int f27(int n) { int s = 27; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 28; else s -= j; } return s; }\nstatic int f28(int n) { int s = 28; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 29; else s -= j; } return s; }\nstatic int f29(int n) { int s = 29; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 30; else s -= j; } return s; }\nstatic int f30(int n) { int s = 30; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 31; else s -= j; } return s; }\nstatic int f31(int n) { int s = 31; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 32; else s -= j; } return s; }\nstatic int f32(int n) { int s = 32; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 33; else s -= j; } return s; }\nstatic int f33(int n) { int s = 33; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 34; else s -= j; } return s; }\nstatic int f34(int n) { int s = 34; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 35; else s -= j; } return s; }\nstatic int f35(int n) { int s = 35; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 36; else s -= j; } return s; }\nstatic int f36(int n) { int s = 36; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 37; else s -= j; } return s; }\nstatic int f37(int n) { int s = 37; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 38; else s -= j; } return s; }\nstatic int f38(int n) { int s = 38; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 39; else s -= j; } return s; }\nstatic int f39(int n) { int s = 39; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 40; else s -= j; } return s; }\nstatic int f40(int n) { int s = 40; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 41; else s -= j; } return s; }\nstatic int f41(int n) { int s = 41; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 42; else s -= j; } return s; }\nstatic int f42(int n) { int s = 42; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 43; else s -= j; } return s; }\nstatic int f43(int n) { int s = 43; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 44; else s -= j; } return s; }\nstatic int f44(int n) { int s = 44; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 45; else s -= j; } return s; }\nstatic int f45(int n) { int s = 45; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 46; else s -= j; } return s; }\nstatic int f46(int n) { int s = 46; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 47; else s -= j; } return s; }\nstatic int f47(int n) { int s = 47; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 48; else s -= j; } return s; }\nstatic int f48(int n) { int s = 48; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 49; else s -= j; } return s; }\nstatic int f49(int n) { int s = 49; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 50; else s -= j; } return s; }\nstatic int f50(int n) { int s = 50; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 51; else s -= j; } return s; }\nstatic int f51(int n) { int s = 51; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 52; else s -= j; } return s; }\nstatic int f52(int n) { int s = 52; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 53; else s -= j; } return s; }\nstatic int f53(int n) { int s = 53; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 54; else s -= j; } return s; }\nstatic int f54(int n) { int s = 54; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 55; else s -= j; } return s; }\nstatic int f55(int n) { int s = 55; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 56; else s -= j; } return s; }\nstatic int f56(int n) { int s = 56; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 57; else s -= j; } return s; }\nstatic int f57(int n) { int s = 57; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 58; else s -= j; } return s; }\nstatic int f58(int n) { int s = 58; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 59; else s -= j; } return s; }\nstatic int f59(int n) { int s = 59; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 60; else s -= j; } return s; }\nstatic int f60(int n) { int s = 60; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 61; else s -= j; } return s; }\nstatic int f61(int n) { int s = 61; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 62; else s -= j; } return s; }\nstatic int f62(int n) { int s = 62; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 63; else s -= j; } return s; }\nstatic int f63(int n) { int s = 63; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 64; else s -= j; } return s; }\nstatic int f64(int n) { int s = 64; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 65; else s -= j; } return s; }\nstatic int f65(int n) { int s = 65; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 66; else s -= j; } return s; }\nstatic int f66(int n) { int s = 66; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 67; else s -= j; } return s; }\nstatic int f67(int n) { int s = 67; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 68; else s -= j; } return s; }\nstatic int f68(int n) { int s = 68; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 69; else s -= j; } return s; }\nstatic int f69(int n) { int s = 69; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 70; else s -= j; } return s; }\nstatic int f70(int n) { int s = 70; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 71; else s -= j; } return s; }\nstatic int f71(int n) { int s = 71; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 72; else s -= j; } return s; }\nstatic int f72(int n) { int s = 72; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 73; else s -= j; } return s; }\nstatic int f73(int n) { int s = 73; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 74; else s -= j; } return s; }\nstatic int f74(int n) { int s = 74; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 75; else s -= j; } return s; }\nstatic int f75(int n) { int s = 75; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 76; else s -= j; } return s; }\nstatic int f76(int n) { int s = 76; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 77; else s -= j; } return s; }\nstatic int f77(int n) { int s = 77; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 78; else s -= j; } return s; }\nstatic int f78(int n) { int s = 78; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 79; else s -= j; } return s; }\nstatic int f79(int n) { int s = 79; for (int j = 0; j < n; j++) { if ((j ^ s) & 1) s += j * 80; else s -= j; } return s; }\nint main(void) { int s = 0;\n    s += f0(3);\n    s += f1(4);\n    s += f2(5);\n    s += f3(6);\n    s += f4(7);\n    s += f5(8);\n    s += f6(9);\n    s += f7(3);\n    s += f8(4);\n    s += f9(5);\n    s += f10(6);\n    s += f11(7);\n    s += f12(8);\n    s += f13(9);\n    s += f14(3);\n    s += f15(4);\n    s += f16(5);\n    s += f17(6);\n    s += f18(7);\n    s += f19(8);\n    s += f20(9);\n    s += f21(3);\n    s += f22(4);\n    s += f23(5);\n    s += f24(6);\n    s += f25(7);\n    s += f26(8);\n    s += f27(9);\n    s += f28(3);\n    s += f29(4);\n    s += f30(5);\n    s += f31(6);\n    s += f32(7);\n    s += f33(8);\n    s += f34(9);\n    s += f35(3);\n    s += f36(4);\n    s += f37(5);\n    s += f38(6);\n    s += f39(7);\n    s += f40(8);\n    s += f41(9);\n    s += f42(3);\n    s += f43(4);\n    s += f44(5);\n    s += f45(6);\n    s += f46(7);\n    s += f47(8);\n    s += f48(9);\n    s += f49(3);\n    s += f50(4);\n    s += f51(5);\n    s += f52(6);\n    s += f53(7);\n    s += f54(8);\n    s += f55(9);\n    s += f56(3);\n    s += f57(4);\n    s += f58(5);\n    s += f59(6);\n    s += f60(7);\n    s += f61(8);\n    s += f62(9);\n    s += f63(3);\n    s += f64(4);\n    s += f65(5);\n    s += f66(6);\n    s += f67(7);\n    s += f68(8);\n    s += f69(9);\n    s += f70(3);\n    s += f71(4);\n    s += f72(5);\n    s += f73(6);\n    s += f74(7);\n    s += f75(8);\n    s += f76(9);\n    s += f77(3);\n    s += f78(4);\n    s += f79(5);\n    return s & 255; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 35
+      }
+    },
+    {
+      "name": "x87ops",
+      "language": "c",
+      "exercises": "Non-commutative x87 operations, comparisons",
+      "source": "long double a = 10.0L, b = 4.0L, c = 2.0L;\nint main(void) {\n    long double r1 = a - b, r2 = b - a, r3 = a / b, r4 = b / a;\n    long double r5 = (a - b) / (c - a), r6 = c / (a - b * c), r7 = a * b - c * a;\n    int cmp = (a > b) + (b > a) * 2 + (c < b) * 4 + (a == a) * 8;\n    return (int)(r1 * 1000 + r2 * 100 + r3 * 10 + r4 * 100 + r5 * 1000 + r6 * 7 + r7) + cmp;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 4755
+      }
+    },
+    {
+      "name": "bitops",
+      "language": "c",
+      "exercises": "Rotate, byte swap, bit scans, 64-bit multiply, division by constants",
+      "source": "unsigned int seed = 0x12345678u;\nstatic unsigned rotl(unsigned x, int k) { return (x << k) | (x >> (32 - k)); }\nint main(void) {\n    unsigned x = seed;\n    unsigned r = rotl(x, 3);\n    unsigned b = __builtin_bswap32(x);\n    int lz = __builtin_clz(x), tz = __builtin_ctz(x << 4);\n    long long m = (long long)x * -7;\n    unsigned long long big = 0xFFFFFFFFFFFFull * 3;\n    int s = (int)(x % 1000) + (int)(-1234567 / 10) % 97 + (int)(big >> 40) + (int)(m % 1000);\n    return (int)((r ^ 0x91a2b3c0u) + (b ^ 0x78563412u) + (lz - 3) + (tz - 7) + (s - 1319)) + 77;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 77
+      }
+    },
+    {
+      "name": "aligned",
+      "language": "c",
+      "exercises": "A 64-byte-aligned global",
+      "source": "int big_aligned[8] __attribute__((aligned(64))) = {1, 2, 3, 4, 5, 6, 7, 8};\nchar pad = 1;\nint main(void) { return ((unsigned long)big_aligned % 64 == 0) * 10 + big_aligned[7] + pad - 1; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 18
+      }
+    },
+    {
+      "name": "fptable",
+      "language": "c",
+      "exercises": "Read-only function-pointer table, struct by value, float, stack array",
+      "source": "typedef int (*op)(int, int);\nstatic int add2(int a, int b) { return a + b; }\nstatic int sub2(int a, int b) { return a - b; }\nstatic int mul2(int a, int b) { return a * b; }\nstatic const op ops[] = { add2, sub2, mul2 };\nstruct pair { int a; int b; };\nstatic struct pair swap(struct pair p) { struct pair q = { p.b, p.a }; return q; }\nstatic float halve(float f) { return f * 0.5f; }\nint main(void) {\n    int s = 0;\n    for (int i = 0; i < 3; i++) s += ops[i](5, 3);\n    struct pair p = swap((struct pair){1, 2});\n    char buf[] = \"hello world\";\n    return s + p.a * 10 - p.b + (int)halve(4.0f) + (buf[6] == 'w') - 15 + 1 + 6 - 8 + 1;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 32
+      }
+    },
+    {
+      "name": "printf",
+      "language": "c",
+      "exercises": "An undefined library function",
+      "source": "#include <stdio.h>\nint main(void) { printf(\"hi %d\\n\", 42); return 0; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "link-failure",
+        "symbols": [
+          "printf"
+        ]
+      }
+    },
+    {
+      "name": "int128",
+      "language": "c",
+      "exercises": "`__int128` division; from O1 to O3 GCC takes the remainder by 100 inline, so only `__divti3` is called",
+      "source": "__int128 a = 1000000000000000000;\nlong long b = 7;\nint main(void) { return (int)(a / b % 100); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "link-failure",
+        "symbols": [
+          "__divti3",
+          "__modti3"
+        ]
+      },
+      "outcomes": {
+        "1": {
+          "kind": "link-failure",
+          "symbols": [
+            "__divti3"
+          ]
+        },
+        "2": {
+          "kind": "link-failure",
+          "symbols": [
+            "__divti3"
+          ]
+        },
+        "3": {
+          "kind": "link-failure",
+          "symbols": [
+            "__divti3"
+          ]
+        }
+      }
+    },
+    {
+      "name": "cppvirtual",
+      "language": "cpp",
+      "exercises": "Virtual destructor",
+      "source": "struct Shape { virtual int area() const = 0; virtual ~Shape() {} };\nstruct Rect : Shape { int w, h; Rect(int w, int h) : w(w), h(h) {} int area() const override { return w * h; } };\nint main() { Rect r(3, 4); const Shape &s = r; return s.area(); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "link-failure",
+        "symbols": [
+          "operator delete(void*, unsigned long)"
+        ]
+      }
+    },
+    {
+      "name": "inlineasm",
+      "language": "c",
+      "exercises": "Inline assembly between `#APP` and `#NO_APP` (gate 4)",
+      "source": "int main(void) {\n    int value = 40;\n    __asm__ volatile(\"add %0, 2\" : \"+r\"(value));\n    return value;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "translation-error",
+        "code": "inline-assembly"
+      }
+    },
+    {
+      "name": "tls",
+      "language": "c",
+      "exercises": "A `__thread` variable in `.tdata` and one in `.tbss`, read and written through `fs:`",
+      "source": "__thread int counter = 3;\n__thread int scratch;\nint main(void) {\n    scratch = counter + 4;\n    return scratch;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "translation-error",
+        "code": "unsupported-section"
+      }
+    },
+    {
+      "name": "ifunc",
+      "language": "c",
+      "exercises": "An ifunc: `.type @gnu_indirect_function` and its resolver",
+      "source": "static int add_one(int value) { return value + 1; }\nstatic int add_two(int value) { return value + 2; }\nstatic int (*choose_adder(void))(int) { return sizeof(long) == 8 ? add_two : add_one; }\nint adder(int value) __attribute__((ifunc(\"choose_adder\")));\nint main(void) { return adder(40); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "translation-error",
+        "code": "unsupported-symbol"
+      }
+    },
+    {
+      "name": "ctorpriority",
+      "language": "c",
+      "exercises": "A prioritized constructor (`.init_array.00101`) beside an ordinary one",
+      "source": "int value = 1;\n__attribute__((constructor(101))) static void first(void) { value = value * 10 + 2; }\n__attribute__((constructor)) static void second(void) { value = value * 10 + 3; }\nint main(void) { return value; }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "translation-error",
+        "code": "unsupported-section"
+      }
+    },
+    {
+      "name": "registername",
+      "language": "c",
+      "exercises": "A function named like a register (`si`) and called directly, so a bare operand names it",
+      "source": "__attribute__((noipa)) int si(int value) { return value + 2; }\nint main(void) { return si(40); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "translation-error",
+        "code": "ambiguous-register-name"
+      }
+    },
+    {
+      "name": "cppunique",
+      "language": "cpp",
+      "exercises": "Template static data, statics in inline functions and an inline variable (`@gnu_unique_object`, gate 7), constant and dynamic initialization with guard variables",
+      "source": "int seed = 4;\ntemplate <typename T> struct Registry {\n    static int count;\n    static int scaled;\n};\ntemplate <typename T> int Registry<T>::count = 5;\ntemplate <typename T> int Registry<T>::scaled = seed * 3;\ninline int &shared() { static int value = 7; return value; }\ninline int &lazy() { static int value = seed + 1; return value; }\ninline int answer = 2;\nint main() {\n    Registry<int>::count += 3;\n    shared() += 2;\n    lazy() += 10;\n    return Registry<int>::count + Registry<int>::scaled + shared() + lazy() + answer;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 46
+      }
+    },
+    {
+      "name": "cppvague",
+      "language": "cpp",
+      "exercises": "More vague linkage for gate 7: an explicit instantiation, a `const` template member in `.rodata`, a variable template, statics in a function template and in a member function of a class template, a static inline member, guard variables, and an anonymous-namespace template that stays local",
+      "source": "int seed = 4;\ntemplate <typename T> struct Holder {\n    static int count;\n    static const int limit;\n    static T value;\n    static int scaled;\n};\ntemplate <typename T> int Holder<T>::count = 5;\ntemplate <typename T> const int Holder<T>::limit = 9;\ntemplate <typename T> T Holder<T>::value = T(3);\ntemplate <typename T> int Holder<T>::scaled = seed * 2;\ntemplate struct Holder<long>;\ntemplate <typename T> inline T pi = T(3);\ntemplate <typename T> T &counter() { static T value = T(1); return value; }\ntemplate <typename T> struct Box { int bump() { static int calls; return ++calls; } };\ninline const int &table() { static const int values[4] = {1, 2, 3, 4}; return values[2]; }\ninline int lazy_value() { static int value = seed + 1; return value; }\ninline const int constant_answer = 3;\nstruct Widget { static inline int made = 0; static inline const double ratio = 1.5; };\nnamespace { template <typename T> struct Hidden { static int count; }; template <typename T> int Hidden<T>::count = 8; }\nint use(const int &v) { return v; }\nint main() {\n    Holder<int>::count += 1;\n    Box<char> box;\n    box.bump();\n    Widget::made++;\n    counter<int>() += 4;\n    return Holder<int>::count + use(Holder<int>::limit) + Holder<int>::value + Holder<int>::scaled\n        + Holder<long>::count + (int)Holder<long>::value + pi<int> + counter<int>() + box.bump() + table()\n        + lazy_value() + use(constant_answer) + Widget::made + (int)Widget::ratio + Hidden<int>::count;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 65
+      }
+    },
+    {
+      "name": "cpplocalstatic",
+      "language": "cpp",
+      "exercises": "A function-local static with a constructor, guarded without `__cxa_guard_*` calls under `-fno-threadsafe-statics`",
+      "source": "struct Tally {\n    int count;\n    explicit Tally(int start) : count(start) {}\n    int bump() { return ++count; }\n};\nint base = 5;\nint next() {\n    static Tally tally(base * 2);\n    return tally.bump();\n}\nint main() {\n    next();\n    next();\n    return next();\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 13
+      }
+    },
+    {
+      "name": "cfprotection",
+      "language": "c",
+      "exercises": "`-fcf-protection=full` instead of the profile's `none`: `endbr64`, `notrack` jump tables and `.note.gnu.property`; outside the profile",
+      "source": "typedef int (*operation)(int, int);\nstatic int add2(int a, int b) { return a + b; }\nstatic int sub2(int a, int b) { return a - b; }\noperation table[] = { add2, sub2 };\nint operands[2] = { 9, 4 };\n__attribute__((noinline)) int apply(int op, int a, int b) {\n    switch (op) {\n    case 0: return a + b;\n    case 1: return a - b;\n    case 2: return a * b;\n    case 3: return a / b;\n    case 4: return a % b;\n    case 5: return a << b;\n    case 6: return a >> b;\n    default: return 0;\n    }\n}\nint main(void) {\n    int sum = 0;\n    for (int i = 0; i < 2; i++) sum += table[i](operands[0], operands[1]);\n    for (int op = 0; op < 8; op++) sum += apply(op, operands[0], operands[1]);\n    return sum - 100;\n}\n",
+      "headers": {},
+      "files": {},
+      "optimizations": [
+        "2"
+      ],
+      "flags": {
+        "replace": {
+          "-fcf-protection=none": "-fcf-protection=full"
+        }
+      },
+      "outcome": {
+        "kind": "translation-error",
+        "code": "unsupported-instruction"
+      },
+      "referenceOutcome": {
+        "kind": "exit",
+        "value": 119
+      },
+      "note": "Intended to fail translation since 2026-10-04: NASM 3.00 cannot express GCC's `notrack` prefix on the jump-table jump faithfully, so the translator rejects the `notrack jmp` as `unsupported-instruction`, and the profile requires `-fcf-protection=none`. Its GNU as reference, built when the intended outcome was exit 119, is still built and must still exit 119, as evidence that the program itself runs as written."
+    },
+    {
+      "name": "quicksort",
+      "language": "c",
+      "exercises": "Runtime-library-style generic quicksort through a comparator, on ints and 16-byte records",
+      "source": "typedef int (*compare_fn)(const void *, const void *);\n\nstatic void swap_items(unsigned char *a, unsigned char *b, unsigned long size) {\n    while (size--) {\n        unsigned char t = *a;\n        *a++ = *b;\n        *b++ = t;\n    }\n}\n\nvoid quick_sort(void *base, unsigned long count, unsigned long size, compare_fn compare) {\n    unsigned char *items = base;\n    while (count > 1) {\n        unsigned char *last = items + (count - 1) * size;\n        swap_items(items + (count / 2) * size, last, size);\n        unsigned long store = 0;\n        for (unsigned long i = 0; i + 1 < count; i++) {\n            if (compare(items + i * size, last) < 0) {\n                swap_items(items + i * size, items + store * size, size);\n                store++;\n            }\n        }\n        swap_items(items + store * size, last, size);\n        unsigned long right = count - store - 1;\n        if (store < right) {\n            quick_sort(items, store, size, compare);\n            items += (store + 1) * size;\n            count = right;\n        } else {\n            quick_sort(items + (store + 1) * size, right, size, compare);\n            count = store;\n        }\n    }\n}\n\nstatic int compare_ints(const void *a, const void *b) {\n    int x = *(const int *)a, y = *(const int *)b;\n    return (x > y) - (x < y);\n}\n\nstruct record { short key; char tag; long weight; };\n\nstatic int compare_records(const void *a, const void *b) {\n    const struct record *x = a, *y = b;\n    if (x->key != y->key) return x->key < y->key ? -1 : 1;\n    return x->tag - y->tag;\n}\n\nint numbers[] = { 42, -7, 19, 3, 88, 3, -50, 61, 0, 27, 14, -1, 99, 5, 73, 36, 8, -12, 50, 21 };\nstruct record records[] = { {5, 'c', 10}, {2, 'a', 20}, {5, 'a', 30}, {-3, 'z', 40}, {2, 'b', 50}, {9, 'q', 60}, {0, 'm', 70} };\n\nint main(void) {\n    unsigned long n = sizeof numbers / sizeof numbers[0];\n    quick_sort(numbers, n, sizeof numbers[0], compare_ints);\n    for (unsigned long i = 1; i < n; i++)\n        if (numbers[i - 1] > numbers[i]) return 1;\n    unsigned long m = sizeof records / sizeof records[0];\n    quick_sort(records, m, sizeof records[0], compare_records);\n    int sum = 0;\n    for (unsigned long i = 0; i < m; i++) sum += (int)(i + 1) * (int)(records[i].weight / 10);\n    return numbers[0] + numbers[n - 1] + numbers[n / 2] + sum;\n}\n",
+      "headers": {},
+      "files": {},
+      "optimizations": [
+        "2",
+        "s"
+      ],
+      "outcome": {
+        "kind": "exit",
+        "value": 175
+      }
+    },
+    {
+      "name": "strtol",
+      "language": "c",
+      "exercises": "Runtime-library-style `strtol`: whitespace, signs, base prefixes, bases 2 to 36, overflow",
+      "source": "static int is_space(int c) { return c == ' ' || (c >= '\\t' && c <= '\\r'); }\n\nstatic int digit_value(int c) {\n    if (c >= '0' && c <= '9') return c - '0';\n    if (c >= 'a' && c <= 'z') return c - 'a' + 10;\n    if (c >= 'A' && c <= 'Z') return c - 'A' + 10;\n    return 64;\n}\n\nlong parse_long(const char *text, const char **end, int base) {\n    const char *p = text;\n    while (is_space((unsigned char)*p)) p++;\n    int negative = 0;\n    if (*p == '+' || *p == '-') negative = *p++ == '-';\n    if ((base == 0 || base == 16) && p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&\n        digit_value((unsigned char)p[2]) < 16) {\n        p += 2;\n        base = 16;\n    } else if (base == 0) {\n        base = p[0] == '0' ? 8 : 10;\n    }\n    unsigned long limit = negative ? 0x8000000000000000UL : 0x7fffffffffffffffUL;\n    unsigned long value = 0;\n    int any = 0, overflow = 0;\n    for (;; p++) {\n        int digit = digit_value((unsigned char)*p);\n        if (digit >= base) break;\n        any = 1;\n        if (overflow || value > (limit - digit) / base) overflow = 1;\n        else value = value * base + digit;\n    }\n    if (end) *end = any ? p : text;\n    if (overflow) value = limit;\n    return negative ? (long)(0 - value) : (long)value;\n}\n\nstruct test { const char *text; int base; };\n\nstatic const struct test tests[] = {\n    { \"  -42\", 10 },\n    { \"0x1F\", 0 },\n    { \"0777\", 0 },\n    { \"+15zz\", 10 },\n    { \"zz\", 36 },\n    { \"z\", 10 },\n    { \"9223372036854775807\", 10 },\n    { \"-9223372036854775808\", 10 },\n    { \"99999999999999999999\", 10 },\n    { \"\\t\\n 1010\", 2 },\n    { \"0x\", 16 },\n};\n\nint main(void) {\n    unsigned long mix = 0;\n    int consumed = 0;\n    for (unsigned i = 0; i < sizeof tests / sizeof tests[0]; i++) {\n        const char *end;\n        long value = parse_long(tests[i].text, &end, tests[i].base);\n        mix = mix * 31 + (unsigned long)value;\n        consumed += (int)(end - tests[i].text);\n    }\n    return (int)(mix % 151) + consumed;\n}\n",
+      "headers": {},
+      "files": {},
+      "optimizations": [
+        "2",
+        "s"
+      ],
+      "outcome": {
+        "kind": "exit",
+        "value": 125
+      }
+    },
+    {
+      "name": "formatter",
+      "language": "c",
+      "exercises": "Runtime-library-style variadic formatter: `%d %i %u %x %X %c %s %%`, `l`, width, `-` and `0` flags, truncation",
+      "source": "#include <stdarg.h>\n\nstruct sink { char *buffer; unsigned long size; unsigned long length; };\n\nstatic void put(struct sink *out, char c) {\n    if (out->length + 1 < out->size) out->buffer[out->length] = c;\n    out->length++;\n}\n\nstatic void put_repeated(struct sink *out, char c, int count) {\n    while (count-- > 0) put(out, c);\n}\n\nstatic int digits_of(char *digits, unsigned long value, unsigned base, int upper) {\n    const char *set = upper ? \"0123456789ABCDEF\" : \"0123456789abcdef\";\n    int n = 0;\n    do {\n        digits[n++] = set[value % base];\n        value /= base;\n    } while (value);\n    return n;\n}\n\nstatic void put_number(struct sink *out, unsigned long magnitude, int negative, unsigned base,\n                       int upper, int width, int left, int zero) {\n    char digits[24];\n    int n = digits_of(digits, magnitude, base, upper);\n    int length = n + negative;\n    if (!left && !zero) put_repeated(out, ' ', width - length);\n    if (negative) put(out, '-');\n    if (!left && zero) put_repeated(out, '0', width - length);\n    while (n > 0) put(out, digits[--n]);\n    if (left) put_repeated(out, ' ', width - length);\n}\n\nint format(char *buffer, unsigned long size, const char *fmt, ...) {\n    struct sink out = { buffer, size, 0 };\n    va_list args;\n    va_start(args, fmt);\n    for (const char *p = fmt; *p; p++) {\n        if (*p != '%') {\n            put(&out, *p);\n            continue;\n        }\n        p++;\n        int left = 0, zero = 0, width = 0, is_long = 0;\n        for (;; p++) {\n            if (*p == '-') left = 1;\n            else if (*p == '0') zero = 1;\n            else break;\n        }\n        while (*p >= '0' && *p <= '9') width = width * 10 + (*p++ - '0');\n        if (*p == 'l') {\n            is_long = 1;\n            p++;\n        }\n        switch (*p) {\n        case 'd':\n        case 'i': {\n            long value = is_long ? va_arg(args, long) : va_arg(args, int);\n            unsigned long magnitude = value < 0 ? 0 - (unsigned long)value : (unsigned long)value;\n            put_number(&out, magnitude, value < 0, 10, 0, width, left, zero);\n            break;\n        }\n        case 'u':\n        case 'x':\n        case 'X': {\n            unsigned long value = is_long ? va_arg(args, unsigned long) : va_arg(args, unsigned);\n            put_number(&out, value, 0, *p == 'u' ? 10 : 16, *p == 'X', width, left, zero);\n            break;\n        }\n        case 'c': {\n            char c = (char)va_arg(args, int);\n            if (!left) put_repeated(&out, ' ', width - 1);\n            put(&out, c);\n            if (left) put_repeated(&out, ' ', width - 1);\n            break;\n        }\n        case 's': {\n            const char *s = va_arg(args, const char *);\n            int length = 0;\n            while (s[length]) length++;\n            if (!left) put_repeated(&out, ' ', width - length);\n            for (int i = 0; i < length; i++) put(&out, s[i]);\n            if (left) put_repeated(&out, ' ', width - length);\n            break;\n        }\n        case '%':\n            put(&out, '%');\n            break;\n        default:\n            put(&out, '%');\n            if (*p) put(&out, *p);\n            else p--;\n            break;\n        }\n    }\n    va_end(args);\n    if (out.size) out.buffer[out.length < out.size ? out.length : out.size - 1] = 0;\n    return (int)out.length;\n}\n\nint main(void) {\n    char buffer[96];\n    int length = format(buffer, sizeof buffer, \"%s=%d|%5u|%-4x|%c%%|%08ld|%lX|%-6s|%3c|%i\", \"key\", -42,\n                        7u, 0xabu, 'Z', -123456L, 0xdeadbeefUL, \"ok\", 'q', 0);\n    unsigned sum = 0;\n    for (int i = 0; buffer[i]; i++) sum = sum * 7 + (unsigned char)buffer[i];\n    char small[8];\n    int truncated = format(small, sizeof small, \"%x-%x\", 0x1234u, 0x5678u);\n    return (int)(sum % 97) + length + truncated + small[6];\n}\n",
+      "headers": {},
+      "files": {},
+      "optimizations": [
+        "2",
+        "s"
+      ],
+      "outcome": {
+        "kind": "exit",
+        "value": 122
+      }
+    },
+    {
+      "name": "ctororder",
+      "language": "cpp",
+      "exercises": "Unprioritized constructors whose order shows in the result: three `__attribute__((constructor))` functions, whose order the language leaves to GCC, and two global objects, which C++ builds in declaration order, each noting when it ran; `.init_array` holds four entries",
+      "source": "int runs;\nint early_at, middle_at, late_at;\nstatic int next_run() { return ++runs; }\n__attribute__((constructor)) static void early() { early_at = next_run(); }\nstruct Stamp { int at; Stamp() : at(next_run()) {} };\nStamp first;\n__attribute__((constructor)) static void middle() { middle_at = next_run(); }\nStamp second;\n__attribute__((constructor)) static void late() { late_at = next_run(); }\nint main() { return early_at * 25 + middle_at * 5 + late_at + (second.at == first.at + 1 ? 0 : 100); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 38
+      }
+    },
+    {
+      "name": "memberpointers",
+      "language": "cpp",
+      "exercises": "Pointers to member functions through a table: ten member functions, one virtual. The Itanium C++ ABI tells a virtual one by the address's low bit, so GCC aligns member functions to 2 bytes (plan note 8)",
+      "source": "struct Machine {\n    int acc;\n    Machine() : acc(0) {}\n    virtual int twice(int x) { return acc = acc * 2 + x; }\n    int set(int x) { return acc = x; }\n    int add(int x) { return acc += x; }\n    int sub(int x) { return acc -= x; }\n    int mul(int x) { return acc *= x; }\n    int half(int x) { return acc = acc / 2 + x; }\n    int flip(int x) { return acc = x - acc; }\n    int mask(int x) { return acc &= x; }\n    int merge(int x) { return acc |= x; }\n    int toggle(int x) { return acc ^= x; }\n};\ntypedef int (Machine::*Operation)(int);\nOperation steps[] = {\n    &Machine::set, &Machine::add, &Machine::mul, &Machine::twice, &Machine::sub, &Machine::half,\n    &Machine::flip, &Machine::mask, &Machine::merge, &Machine::toggle, &Machine::twice,\n};\nint operands[] = { 7, 5, 3, 1, 4, 6, 50, 31, 64, 5, 9 };\nint main() {\n    Machine machine;\n    int result = 0;\n    for (unsigned i = 0; i < sizeof steps / sizeof steps[0]; i++) result = (machine.*steps[i])(operands[i]);\n    return result;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 167
+      }
+    },
+    {
+      "name": "alignedfn",
+      "language": "c",
+      "exercises": "A function aligned to 64 bytes (`__attribute__((aligned(64)))`), whose address the program checks through a table",
+      "source": "__attribute__((noinline)) int plain(int x) { return x + 1; }\n__attribute__((noinline, aligned(64))) int aligned(int x) { return x * 3; }\nint (*functions[])(int) = { plain, aligned };\nint main(void) { return ((unsigned long)functions[1] % 64 == 0) * 100 + functions[1](functions[0](13)); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 142
+      }
+    }
+  ],
+  "x87Matrix": {
+    "description": "Each form in GCC's -masm=intel spelling, applied to the values in `stack` (top first) loaded from .rodata with fld: 10.0 and 4.0 for st(1) forms, 10.0, 7.0 and 4.0 for st(2) forms, so the operands are always 10 and 4. main stores the stack to memory with fstp, then returns cvtsd2si(destination × 4) + 64, read from the destination register's slot after any pop; every operand order gives a different value below 256, and a form that wrote another register returns 104, 92 or 80 instead. `semantics` and `intelOpcode` are the Intel SDM's; `intended` follows from them.",
+    "forms": [
+      {
+        "name": "fadd-st-st1",
+        "instruction": "fadd st, st(1)",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(0) + ST(1)",
+        "intelOpcode": "D8 C1",
+        "result": 14,
+        "intended": 120
+      },
+      {
+        "name": "fadd-st1-st",
+        "instruction": "fadd st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": false,
+        "semantics": "ST(1) ← ST(1) + ST(0)",
+        "intelOpcode": "DC C1",
+        "result": 14,
+        "intended": 120
+      },
+      {
+        "name": "faddp-st1-st",
+        "instruction": "faddp st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": true,
+        "semantics": "ST(1) ← ST(1) + ST(0), then pop",
+        "intelOpcode": "DE C1",
+        "result": 14,
+        "intended": 120
+      },
+      {
+        "name": "fsub-st-st1",
+        "instruction": "fsub st, st(1)",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(0) − ST(1)",
+        "intelOpcode": "D8 E1",
+        "result": 6,
+        "intended": 88
+      },
+      {
+        "name": "fsub-st1-st",
+        "instruction": "fsub st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": false,
+        "semantics": "ST(1) ← ST(1) − ST(0)",
+        "intelOpcode": "DC E9",
+        "result": -6,
+        "intended": 40
+      },
+      {
+        "name": "fsubp-st1-st",
+        "instruction": "fsubp st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": true,
+        "semantics": "ST(1) ← ST(1) − ST(0), then pop",
+        "intelOpcode": "DE E9",
+        "result": -6,
+        "intended": 40
+      },
+      {
+        "name": "fsubr-st-st1",
+        "instruction": "fsubr st, st(1)",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(1) − ST(0)",
+        "intelOpcode": "D8 E9",
+        "result": -6,
+        "intended": 40
+      },
+      {
+        "name": "fsubr-st1-st",
+        "instruction": "fsubr st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": false,
+        "semantics": "ST(1) ← ST(0) − ST(1)",
+        "intelOpcode": "DC E1",
+        "result": 6,
+        "intended": 88
+      },
+      {
+        "name": "fsubrp-st1-st",
+        "instruction": "fsubrp st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": true,
+        "semantics": "ST(1) ← ST(0) − ST(1), then pop",
+        "intelOpcode": "DE E1",
+        "result": 6,
+        "intended": 88
+      },
+      {
+        "name": "fmul-st-st1",
+        "instruction": "fmul st, st(1)",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(0) × ST(1)",
+        "intelOpcode": "D8 C9",
+        "result": 40,
+        "intended": 224
+      },
+      {
+        "name": "fmul-st1-st",
+        "instruction": "fmul st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": false,
+        "semantics": "ST(1) ← ST(1) × ST(0)",
+        "intelOpcode": "DC C9",
+        "result": 40,
+        "intended": 224
+      },
+      {
+        "name": "fmulp-st1-st",
+        "instruction": "fmulp st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": true,
+        "semantics": "ST(1) ← ST(1) × ST(0), then pop",
+        "intelOpcode": "DE C9",
+        "result": 40,
+        "intended": 224
+      },
+      {
+        "name": "fdiv-st-st1",
+        "instruction": "fdiv st, st(1)",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(0) ÷ ST(1)",
+        "intelOpcode": "D8 F1",
+        "result": 2.5,
+        "intended": 74
+      },
+      {
+        "name": "fdiv-st1-st",
+        "instruction": "fdiv st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": false,
+        "semantics": "ST(1) ← ST(1) ÷ ST(0)",
+        "intelOpcode": "DC F9",
+        "result": 0.4,
+        "intended": 66
+      },
+      {
+        "name": "fdivp-st1-st",
+        "instruction": "fdivp st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": true,
+        "semantics": "ST(1) ← ST(1) ÷ ST(0), then pop",
+        "intelOpcode": "DE F9",
+        "result": 0.4,
+        "intended": 66
+      },
+      {
+        "name": "fdivr-st-st1",
+        "instruction": "fdivr st, st(1)",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(1) ÷ ST(0)",
+        "intelOpcode": "D8 F9",
+        "result": 0.4,
+        "intended": 66
+      },
+      {
+        "name": "fdivr-st1-st",
+        "instruction": "fdivr st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": false,
+        "semantics": "ST(1) ← ST(0) ÷ ST(1)",
+        "intelOpcode": "DC F1",
+        "result": 2.5,
+        "intended": 74
+      },
+      {
+        "name": "fdivrp-st1-st",
+        "instruction": "fdivrp st(1), st",
+        "stack": [
+          10,
+          4
+        ],
+        "destination": "st(1)",
+        "pops": true,
+        "semantics": "ST(1) ← ST(0) ÷ ST(1), then pop",
+        "intelOpcode": "DE F1",
+        "result": 2.5,
+        "intended": 74
+      },
+      {
+        "name": "fadd-st-st2",
+        "instruction": "fadd st, st(2)",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(0) + ST(2)",
+        "intelOpcode": "D8 C2",
+        "result": 14,
+        "intended": 120
+      },
+      {
+        "name": "fadd-st2-st",
+        "instruction": "fadd st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": false,
+        "semantics": "ST(2) ← ST(2) + ST(0)",
+        "intelOpcode": "DC C2",
+        "result": 14,
+        "intended": 120
+      },
+      {
+        "name": "faddp-st2-st",
+        "instruction": "faddp st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": true,
+        "semantics": "ST(2) ← ST(2) + ST(0), then pop",
+        "intelOpcode": "DE C2",
+        "result": 14,
+        "intended": 120
+      },
+      {
+        "name": "fsub-st-st2",
+        "instruction": "fsub st, st(2)",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(0) − ST(2)",
+        "intelOpcode": "D8 E2",
+        "result": 6,
+        "intended": 88
+      },
+      {
+        "name": "fsub-st2-st",
+        "instruction": "fsub st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": false,
+        "semantics": "ST(2) ← ST(2) − ST(0)",
+        "intelOpcode": "DC EA",
+        "result": -6,
+        "intended": 40
+      },
+      {
+        "name": "fsubp-st2-st",
+        "instruction": "fsubp st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": true,
+        "semantics": "ST(2) ← ST(2) − ST(0), then pop",
+        "intelOpcode": "DE EA",
+        "result": -6,
+        "intended": 40
+      },
+      {
+        "name": "fsubr-st-st2",
+        "instruction": "fsubr st, st(2)",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(2) − ST(0)",
+        "intelOpcode": "D8 EA",
+        "result": -6,
+        "intended": 40
+      },
+      {
+        "name": "fsubr-st2-st",
+        "instruction": "fsubr st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": false,
+        "semantics": "ST(2) ← ST(0) − ST(2)",
+        "intelOpcode": "DC E2",
+        "result": 6,
+        "intended": 88
+      },
+      {
+        "name": "fsubrp-st2-st",
+        "instruction": "fsubrp st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": true,
+        "semantics": "ST(2) ← ST(0) − ST(2), then pop",
+        "intelOpcode": "DE E2",
+        "result": 6,
+        "intended": 88
+      },
+      {
+        "name": "fmul-st-st2",
+        "instruction": "fmul st, st(2)",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(0) × ST(2)",
+        "intelOpcode": "D8 CA",
+        "result": 40,
+        "intended": 224
+      },
+      {
+        "name": "fmul-st2-st",
+        "instruction": "fmul st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": false,
+        "semantics": "ST(2) ← ST(2) × ST(0)",
+        "intelOpcode": "DC CA",
+        "result": 40,
+        "intended": 224
+      },
+      {
+        "name": "fmulp-st2-st",
+        "instruction": "fmulp st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": true,
+        "semantics": "ST(2) ← ST(2) × ST(0), then pop",
+        "intelOpcode": "DE CA",
+        "result": 40,
+        "intended": 224
+      },
+      {
+        "name": "fdiv-st-st2",
+        "instruction": "fdiv st, st(2)",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(0) ÷ ST(2)",
+        "intelOpcode": "D8 F2",
+        "result": 2.5,
+        "intended": 74
+      },
+      {
+        "name": "fdiv-st2-st",
+        "instruction": "fdiv st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": false,
+        "semantics": "ST(2) ← ST(2) ÷ ST(0)",
+        "intelOpcode": "DC FA",
+        "result": 0.4,
+        "intended": 66
+      },
+      {
+        "name": "fdivp-st2-st",
+        "instruction": "fdivp st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": true,
+        "semantics": "ST(2) ← ST(2) ÷ ST(0), then pop",
+        "intelOpcode": "DE FA",
+        "result": 0.4,
+        "intended": 66
+      },
+      {
+        "name": "fdivr-st-st2",
+        "instruction": "fdivr st, st(2)",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(0)",
+        "pops": false,
+        "semantics": "ST(0) ← ST(2) ÷ ST(0)",
+        "intelOpcode": "D8 FA",
+        "result": 0.4,
+        "intended": 66
+      },
+      {
+        "name": "fdivr-st2-st",
+        "instruction": "fdivr st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": false,
+        "semantics": "ST(2) ← ST(0) ÷ ST(2)",
+        "intelOpcode": "DC F2",
+        "result": 2.5,
+        "intended": 74
+      },
+      {
+        "name": "fdivrp-st2-st",
+        "instruction": "fdivrp st(2), st",
+        "stack": [
+          10,
+          7,
+          4
+        ],
+        "destination": "st(2)",
+        "pops": true,
+        "semantics": "ST(2) ← ST(0) ÷ ST(2), then pop",
+        "intelOpcode": "DE F2",
+        "result": 2.5,
+        "intended": 74
+      }
+    ]
+  }
+}

@@ -27,6 +27,7 @@
 #include "blink/atomic.h"
 #include "blink/bitscan.h"
 #include "blink/endian.h"
+#include "blink/flags.h"
 #include "blink/ldbl.h"
 #include "blink/linux.h"
 #include "blink/log.h"
@@ -101,7 +102,9 @@ void DeliverSignal(struct Machine *m, int sig, int code) {
   memcpy(sf.uc.rcx, m->cx, 8);
   memcpy(sf.uc.rsp, m->sp, 8);
   Write64(sf.uc.rip, m->ip);
-  Write64(sf.uc.eflags, m->flags);
+  if (m->trapno == kMachineSingleStep) Write64(sf.uc.trapno, 1);
+  // the eflags a program sees, not blink's own word (see ExportFlags())
+  Write64(sf.uc.eflags, ExportFlags(m, m->flags));
   Write16(sf.fp.cwd, m->fpu.cw);
 #ifndef DISABLE_X87
   Write16(sf.fp.swd, m->fpu.sw);
@@ -164,6 +167,10 @@ void DeliverSignal(struct Machine *m, int sig, int code) {
   Put64(m->dx, sp + offsetof(struct SignalFrame, uc));
   SIG_LOGF("handler is %" PRIx64, Read64(m->system->hands[sig - 1].handler));
   m->ip = Read64(m->system->hands[sig - 1].handler);
+  // Linux handle_signal() clears these for handler entry, after saving the
+  // interrupted flags in the frame. In particular TF must not trap inside
+  // the SIGTRAP handler itself.
+  m->flags &= ~(DF | RF | 1 << FLAGS_TF);
 }
 
 void SigRestore(struct Machine *m) {
@@ -180,7 +187,12 @@ void SigRestore(struct Machine *m) {
   SYS_LOGF("rt_sigreturn(%#" PRIx64 ")", Read64(m->sp) - 8);
   unassert(!CopyFromUserRead(m, &sf, Read64(m->sp) - 8, sizeof(sf)));
   m->ip = Read64(sf.uc.rip);
-  m->flags = Read64(sf.uc.eflags);
+  // like linux restore_sigcontext(), which takes only the flags in its
+  // FIX_EFLAGS from the frame (less RF: blink has no hardware instruction
+  // breakpoints to suppress), so a handler can't set the others. Fault and
+  // intermediate REP frames still expose the architectural saved RF bit.
+  ImportFlagsMasked(m, Read64(sf.uc.eflags),
+                    CF | PF | AF | ZF | SF | OF | DF | AC | 1 << FLAGS_TF);
   m->sigmask = Read64(sf.uc.sigmask);
   SIG_LOGF("sigmask restore %" PRIx64, m->sigmask);
   memcpy(m->r8, sf.uc.r8, 8);

@@ -58,6 +58,7 @@
 #include "blink/checked.h"
 #include "blink/debug.h"
 #include "blink/endian.h"
+#include "blink/flags.h"
 #include "blink/errno.h"
 #include "blink/flag.h"
 #include "blink/iovs.h"
@@ -351,6 +352,13 @@ static void ClearChildTid(struct Machine *m) {
 
 _Noreturn void SysExitGroup(struct Machine *m, int rc) {
   THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
+  /* The debugger retains the machine so an exit instruction can be undone.
+   * Every trapped exit must halt, including one replayed after an undo. */
+  if (m->system->trapexit) {
+    m->system->exited = true;
+    m->system->exitcode = rc;
+    HaltMachine(m, kMachineExitTrap);
+  }
   ClearChildTid(m);
   if (m->system->isfork) {
 #ifndef NDEBUG
@@ -366,11 +374,6 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
 #ifdef HAVE_JIT
     DisableJit(&m->system->jit);  // unmapping exec pages is slow
 #endif
-    if (m->system->trapexit && !m->system->exited) {
-      m->system->exited = true;
-      m->system->exitcode = rc;
-      HaltMachine(m, kMachineExitTrap);
-    }
     FreeMachine(m);
 #ifdef HAVE_JIT
     ShutdownJit();
@@ -5474,6 +5477,10 @@ void OpSyscall(P) {
   size_t mark;
   u64 ax, di, si, dx, r0, r8, r9;
   unassert(!m->nofault);
+  // SYSCALL saves the next RIP and the architectural RFLAGS word, before
+  // any syscall (including the clock_gettime fast path) can change state.
+  Put64(m->cx, m->ip);
+  Put64(m->r11, ExportFlags(m, m->flags));
   if (Get64(m->ax) == 0xE4) {
     // clock_gettime() is
     //   1) called frequently,

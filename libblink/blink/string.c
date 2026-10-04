@@ -194,6 +194,14 @@ static void StringOp(P, int op) {
     }
     if (Rep(rde)) {
       SubtractCx(A, 1);
+      if (GetFlag(m->flags, FLAGS_TF) && ReadCx(A) && !stop) {
+        // REP traps between iterations, with RIP still on the string opcode
+        // and RF set in the saved frame (SDM Vol. 3B 20.3.1.1).
+        m->ip -= m->oplen;
+        m->flags |= RF;
+        if (m->stashaddr) CommitStash(m);
+        RaiseSingleStep(m);
+      }
     } else {
       break;
     }
@@ -310,15 +318,17 @@ void OpScas(P) {
 }
 
 void OpIns(P) {
+  if (!m->metal) ThrowProtectionFault(m);
   StringOp(A, STRING_INS);
 }
 
 void OpOuts(P) {
+  if (!m->metal) ThrowProtectionFault(m);
   StringOp(A, STRING_OUTS);
 }
 
 void OpMovsb(P) {
-  if (Rep(rde)) {
+  if (Rep(rde) && !GetFlag(m->flags, FLAGS_TF)) {
     RepMovsbEnhanced(A);
   } else {
     OpMovs(A);
@@ -326,7 +336,8 @@ void OpMovsb(P) {
 }
 
 void OpStosb(P) {
-  if (Rep(rde) && !GetFlag(m->flags, FLAGS_DF)) {
+  if (Rep(rde) && !GetFlag(m->flags, FLAGS_DF) &&
+      !GetFlag(m->flags, FLAGS_TF)) {
     RepStosbEnhanced(A);
   } else {
     OpStos(A);

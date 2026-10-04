@@ -40,9 +40,10 @@
 #define GetLazyParityBool(f)    GetParity((0xff000000 & (f)) >> FLAGS_LP)
 #define SetLazyParityByte(f, x) ((0x00ffffff & (f)) | (255 & (x)) << FLAGS_LP)
 
-u64 ExportFlags(u64);
+u64 ExportFlags(struct Machine *, u64);
 bool GetParity(u8) pureconst;
 void ImportFlags(struct Machine *, u64);
+void ImportFlagsMasked(struct Machine *, u64, u64);
 int GetFlagDeps(u64) pureconst;
 int GetFlagClobbers(u64) pureconst;
 int GetNeededFlags(struct Machine *, i64, int);

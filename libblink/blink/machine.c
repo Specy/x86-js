@@ -75,10 +75,12 @@ static void OpStc(P) {
 }
 
 static void OpCli(P) {
+  if (!m->metal) ThrowProtectionFault(m);
   m->flags = SetFlag(m->flags, FLAGS_IF, false);
 }
 
 static void OpSti(P) {
+  if (!m->metal) ThrowProtectionFault(m);
   m->flags = SetFlag(m->flags, FLAGS_IF, true);
 }
 
@@ -91,7 +93,7 @@ static void OpStd(P) {
 }
 
 static void OpPushf(P) {
-  Push(A, ExportFlags(m->flags) & 0xFCFFFF);
+  Push(A, ExportFlags(m, m->flags) & 0xFCFFFF);
 }
 
 static void OpPopf(P) {
@@ -103,7 +105,7 @@ static void OpPopf(P) {
 }
 
 static void OpLahf(P) {
-  m->ah = ExportFlags(m->flags);
+  m->ah = ExportFlags(m, m->flags);
 }
 
 static void OpSahf(P) {
@@ -820,7 +822,7 @@ static void GenInterrupt(P, u8 trapno) {
         fp = Load32(pfp);
         isrseg = (u16)(fp >> 16);
         isroff = (u16)fp;
-        Push(A, ExportFlags(m->flags));
+        Push(A, ExportFlags(m, m->flags));
         Push(A, m->cs.sel);
         Push(A, m->ip);
         // optimize for cases where ISR is simply a `hvtailcall` & a few
@@ -1485,12 +1487,16 @@ static void OpEmms(P) {
 }
 
 #ifdef DISABLE_METAL
+static void OpIoFault(P) {
+  ThrowProtectionFault(m);
+}
+
 #define OpCallf       OpUd
 #define OpDecZv       OpUd
-#define OpInAlDx      OpUd
-#define OpInAlImm     OpUd
-#define OpInAxDx      OpUd
-#define OpInAxImm     OpUd
+#define OpInAlDx      OpIoFault
+#define OpInAlImm     OpIoFault
+#define OpInAxDx      OpIoFault
+#define OpInAxImm     OpIoFault
 #define OpIncZv       OpUd
 #define OpJmpf        OpUd
 #define OpLds         OpUd
@@ -1502,10 +1508,10 @@ static void OpEmms(P) {
 #define OpMovEvqpSw   OpUd
 #define OpMovRqCq     OpUd
 #define OpMovSwEvqp   OpUd
-#define OpOutDxAl     OpUd
-#define OpOutDxAx     OpUd
-#define OpOutImmAl    OpUd
-#define OpOutImmAx    OpUd
+#define OpOutDxAl     OpIoFault
+#define OpOutDxAx     OpIoFault
+#define OpOutImmAl    OpIoFault
+#define OpOutImmAx    OpIoFault
 #define OpPopSeg      OpUd
 #define OpPopa        OpUd
 #define OpPushSeg     OpUd
@@ -2091,10 +2097,11 @@ nexgen32e_f GetOp(long op) {
 }
 
 static bool CanJit(struct Machine *m) {
-  return !IsJitDisabled(&m->system->jit);
+  return !GetFlag(m->flags, FLAGS_TF) && !IsJitDisabled(&m->system->jit);
 }
 
 void JitlessDispatch(P) {
+  bool singlestep = GetFlag(m->flags, FLAGS_TF);
   ASM_LOGF("decoding [%s] at address %" PRIx64, DescribeOp(m, GetPc(m)),
            GetPc(m));
   COSTLY_STATISTIC(++instructions_dispatched);
@@ -2102,11 +2109,20 @@ void JitlessDispatch(P) {
   rde = m->xedd->op.rde;
   disp = m->xedd->op.disp;
   uimm0 = m->xedd->op.uimm0;
+  // RF is consumed when an instruction begins (PUSHF also masks its image).
+  m->flags &= ~RF;
   m->oplen = Oplength(rde);
   m->ip += Oplength(rde);
   GetOp(Mopcode(rde))(A);
   if (m->stashaddr) CommitStash(m);
   m->oplen = 0;
+  // Sampling TF before dispatch delays POPF's newly enabled single stepping
+  // until the following instruction, and still traps when POPF clears TF.
+  // Linux masks TF during SYSCALL and restores it on return: stepping resumes
+  // with the first user instruction after the syscall (also for sigreturn).
+  if (singlestep && Mopcode(rde) != 0x105) {
+    RaiseSingleStep(m);
+  }
 }
 
 static void GeneralDispatch(P) {

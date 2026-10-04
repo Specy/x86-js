@@ -51,6 +51,7 @@
 #define kMachineExitTrap             -10
 #define kMachineFatalSystemSignal    -11
 #define kMachineFakeTTYtrap          -12
+#define kMachineSingleStep           -13
 
 #define CR0_PE 0x01        // protected mode enabled
 #define CR0_MP 0x02        // monitor coprocessor
@@ -503,6 +504,7 @@ _Noreturn void HaltMachine(struct Machine *, int);
 _Noreturn void RaiseDivideError(struct Machine *);
 _Noreturn void ThrowSegmentationFault(struct Machine *, i64);
 _Noreturn void ThrowProtectionFault(struct Machine *);
+_Noreturn void RaiseSingleStep(struct Machine *);
 _Noreturn void OpUdImpl(struct Machine *);
 _Noreturn void OpUd(P);
 void OpHlt(P);
@@ -535,6 +537,7 @@ void CollectPageLocks(struct Machine *);
 u8 *LookupAddress(struct Machine *, i64);
 u8 *LookupAddress2(struct Machine *, i64, u64, u64);
 u8 *SpyAddress(struct Machine *, i64);
+u8 *PageInAddress(struct Machine *, i64);
 u8 *Load(struct Machine *, i64, size_t, u8 *);
 u8 *MallocPage(void);
 u8 *RealAddress(struct Machine *, i64);

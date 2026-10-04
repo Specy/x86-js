@@ -24,29 +24,8 @@ import {
     type X86Project,
 } from './types'
 import { x86ProjectText } from './project'
-import type {
-    BlinkenlibModule,
-    NativeInstruction,
-    NativeMemoryWrite,
-    NativeStepInfo,
-    RegisterSnapshot,
-} from './wasm-types'
-import {
-    CircularHistory,
-    X86_FLAGS,
-    cloneCallStack,
-    cloneRegisterValues,
-    deferToHost,
-    isRecordableWrite,
-    makeFrameColor,
-    maskForSize,
-    maskRegisterValue,
-    stripPrivateHistory,
-    toHistoryPc,
-    type OpenPokeTransaction,
-    type UndoMemoryWrite,
-    type X86HistoryEntry,
-} from './x86-emulator-utils'
+import type { BlinkenlibModule } from './wasm-types'
+import { X86_FLAGS, deferToHost, maskForSize, maskRegisterValue } from './x86-emulator-utils'
 import { observeCallbackResult } from './callbacks'
 import { NativeHistory } from './native-history'
 import {
@@ -72,8 +51,6 @@ export type X86RunOptions = {
 export type X86EmulatorOptions = Omit<BlinkRuntimeOptions, 'callbacks' | 'mode'> & {
     mode?: AssemblerMode | AssemblerId
     callbacks?: BlinkRuntimeCallbacks
-    /** Compatibility and benchmarking switch; defaults to native history when available. */
-    nativeHistory?: boolean
 }
 
 export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86CompileResult> {
@@ -91,25 +68,28 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     private lastCompileResult: X86CompileResult | null = null
     private lastSourceCode = ''
-    private history = new CircularHistory<X86HistoryEntry>(0)
-    private callStack: StackFrame[] = []
-    private openPoke: OpenPokeTransaction | null = null
-    private nativePokeOpen = false
-    private readonly nativeHistory: NativeHistory | null
+    /** What `initialize()` was given: how many steps the history keeps, 0 recording none. */
+    private undoSize = 0
+    /** The undo history and call stack, both recorded inside the wasm. */
+    private readonly history: NativeHistory
+    private pokeOpen = false
     /** True while an instruction is running, so a Poke cannot open on top of one. */
     private executing = false
+    /**
+     * Input resumed the program and nothing has driven it since. A run left to
+     * the runtime's own loop goes on inside `provideInput()`, and may end there
+     * or still be going on, preempted, when the next call comes.
+     */
+    private resumedByInput = false
 
-    private constructor(runtime: BlinkRuntime, nativeHistory: boolean) {
+    private constructor(runtime: BlinkRuntime) {
         super({
             systemSize: RegisterSize.Double,
             registerNames: [...X86_REGISTER_NAMES],
             endianness: 'little',
         })
         this.runtime = runtime
-        this.nativeHistory =
-            nativeHistory && NativeHistory.available(runtime)
-                ? new NativeHistory(runtime, this.recordFpuMutations.bind(this))
-                : null
+        this.history = new NativeHistory(runtime, this.recordFpuMutations.bind(this))
     }
 
     static async create(options: X86EmulatorOptions = {}): Promise<X86Emulator> {
@@ -145,7 +125,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 },
             },
         })
-        emulator = new X86Emulator(runtime, options.nativeHistory ?? true)
+        NativeHistory.assertSupported(runtime.module)
+        emulator = new X86Emulator(runtime)
         return emulator
     }
 
@@ -196,7 +177,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const wasExecuting = this.executing
         this.executing = true
         try {
-            await this.runtime.runUntilBlocked()
+            if (!(await this.endedAfterInput())) await this.runtime.runUntilBlocked()
         } finally {
             this.executing = wasExecuting
         }
@@ -205,13 +186,13 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     provideInput(line: string): void {
         this.runtime.provideInput(line)
+        this.resumedByInput = true
     }
 
     initialize(undoSize: number): void {
-        const undoLimit = Number.isFinite(undoSize) ? Math.max(0, Math.floor(undoSize)) : 0
-        this.history = new CircularHistory<X86HistoryEntry>(undoLimit)
+        this.undoSize = Number.isFinite(undoSize) ? Math.max(0, Math.floor(undoSize)) : 0
         this.clearExecutionTrace()
-        this.nativeHistory?.initialize(undoLimit)
+        this.history.initialize(this.undoSize)
         this.runtime.setStepRecording(this.isTracingEnabled())
     }
 
@@ -222,7 +203,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     dispose(): void {
         this.runtime.setStepRecording(false)
         this.clearExecutionTrace()
-        this.nativeHistory?.initialize(0)
+        this.history.initialize(0)
         this.eventHandlers.stateChange.clear()
         this.eventHandlers.stdout.clear()
         this.eventHandlers.stderr.clear()
@@ -272,34 +253,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     undo(): void {
-        if (this.nativeHistory) {
-            if (this.nativeHistory.undo()) this.runtime.resumeAfterStateMutation()
-            return
-        }
-        const entry = this.history.pop()
-        if (!entry) return
-        if (!entry.reversible) {
-            this.history.push(entry)
-            throw new Error('The latest x86 step cannot be undone because its memory writes were too large to capture')
-        }
-
-        for (let index = entry.memoryWrites.length - 1; index >= 0; index -= 1) {
-            const write = entry.memoryWrites[index]
-            if (write) this.runtime.writeMemoryBytes(write.address, Uint8Array.from(write.old))
-        }
-        for (const register of X86_REGISTER_NAMES) {
-            this.runtime.setRegister(register, entry.registersBefore[register])
-        }
-        this.runtime.setFpuStateRaw(entry.fpuBefore)
-        this.runtime.setFlags(entry.flagsBefore)
-        this.callStack = cloneCallStack(entry.callStackBefore)
-        this.runtime.resumeAfterStateMutation()
+        if (this.history.undo()) this.runtime.resumeAfterStateMutation()
     }
 
     canUndo(): boolean {
-        if (this.nativeHistory) return this.nativeHistory.canUndo()
-        const entry = this.history.peekNewest()
-        return Boolean(entry?.reversible)
+        return this.history.canUndo()
     }
 
     /**
@@ -324,20 +282,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             throw new Error('Cannot begin a poke while an instruction is executing')
         }
 
-        if (this.nativeHistory) {
-            this.nativeHistory.beginPoke()
-            this.nativePokeOpen = true
-            return
-        }
-
-        const snapshot = this.runtime.getRegisterSnapshot()
-        this.openPoke = {
-            registersBefore: cloneRegisterValues(snapshot),
-            flagsBefore: snapshot.flags,
-            fpuBefore: this.runtime.getFpuStateRaw(),
-            callStackBefore: cloneCallStack(this.callStack),
-            memoryWrites: [],
-        }
+        this.history.beginPoke()
+        this.pokeOpen = true
     }
 
     /**
@@ -357,64 +303,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * Throws when no poke is open.
      */
     endPoke(): boolean {
-        if (this.nativeHistory) {
-            if (!this.nativePokeOpen) throw new Error('No poke is open: begin one before ending it')
-            this.nativePokeOpen = false
-            return this.nativeHistory.endPoke()
-        }
-        const poke = this.openPoke
-        if (!poke) throw new Error('No poke is open: begin one before ending it')
-        this.openPoke = null
-
-        const after = this.runtime.getRegisterSnapshot()
-        const registersAfter = cloneRegisterValues(after)
-        const mutations: ExecutionStep['mutations'] = []
-        const writes: PokeWrite[] = []
-
-        // `rip` is diffed here, unlike in an instruction's step, where the
-        // program counter is the control flow rather than a mutation: a poke
-        // moves it only because the host wrote it.
-        for (const register of X86_REGISTER_NAMES) {
-            const old = poke.registersBefore[register]
-            const value = registersAfter[register]
-            if (old === value) continue
-            mutations.push({
-                type: 'WriteRegister',
-                value: { register, old, new: value, size: RegisterSize.Double },
-            })
-            writes.push({ type: 'register', name: register, old, new: value })
-        }
-
-        this.recordFpuMutations(poke.fpuBefore, this.runtime.getFpuStateRaw(), mutations, writes)
-        const memoryWrites = this.recordPokeMemoryMutations(poke.memoryWrites, mutations, writes)
-
-        if (writes.length === 0) return false
-
-        const location = this.runtime.getSourceLocationForAddress(after.pc)
-        const entry: X86HistoryEntry = {
-            kind: 'poke',
-            mutations,
-            writes,
-            pc: toHistoryPc(after.pc),
-            old_ccr: { bits: poke.flagsBefore },
-            new_ccr: { bits: after.flags },
-            line: location?.line ?? -1,
-            file: location?.path,
-            registersBefore: poke.registersBefore,
-            flagsBefore: poke.flagsBefore,
-            fpuBefore: poke.fpuBefore,
-            callStackBefore: cloneCallStack(this.callStack),
-            memoryWrites,
-            reversible: true,
-        }
-
-        this.history.push(entry)
-        return true
+        if (!this.pokeOpen) throw new Error('No poke is open: begin one before ending it')
+        this.pokeOpen = false
+        return this.history.endPoke()
     }
 
     /** True between `beginPoke()` and `endPoke()`. */
     isPokeOpen(): boolean {
-        return this.nativePokeOpen || this.openPoke !== null
+        return this.pokeOpen
     }
 
     async step(): Promise<{ terminated: boolean }> {
@@ -422,12 +318,9 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const wasExecuting = this.executing
         this.executing = true
         try {
-            if (this.isTracingEnabled() && !this.nativeHistory) {
-                this.captureStep()
-            } else {
-                this.prepareOneInstructionRun()
-                this.runtime.step()
-            }
+            if (await this.endedAfterInput()) return { terminated: true }
+            this.prepareOneInstructionRun()
+            this.runtime.step()
         } finally {
             this.executing = wasExecuting
         }
@@ -447,23 +340,10 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * into the machine and records nothing, as it always has.
      */
     writeMemoryBytes(address: bigint, data: Uint8Array): void {
-        if (this.nativePokeOpen && data.length) {
-            // Preflight the whole range, as the legacy Poke path does.
-            this.runtime.readMemoryBytes(address, BigInt(data.length))
-            this.runtime.writeMemoryBytes(address, data)
-            return
-        }
-        const poke = this.openPoke
-        if (!poke || data.length === 0) {
-            this.runtime.writeMemoryBytes(address, data)
-            return
-        }
-
         // Read before writing: a range the machine cannot read throws here,
         // leaving the memory and the transaction as they were.
-        const old = [...this.runtime.readMemoryBytes(address, BigInt(data.length))]
+        if (this.pokeOpen && data.length) this.runtime.readMemoryBytes(address, BigInt(data.length))
         this.runtime.writeMemoryBytes(address, data)
-        poke.memoryWrites.push({ address, old })
     }
 
     readMemoryBytes(address: bigint, length: bigint): Uint8Array {
@@ -478,8 +358,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     getUndoHistory(max: number): ExecutionStep[] {
         const count = Math.max(0, Math.floor(max))
         if (count === 0) return []
-        if (this.nativeHistory) return this.nativeHistory.newestFirst(count)
-        return this.history.newestFirst(count).map(stripPrivateHistory)
+        return this.history.newestFirst(count)
     }
 
     getPc(): bigint {
@@ -492,7 +371,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     getFlags(): { name: string; value: number; prev?: number }[] {
         const flags = this.runtime.getFlags()
-        const previous = this.nativeHistory?.previousFlags() ?? this.history.peekNewest()?.flagsBefore
+        const previous = this.history.previousFlags()
         const previousFlags = previous === undefined ? flags : BigInt(previous)
         return X86_FLAGS.map((flag) => ({
             name: flag.name,
@@ -502,8 +381,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     getCallStack(): StackFrame[] {
-        if (this.nativeHistory) return this.nativeHistory.callStack()
-        return cloneCallStack(this.callStack)
+        return this.history.callStack()
     }
 
     getInstructionAt(address: bigint): Instruction | null {
@@ -609,14 +487,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const wasExecuting = this.executing
         this.executing = true
         try {
-            if (this.nativeHistory) return await this.runNativeSlices(limit, breakpointAddresses, options)
-            //the instruction loop is what records history and what stops on a
-            //breakpoint; the runtime's own loop is only for a run with neither
-            if (this.isTracingEnabled() || breakpointAddresses.length) {
-                return await this.runInstructions(limit, breakpointAddresses, options)
-            }
-            await this.runtime.runUntilBlocked({ limit, breakpointAddresses })
-            return this.getStatus()
+            if (await this.endedAfterInput()) return this.getStatus()
+            return await this.runNativeSlices(limit, breakpointAddresses, options)
         } finally {
             this.executing = wasExecuting
         }
@@ -651,67 +523,30 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return [...addresses.values()]
     }
 
-    /**
-     * One instruction at a time, which is what a breakpoint and the execution
-     * history both need: `step` records the history when tracing is on, and a
-     * breakpoint is checked before the instruction it names executes, so the
-     * program stops with that instruction still to run.
-     */
-    private async runInstructions(
-        limit: number | undefined,
-        breakpointAddresses: bigint[],
-        options: X86RunOptions,
-    ): Promise<EmulatorStatus> {
-        const breakpointSet = new Set(breakpointAddresses.map((address) => address.toString()))
-        const hasLimit = limit !== undefined && limit > 0
-        let executedInstructions = 0
-
-        //before the program counter is read: a program that has not started has
-        //no meaningful one, and `starti` runs no instruction, so this leaves it
-        //on the instruction the run is about to execute either way
-        this.prepareOneInstructionRun()
-
-        //the breakpoint the run starts on, which `skipBreakpointAtPc` runs past:
-        //null once the first instruction has been executed, so the same address
-        //reached again later - a loop closing on it - stops the run
-        let skipAt: string | null =
-            (options.skipBreakpointAtPc ?? true) ? this.getPc().toString() : null
-
-        while (this.runtime.state === BlinkState.ProgramRunning) {
-            const pc = this.getPc()
-            if (breakpointSet.has(pc.toString()) && pc.toString() !== skipAt) {
-                this.runtime.pauseForBreakpoint(
-                    pc,
-                    this.runtime.getSourceLocationForAddress(pc) ?? undefined,
-                )
-                return this.getStatus()
-            }
-            if (hasLimit && executedInstructions >= limit) {
-                this.runtime.pauseForLimit(pc, BigInt(executedInstructions))
-                return this.getStatus()
-            }
-
-            await this.step()
-            skipAt = null
-            executedInstructions += 1
-            if (executedInstructions % 10000 === 0) await deferToHost()
-        }
-
-        return this.getStatus()
-    }
-
     private isTracingEnabled(): boolean {
-        return this.history.capacity > 0
+        return this.undoSize > 0
     }
 
     private clearExecutionTrace(): void {
-        this.nativeHistory?.clear()
         this.history.clear()
-        this.callStack = []
         // A build or an initialize() throws the whole trace away; an open poke
-        // has nothing left to be recorded against.
-        this.openPoke = null
-        this.nativePokeOpen = false
+        // has nothing left to be recorded against, and the program input
+        // resumed is no longer the one there.
+        this.pokeOpen = false
+        this.resumedByInput = false
+    }
+
+    /**
+     * Whether the program ended after input resumed it and before this call:
+     * an end the caller reports, not a reason to start the program over. A
+     * loop the input resumed that is still going on, preempted, is waited for
+     * first, so two loops never drive the machine at once.
+     */
+    private async endedAfterInput(): Promise<boolean> {
+        if (!this.resumedByInput) return false
+        this.resumedByInput = false
+        await this.runtime.settle()
+        return this.hasTerminated()
     }
 
     private async runNativeSlices(
@@ -748,82 +583,6 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         }
     }
 
-    private captureStep(): void {
-        this.prepareOneInstructionRun()
-        const before = this.runtime.getRegisterSnapshot()
-        const fpuBefore = this.runtime.getFpuStateRaw()
-        const instruction = this.runtime.getInstructionAt(before.pc)
-        const callStackBefore = cloneCallStack(this.callStack)
-
-        this.runtime.step()
-
-        const after = this.runtime.getRegisterSnapshot()
-        const fpuAfter = this.runtime.getFpuStateRaw()
-        const nativeStep = this.runtime.getLastStepInfo()
-        this.recordStep(before, after, fpuBefore, fpuAfter, nativeStep, instruction, callStackBefore)
-    }
-
-    private recordStep(
-        before: RegisterSnapshot,
-        after: RegisterSnapshot,
-        fpuBefore: Uint8Array,
-        fpuAfter: Uint8Array,
-        nativeStep: NativeStepInfo,
-        instruction: NativeInstruction | null,
-        callStackBefore: StackFrame[],
-    ): void {
-        const registersBefore = cloneRegisterValues(before)
-        const registersAfter = cloneRegisterValues(after)
-        const pcBefore = nativeStep.valid ? nativeStep.pcBefore : before.pc
-        const pcAfter = nativeStep.valid ? nativeStep.pcAfter : after.pc
-        const flagsBefore = nativeStep.valid ? nativeStep.flagsBefore : before.flags
-        const flagsAfter = nativeStep.valid ? nativeStep.flagsAfter : after.flags
-        const mutations: ExecutionStep['mutations'] = []
-
-        // Both sides come from the two snapshots the step already takes, so a
-        // write reports what it left without any extra read of the machine.
-        for (const register of X86_REGISTER_NAMES) {
-            if (register === 'rip') continue
-            if (registersBefore[register] !== registersAfter[register]) {
-                mutations.push({
-                    type: 'WriteRegister',
-                    value: {
-                        register,
-                        old: registersBefore[register],
-                        new: registersAfter[register],
-                        size: RegisterSize.Double,
-                    },
-                })
-            }
-        }
-
-        this.recordFpuMutations(fpuBefore, fpuAfter, mutations)
-
-        const memoryWrites = nativeStep.valid ? this.recordMemoryMutations(nativeStep.memoryWrites, mutations) : []
-        if (nativeStep.valid) {
-            this.recordControlFlowMutation(nativeStep, instruction, mutations)
-        }
-        const location = this.runtime.getSourceLocationForAddress(pcBefore)
-
-        const entry: X86HistoryEntry = {
-            kind: 'instruction',
-            mutations,
-            pc: toHistoryPc(pcBefore),
-            old_ccr: { bits: flagsBefore },
-            new_ccr: { bits: flagsAfter },
-            line: location?.line ?? -1,
-            file: location?.path,
-            registersBefore,
-            flagsBefore,
-            fpuBefore,
-            callStackBefore,
-            memoryWrites,
-            reversible: !nativeStep.valid || !nativeStep.truncatedMemoryWrites,
-        }
-
-        this.history.push(entry)
-    }
-
     /**
      * Notes the SSE and x87 registers the step wrote. Most instructions touch
      * none of them, and that case costs one byte comparison: only a block that
@@ -845,22 +604,6 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
         const stateBefore = decodeFpuState(fpuBefore)
         const stateAfter = decodeFpuState(fpuAfter)
-
-        if (stateBefore.mxcsr !== stateAfter.mxcsr) {
-            mutations.push({
-                type: 'WriteRegister',
-                value: {
-                    register: 'mxcsr',
-                    old: BigInt(stateBefore.mxcsr),
-                    new: BigInt(stateAfter.mxcsr),
-                    size: RegisterSize.Long,
-                },
-            })
-            writes?.push({
-                type: 'register', name: 'mxcsr',
-                old: BigInt(stateBefore.mxcsr), new: BigInt(stateAfter.mxcsr),
-            })
-        }
 
         for (let index = 0; index < stateBefore.xmm.length; index += 1) {
             if (stateBefore.xmm[index] === stateAfter.xmm[index]) continue
@@ -941,180 +684,6 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 old: BigInt(stateBefore[word]),
                 new: BigInt(stateAfter[word]),
             })
-        }
-    }
-
-    /**
-     * The memory a Poke actually changed. The journal is collapsed per byte
-     * first - the EARLIEST `old` of every address, from the first write that
-     * touched it - and only then compared against what memory holds now, so a
-     * range written twice inside one transaction is diffed against what the
-     * machine held before the poke and not against the intermediate value the
-     * first write left. A range written away and back therefore leaves no
-     * trace at all, and two differing writes to one range leave one entry
-     * carrying the value the machine really had. What survives keeps the old
-     * bytes the way an instruction's writes do, for undo to put back in
-     * reverse order.
-     */
-    private recordPokeMemoryMutations(
-        journaled: UndoMemoryWrite[],
-        mutations: ExecutionStep['mutations'],
-        writes: PokeWrite[],
-    ): UndoMemoryWrite[] {
-        const earliest = new Map<bigint, number>()
-        for (const write of journaled) {
-            write.old.forEach((byte, index) => {
-                const address = write.address + BigInt(index)
-                if (!earliest.has(address)) earliest.set(address, byte)
-            })
-        }
-
-        // Maximal contiguous runs, lowest address first: writes to the same,
-        // an overlapping or an adjoining range become one entry, so neither
-        // the History row nor undo ever sees a value that existed only inside
-        // the transaction.
-        const addresses = [...earliest.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-        const ranges: UndoMemoryWrite[] = []
-        for (const address of addresses) {
-            const open = ranges[ranges.length - 1]
-            const byte = earliest.get(address) as number
-            if (open && open.address + BigInt(open.old.length) === address) {
-                open.old.push(byte)
-                continue
-            }
-            ranges.push({ address, old: [byte] })
-        }
-
-        const undoWrites: UndoMemoryWrite[] = []
-        for (const range of ranges) {
-            const current = [...this.runtime.readMemoryBytes(range.address, BigInt(range.old.length))]
-            if (current.every((byte, index) => byte === range.old[index])) continue
-            undoWrites.push(range)
-            mutations.push({
-                type: 'WriteMemoryBytes',
-                value: { address: range.address, old: [...range.old], new: [...current] },
-            })
-            writes.push({
-                type: 'memory',
-                address: range.address,
-                old: [...range.old],
-                new: current,
-            })
-        }
-        return undoWrites
-    }
-
-    /**
-     * The memory a step wrote. The native journal hands over the bytes each
-     * store REPLACED, captured in the machine at that store; it records
-     * nothing about what a store PUT there. So `old` is the machine's own
-     * capture, taken at the write, while `new` is read out of the machine as
-     * the entry is recorded - the step has finished and nothing has run since,
-     * so those addresses still hold what the step left.
-     *
-     * The read costs one page lookup per store: one for the single store
-     * almost every store-bearing instruction journals, and none at all for the
-     * majority of instructions, which write no memory. It goes through the
-     * machine's own page lookup rather than the byte-by-byte bridge (see
-     * `BlinkRuntime.spyMemoryBytes`), which keeps it far below the cost of
-     * tracing the step around it.
-     *
-     * What reading rather than journaling costs: were one step to store twice
-     * over the same address, both entries would report the bytes the step
-     * ENDED with rather than the bytes each store left. No x86 instruction
-     * reachable here does that - blink coalesces a `rep` into one record, and
-     * push, call, ret, enter, leave, `xchg` with memory and read-modify-write
-     * arithmetic each journal a single store - so nothing observable turns on
-     * it today. Only a post-image in the native journal would close it, and
-     * that needs the wasm rebuilt, which this package does not do.
-     *
-     * A range the machine refuses to read back - a step can unmap what it
-     * wrote - leaves that entry with no new bytes rather than a guess, and the
-     * read never throws out of recording. Truncated writes keep their existing
-     * `Other` shape and stay out of the undo journal.
-     */
-    private recordMemoryMutations(
-        writes: NativeMemoryWrite[],
-        mutations: ExecutionStep['mutations'],
-    ): UndoMemoryWrite[] {
-        const undoWrites: UndoMemoryWrite[] = []
-        const written = this.writtenBytes(writes)
-        for (const [index, write] of writes.entries()) {
-            if (!isRecordableWrite(write)) {
-                mutations.push({
-                    type: 'Other',
-                    value: `Wrote ${write.size} bytes to 0x${write.address.toString(16)}`,
-                })
-                continue
-            }
-            undoWrites.push({ address: write.address, old: [...write.old] })
-            mutations.push({
-                type: 'WriteMemoryBytes',
-                value: {
-                    address: write.address,
-                    old: [...write.old],
-                    new: written[index] ?? [],
-                },
-            })
-        }
-        return undoWrites
-    }
-
-    /**
-     * The bytes each of a step's stores left, by the index of that store: what
-     * the addresses that store wrote hold now, at the width of the write. One
-     * lookup per store it can account for, and none for a store it cannot.
-     */
-    private writtenBytes(writes: NativeMemoryWrite[]): number[][] {
-        return writes.map((write) =>
-            isRecordableWrite(write) ? this.readBytes(write.address, write.size) : [],
-        )
-    }
-
-    /**
-     * One read of the machine that answers with nothing rather than throwing,
-     * so recording a step can never fail after the instruction already ran.
-     * It takes the machine's own page lookup when that can answer for the
-     * whole range and the byte-by-byte bridge otherwise; the two read the same
-     * memory the same way.
-     */
-    private readBytes(address: bigint, length: number): number[] {
-        const spied = this.runtime.spyMemoryBytes(address, length)
-        if (spied) return Array.from(spied)
-        try {
-            return [...this.runtime.readMemoryBytes(address, BigInt(length))]
-        } catch {
-            return []
-        }
-    }
-
-    private recordControlFlowMutation(
-        step: Extract<NativeStepInfo, { valid: true }>,
-        instruction: NativeInstruction | null,
-        mutations: ExecutionStep['mutations'],
-    ): void {
-        if (step.controlFlow === 'call') {
-            const returnAddress = instruction ? instruction.address + BigInt(instruction.size) : step.pcBefore
-            const symbol = this.runtime.resolveSymbol(step.pcAfter)
-            const frameAddress = symbol?.address ?? step.pcAfter
-            const location = this.runtime.getSourceLocationForAddress(frameAddress)
-            this.callStack.push({
-                name: symbol?.name ?? '',
-                address: frameAddress,
-                destination: returnAddress,
-                sp: step.spAfter,
-                line: location?.line ?? -1,
-                file: location?.path,
-                color: makeFrameColor(this.callStack.length, frameAddress),
-            })
-            mutations.push({ type: 'PushCallStack', value: { from: step.pcBefore, to: step.pcAfter } })
-            return
-        }
-
-        if (step.controlFlow === 'return') {
-            if (this.callStack.pop()) {
-                mutations.push({ type: 'PopCallStack', value: { from: step.pcBefore, to: step.pcAfter } })
-            }
         }
     }
 

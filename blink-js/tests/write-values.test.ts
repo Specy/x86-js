@@ -5,15 +5,14 @@ import {
     type X86Emulator,
     type X86EmulatorOptions,
 } from '../src/x86-emulator'
-import type { BlinkenlibModule, NativeMemoryWrite } from '../src/wasm-types'
-import { isRecordableWrite } from '../src/x86-emulator-utils'
+import type { BlinkenlibModule } from '../src/wasm-types'
 import { isShadowAddress } from '../src/blink-runtime'
 
 const createX86Emulator = (options: X86EmulatorOptions = {}) =>
     createDefaultX86Emulator({ ...options, mode: 'GNU_trunk' })
 
-async function startedEmulator(source: string, undoSize = 32, steps = 0, nativeHistory = true): Promise<X86Emulator> {
-    const emulator = await createX86Emulator({ nativeHistory })
+async function startedEmulator(source: string, undoSize = 32, steps = 0): Promise<X86Emulator> {
+    const emulator = await createX86Emulator()
     const result = await emulator.compile(source)
     expect(result.ok).toBe(true)
     emulator.initialize(undoSize)
@@ -50,9 +49,9 @@ function doubleBits(value: number): bigint {
 }
 
 /**
- * Counts every look the recorder takes at the machine, so the cost of a step
- * can be pinned: the byte-by-byte memory bridge, the page lookup the recorder
- * reads through instead, the register snapshot and the FPU block.
+ * Counts every look JavaScript takes at the machine, so the cost of a step can
+ * be pinned: the byte-by-byte memory bridge, the page lookup beside it, the
+ * register snapshot and the FPU block.
  */
 function countBridgeCalls(emulator: X86Emulator) {
     const module = emulator.module as BlinkenlibModule & Record<string, unknown>
@@ -377,49 +376,11 @@ _start:
         expect(emulator.canUndo()).toBe(false)
         emulator.dispose()
     })
-
-    it('reports no new bytes when the machine refuses to read the range back', async () => {
-        // A step can unmap what it wrote. Both ways of reading the machine are
-        // refused here, and recording still finishes with the bytes it does
-        // have rather than throwing or guessing.
-        // This injects failures into the legacy JS reader, not the native journal.
-        const emulator = await startedEmulator(STORE_TO_DATA, 32, 2, false)
-        const buffer = emulator.getRegisterValue('rbx')
-        const module = emulator.module as BlinkenlibModule & Record<string, unknown>
-        const read = module.blinkenlibReadMemoryBytes.bind(module)
-        const spy = module._blinkenlib_spy_address?.bind(module)
-
-        try {
-            module.blinkenlibReadMemoryBytes = () => ({ ok: false, error: 'unmapped', readBytes: 0 })
-            module._blinkenlib_spy_address = () => 0
-            await emulator.step()
-            expect(memoryWrites(emulator)).toEqual([
-                { address: buffer, old: [1, 2, 3, 4, 5, 6, 7, 8], new: [] },
-            ])
-        } finally {
-            module.blinkenlibReadMemoryBytes = read
-            module._blinkenlib_spy_address = spy
-            emulator.dispose()
-        }
-    })
-
-    it('knows a write it can report in full from one it cannot', () => {
-        const write = (address: bigint, size: number): NativeMemoryWrite => ({
-            address,
-            size,
-            old: Array.from({ length: size }, () => 0),
-            truncated: false,
-        })
-
-        expect(isRecordableWrite(write(0x10n, 4))).toBe(true)
-        expect(isRecordableWrite({ ...write(0x10n, 4), truncated: true })).toBe(false)
-        expect(isRecordableWrite({ address: 0x10n, size: 4, old: [1, 2], truncated: false })).toBe(false)
-    })
 })
 
-// The fast read path the recorder uses has to answer exactly what the bridge
-// answers, or a history entry would report bytes the machine does not hold.
-describe('the page lookup the recorder reads through', () => {
+// The runtime's page lookup is a fast read path beside the bridge, and has to
+// answer exactly what the bridge answers.
+describe('the page lookup beside the bridge', () => {
     it('agrees with the byte-by-byte bridge, and declines what the bridge refuses', async () => {
         const emulator = await startedEmulator(STORE_TO_DATA, 32, 3)
         const buffer = emulator.getRegisterValue('rbx')
@@ -432,8 +393,7 @@ describe('the page lookup the recorder reads through', () => {
 
         // A run that leaves the page is looked up page by page: the bytes
         // inside the mapped page still match the bridge, and a run reaching
-        // into an unmapped page is declined whole, which sends the recorder to
-        // the bridge and, when that refuses too, to no new bytes at all.
+        // into an unmapped page is declined whole.
         const pageEnd = (buffer | 4095n) - 3n
         const straddling = emulator.runtime.spyMemoryBytes(pageEnd, 8)
         if (straddling) {
@@ -450,8 +410,8 @@ describe('the page lookup the recorder reads through', () => {
         emulator.dispose()
     })
 
-    it('falls back to the bridge when the build has no page lookup to offer', async () => {
-        const emulator = await startedEmulator(STORE_TO_DATA, 32, 2, false)
+    it('declines when the build has no page lookup, which the history does not need', async () => {
+        const emulator = await startedEmulator(STORE_TO_DATA, 32, 2)
         const buffer = emulator.getRegisterValue('rbx')
         const module = emulator.module as BlinkenlibModule & Record<string, unknown>
         const spy = module._blinkenlib_spy_address?.bind(module)
@@ -459,6 +419,7 @@ describe('the page lookup the recorder reads through', () => {
         try {
             module._blinkenlib_spy_address = undefined
             expect(emulator.runtime.spyMemoryBytes(buffer, 8)).toBeNull()
+            // The journal copies both sides inside the wasm, not through JavaScript.
             await emulator.step()
             expect(memoryWrites(emulator)).toEqual([
                 {
@@ -612,38 +573,30 @@ describe('the history shape stays additive', () => {
     })
 })
 
-// Point 4: what recording both sides costs. Registers and the FPU cost
-// nothing at all - both sides come from the two snapshots the step was already
-// taking. Memory costs one page lookup per store, because the machine's
-// journal has no post-image to read and the bytes a store left can only come
-// from the addresses themselves; a step that writes no memory pays nothing,
-// and a run with tracing off never records and never looks.
-describe('recording both sides costs one page lookup per store and nothing else', () => {
-    it('looks at memory once per memory write and never for a register-only step', async () => {
-        const emulator = await startedEmulator(SIZED_WRITES, 32, 3, false)
+// Point 4: what recording both sides costs. The native journal takes a step's
+// registers, its FPU block and the bytes each store replaced and left inside
+// the wasm, so JavaScript takes no look at the machine for a step, with
+// tracing on or off; packets are decoded only when the history is read.
+describe('recording both sides costs JavaScript nothing per step', () => {
+    it('takes no look at memory, registers or the FPU for a traced step', async () => {
+        const emulator = await startedEmulator(SIZED_WRITES, 32, 3)
+        const buffer = emulator.getRegisterValue('rbx')
         const probe = countBridgeCalls(emulator)
 
         try {
-            // movw $0xbeef, (%rbx): one store, one lookup.
+            // movw $0xbeef, (%rbx) and push %rax store; mov $60, %rax does not.
             probe.reset()
             await emulator.step()
-            expect(probe.counts.memoryReads).toBe(1)
-            expect(probe.counts.registerSnapshots).toBe(2)
-            expect(probe.counts.fpuReads).toBe(2)
+            await emulator.step()
+            await emulator.step()
+            expect(probe.counts).toEqual({ memoryReads: 0, registerSnapshots: 0, fpuReads: 0 })
 
-            // push %rax: one store, one lookup.
-            probe.reset()
-            await emulator.step()
-            expect(probe.counts.memoryReads).toBe(1)
-
-            // mov $60, %rax: no memory write, so memory is never touched, and
-            // the register values still come from the two snapshots the step
-            // was already taking.
-            probe.reset()
-            await emulator.step()
-            expect(probe.counts.memoryReads).toBe(0)
-            expect(probe.counts.registerSnapshots).toBe(2)
-            expect(probe.counts.fpuReads).toBe(2)
+            // Both sides of every store are in the history all the same.
+            expect(memoryWrites(emulator, 2)).toEqual([
+                { address: buffer, old: [0x88, 0x77], new: [0xef, 0xbe] },
+            ])
+            expect(memoryWrites(emulator, 1)[0]!.new).toEqual([0xff, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11])
+            expect(memoryWrites(emulator)).toEqual([])
         } finally {
             probe.restore()
             emulator.dispose()

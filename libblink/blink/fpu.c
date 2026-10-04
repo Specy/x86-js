@@ -72,7 +72,9 @@ static double OnFpuStackUnderflow(struct Machine *m) {
 }
 
 static double St(struct Machine *m, int i) {
-  if (FpuGetTag(m, i) == kFpuTagEmpty) OnFpuStackUnderflow(m);
+  // reading an empty register is a stack underflow, whose masked response
+  // puts the qnan floating-point indefinite in place of the operand
+  if (FpuGetTag(m, i) == kFpuTagEmpty) return OnFpuStackUnderflow(m);
   return *FpuSt(m, i);
 }
 
@@ -96,16 +98,31 @@ static void FpuClearOutOfRangeIndicator(struct Machine *m) {
   m->fpu.sw &= ~kFpuSwC2;
 }
 
+static unsigned FpuValueTag(double x) {
+  if (!x) return kFpuTagZero;
+  if (!isfinite(x)) return kFpuTagSpecial;
+  // Even a binary64 subnormal is a normal value in x87 extended precision.
+  // Blink cannot represent the much smaller extended-precision denormals.
+  return kFpuTagValid;
+}
+
+// a register holds a value once written, even if it was empty before, as
+// when the masked response to a stack underflow stores the indefinite there
+static void FpuSetSt(struct Machine *m, int i, double x) {
+  *FpuSt(m, i) = x;
+  FpuSetTag(m, i, FpuValueTag(x));
+}
+
 static void FpuSetSt0(struct Machine *m, double x) {
-  *FpuSt(m, 0) = x;
+  FpuSetSt(m, 0, x);
 }
 
 static void FpuSetStRm(struct Machine *m, u64 rde, double x) {
-  *FpuSt(m, ModrmRm(rde)) = x;
+  FpuSetSt(m, ModrmRm(rde), x);
 }
 
 static void FpuSetStPop(struct Machine *m, int i, double x) {
-  *FpuSt(m, i) = x;
+  FpuSetSt(m, i, x);
   FpuPop(m);
 }
 
@@ -123,9 +140,17 @@ static i64 FpuGetMemoryLong(struct Machine *m) {
   return Read64(Load(m, m->fpu.dp, 8, b));
 }
 
-static float FpuGetMemoryFloat(struct Machine *m) {
+static double FpuGetMemoryFloat(struct Machine *m) {
   union FloatPun u;
   u.i = FpuGetMemoryInt(m);
+  // C's float-to-double conversion quiets SNaNs before the guest arithmetic
+  // can detect them. Expand NaNs by bits, retaining sign, payload and class.
+  if ((u.i & 0x7fffffff) > 0x7f800000) {
+    union DoublePun d;
+    d.i = 0x7ff0000000000000 | (u64)(u.i & 0x007fffff) << 29 |
+          (u64)(u.i >> 31) << 63;
+    return d.f;
+  }
   return u.f;
 }
 
@@ -213,83 +238,97 @@ static double fprem1(double dividend, double modulus, u32 *sw) {
   return x87remainder(dividend, modulus, sw, remainder, rint);
 }
 
-static double FpuAdd(struct Machine *m, double x, double y) {
-  if (!isunordered(x, y)) {
-    switch (isinf(y) << 1 | isinf(x)) {
-      case 0:
-        return x + y;
-      case 1:
-        return x;
-      case 2:
-        return y;
-      case 3:
-        if (signbit(x) == signbit(y)) {
-          return x;
-        } else {
-          m->fpu.sw |= kFpuSwIe;
-          return copysign(NAN, x);
-        }
-      default:
-        __builtin_unreachable();
-    }
-  } else {
-    return NAN;
+static bool FpuIsNan(double x) {
+  union DoublePun u = {x};
+  return (u.i & 0x7fffffffffffffff) > 0x7ff0000000000000;
+}
+
+static bool FpuIsSignalingNan(double x) {
+  union DoublePun u = {x};
+  return FpuIsNan(x) && !(u.i & 0x0008000000000000);
+}
+
+static double FpuLoadReal(struct Machine *m, double x) {
+  if (FpuIsSignalingNan(x)) {
+    union DoublePun u = {x};
+    m->fpu.sw |= kFpuSwIe;
+    u.i |= 0x0008000000000000;
+    return u.f;
   }
+  return x;
+}
+
+// Intel SDM Vol. 1 Table 4-8: preserve an operand's sign and payload,
+// prefer a QNaN to an SNaN, otherwise choose the larger significand.
+// The significand bits below binary64 precision are unavailable in Blink.
+static bool FpuPropagateNan(struct Machine *m, double x, double y, double *z) {
+  bool nx, ny, sx, sy;
+  union DoublePun a = {x}, b = {y}, r;
+  nx = FpuIsNan(x);
+  ny = FpuIsNan(y);
+  if (!nx && !ny) return false;
+  sx = FpuIsSignalingNan(x);
+  sy = FpuIsSignalingNan(y);
+  if (sx || sy) m->fpu.sw |= kFpuSwIe;
+  if (!nx || (sx && ny && !sy)) {
+    r = b;
+  } else if (!ny || (sy && !sx)) {
+    r = a;
+  } else {
+    u64 ax = a.i & 0x7fffffffffffffff;
+    u64 by = b.i & 0x7fffffffffffffff;
+    // Equal significands with opposite signs select the positive NaN.
+    r = ax > by || (ax == by && a.i < b.i) ? a : b;
+  }
+  r.i |= 0x0008000000000000;
+  *z = r.f;
+  return true;
+}
+
+static double FpuAdd(struct Machine *m, double x, double y) {
+  double z;
+  FpuClearRoundup(m);
+  if (FpuPropagateNan(m, x, y, &z)) return z;
+  if (isinf(x) && isinf(y) && !!signbit(x) != !!signbit(y)) {
+    m->fpu.sw |= kFpuSwIe;
+    return -NAN;
+  }
+  return x + y;
 }
 
 static double FpuSub(struct Machine *m, double x, double y) {
-  if (!isunordered(x, y)) {
-    switch (isinf(y) << 1 | isinf(x)) {
-      case 0:
-        return x - y;
-      case 1:
-        return -x;
-      case 2:
-        return y;
-      case 3:
-        if (signbit(x) == signbit(y)) {
-          m->fpu.sw |= kFpuSwIe;
-          return copysign(NAN, x);
-        } else {
-          return y;
-        }
-      default:
-        __builtin_unreachable();
-    }
-  } else {
-    return NAN;
+  double z;
+  FpuClearRoundup(m);
+  if (FpuPropagateNan(m, x, y, &z)) return z;
+  if (isinf(x) && isinf(y) && !!signbit(x) == !!signbit(y)) {
+    m->fpu.sw |= kFpuSwIe;
+    return -NAN;
   }
+  return x - y;
 }
 
 static double FpuMul(struct Machine *m, double x, double y) {
-  if (!isunordered(x, y)) {
-    if (!((isinf(x) && !y) || (isinf(y) && !x))) {
-      return x * y;
-    } else {
-      m->fpu.sw |= kFpuSwIe;
-      return -NAN;
-    }
-  } else {
-    return NAN;
+  double z;
+  FpuClearRoundup(m);
+  if (FpuPropagateNan(m, x, y, &z)) return z;
+  if ((isinf(x) && !y) || (isinf(y) && !x)) {
+    m->fpu.sw |= kFpuSwIe;
+    return -NAN;
   }
+  return x * y;
 }
 
 static double FpuDiv(struct Machine *m, double x, double y) {
-  if (!isunordered(x, y)) {
-    if (x || y) {
-      if (y) {
-        return x / y;
-      } else {
-        m->fpu.sw |= kFpuSwZe;
-        return copysign(INFINITY, x);
-      }
-    } else {
-      m->fpu.sw |= kFpuSwIe;
-      return copysign(NAN, x);
-    }
-  } else {
-    return NAN;
+  double z;
+  FpuClearRoundup(m);
+  if (FpuPropagateNan(m, x, y, &z)) return z;
+  if ((!x && !y) || (isinf(x) && isinf(y))) {
+    m->fpu.sw |= kFpuSwIe;
+    return -NAN;
   }
+  if (!y && !isinf(x)) m->fpu.sw |= kFpuSwZe;
+  // Division itself applies both signs, including the sign of zero.
+  return x / y;
 }
 
 static double FpuRound(struct Machine *m, double x) {
@@ -307,14 +346,17 @@ static double FpuRound(struct Machine *m, double x) {
   }
 }
 
-static void FpuCompare(struct Machine *m, double y) {
+static void FpuCompare(struct Machine *m, double y, bool quiet) {
   double x = St0(m);
   m->fpu.sw &= ~(kFpuSwC0 | kFpuSwC1 | kFpuSwC2 | kFpuSwC3);
   if (!isunordered(x, y)) {
     if (x < y) m->fpu.sw |= kFpuSwC0;
     if (x == y) m->fpu.sw |= kFpuSwC3;
   } else {
-    m->fpu.sw |= kFpuSwC0 | kFpuSwC2 | kFpuSwC3 | kFpuSwIe;
+    m->fpu.sw |= kFpuSwC0 | kFpuSwC2 | kFpuSwC3;
+    if (!quiet || FpuIsSignalingNan(x) || FpuIsSignalingNan(y)) {
+      m->fpu.sw |= kFpuSwIe;
+    }
   }
 }
 
@@ -349,7 +391,7 @@ static void OpFxam(struct Machine *m) {
 }
 
 static void OpFtst(struct Machine *m) {
-  FpuCompare(m, 0);
+  FpuCompare(m, 0, false);
 }
 
 static void OpFcmovb(struct Machine *m, u64 rde) {
@@ -451,11 +493,11 @@ static void OpFpatan(struct Machine *m) {
 }
 
 static void OpFcom(struct Machine *m, u64 rde) {
-  FpuCompare(m, StRm(m, rde));
+  FpuCompare(m, StRm(m, rde), false);
 }
 
 static void OpFcomp(struct Machine *m, u64 rde) {
-  FpuCompare(m, StRm(m, rde));
+  FpuCompare(m, StRm(m, rde), false);
   FpuPop(m);
 }
 
@@ -500,11 +542,11 @@ static void OpFsubrEstSt(struct Machine *m, u64 rde) {
 }
 
 static void OpFdivEstSt(struct Machine *m, u64 rde) {
-  FpuSetStRm(m, rde, FpuDiv(m, StRm(m, rde), St0(m)));
+  FpuSetStRm(m, rde, FpuDiv(m, St0(m), StRm(m, rde)));
 }
 
 static void OpFdivrEstSt(struct Machine *m, u64 rde) {
-  FpuSetStRm(m, rde, FpuDiv(m, St0(m), StRm(m, rde)));
+  FpuSetStRm(m, rde, FpuDiv(m, StRm(m, rde), St0(m)));
 }
 
 static void OpFaddp(struct Machine *m, u64 rde) {
@@ -525,7 +567,7 @@ static void OpFsubp(struct Machine *m, u64 rde) {
 }
 
 static void OpFsubrp(struct Machine *m, u64 rde) {
-  FpuSetStPop(m, 1, FpuSub(m, StRm(m, rde), St0(m)));
+  FpuSetStRmPop(m, rde, FpuSub(m, StRm(m, rde), St0(m)));
 }
 
 static void OpFdivp(struct Machine *m, u64 rde) {
@@ -545,7 +587,7 @@ static void OpFmuls(struct Machine *m, u64 rde) {
 }
 
 static void OpFcoms(struct Machine *m) {
-  FpuCompare(m, FpuGetMemoryFloat(m));
+  FpuCompare(m, FpuGetMemoryFloat(m), false);
 }
 
 static void OpFcomps(struct Machine *m) {
@@ -578,11 +620,11 @@ static void OpFmull(struct Machine *m) {
 }
 
 static void OpFcoml(struct Machine *m) {
-  FpuCompare(m, FpuGetMemoryDouble(m));
+  FpuCompare(m, FpuGetMemoryDouble(m), false);
 }
 
 static void OpFcompl(struct Machine *m) {
-  FpuCompare(m, FpuGetMemoryDouble(m));
+  FpuCompare(m, FpuGetMemoryDouble(m), false);
   FpuPop(m);
 }
 
@@ -611,7 +653,7 @@ static void OpFimull(struct Machine *m) {
 }
 
 static void OpFicoml(struct Machine *m) {
-  FpuCompare(m, FpuGetMemoryInt(m));
+  FpuCompare(m, FpuGetMemoryInt(m), false);
 }
 
 static void OpFicompl(struct Machine *m) {
@@ -644,7 +686,7 @@ static void OpFimuls(struct Machine *m) {
 }
 
 static void OpFicoms(struct Machine *m) {
-  FpuCompare(m, FpuGetMemoryShort(m));
+  FpuCompare(m, FpuGetMemoryShort(m), false);
 }
 
 static void OpFicomps(struct Machine *m) {
@@ -709,7 +751,7 @@ static void OpFld(struct Machine *m, u64 rde) {
 }
 
 static void OpFlds(struct Machine *m) {
-  FpuPush(m, FpuGetMemoryFloat(m));
+  FpuPush(m, FpuLoadReal(m, FpuGetMemoryFloat(m)));
 }
 
 static void OpFsts(struct Machine *m) {
@@ -743,6 +785,7 @@ static void OpFstp(struct Machine *m, u64 rde) {
 }
 
 static void OpFxch(struct Machine *m, u64 rde) {
+  FpuClearRoundup(m);
   double t = StRm(m, rde);
   FpuSetStRm(m, rde, St0(m));
   FpuSetSt0(m, t);
@@ -753,7 +796,7 @@ static void OpFldt(struct Machine *m) {
 }
 
 static void OpFldl(struct Machine *m) {
-  FpuPush(m, FpuGetMemoryDouble(m));
+  FpuPush(m, FpuLoadReal(m, FpuGetMemoryDouble(m)));
 }
 
 static double Fld1(void) {
@@ -851,8 +894,9 @@ static void OpFistps(struct Machine *m) {
   FpuPop(m);
 }
 
-static void OpFcomi(struct Machine *m, u64 rde) {
+static void FpuCompareFlags(struct Machine *m, u64 rde, bool quiet) {
   double x, y;
+  FpuClearRoundup(m);
   x = St0(m);
   y = StRm(m, rde);
   if (!isunordered(x, y)) {
@@ -860,19 +904,33 @@ static void OpFcomi(struct Machine *m, u64 rde) {
     m->flags = SetFlag(m->flags, FLAGS_CF, x < y);
     m->flags = SetFlag(m->flags, FLAGS_PF, false);
   } else {
-    m->fpu.sw |= kFpuSwIe;
+    if (!quiet || FpuIsSignalingNan(x) || FpuIsSignalingNan(y)) {
+      m->fpu.sw |= kFpuSwIe;
+    }
     m->flags = SetFlag(m->flags, FLAGS_ZF, true);
     m->flags = SetFlag(m->flags, FLAGS_CF, true);
     m->flags = SetFlag(m->flags, FLAGS_PF, true);
   }
+  m->flags = SetFlag(m->flags, FLAGS_OF, false);
+  m->flags = SetFlag(m->flags, FLAGS_SF, false);
+  m->flags = SetFlag(m->flags, FLAGS_AF, false);
+}
+
+static void OpFcomi(struct Machine *m, u64 rde) {
+  FpuCompareFlags(m, rde, false);
 }
 
 static void OpFucom(struct Machine *m, u64 rde) {
-  FpuCompare(m, StRm(m, rde));
+  FpuCompare(m, StRm(m, rde), true);
 }
 
 static void OpFucomp(struct Machine *m, u64 rde) {
-  FpuCompare(m, StRm(m, rde));
+  FpuCompare(m, StRm(m, rde), true);
+  FpuPop(m);
+}
+
+static void OpFucompp(struct Machine *m, u64 rde) {
+  OpFucomp(m, rde);
   FpuPop(m);
 }
 
@@ -882,11 +940,12 @@ static void OpFcomip(struct Machine *m, u64 rde) {
 }
 
 static void OpFucomi(struct Machine *m, u64 rde) {
-  OpFcomi(m, rde);
+  FpuCompareFlags(m, rde, true);
 }
 
 static void OpFucomip(struct Machine *m, u64 rde) {
-  OpFcomip(m, rde);
+  OpFucomi(m, rde);
+  FpuPop(m);
 }
 
 static void OpFfree(struct Machine *m, u64 rde) {
@@ -1011,7 +1070,7 @@ void FpuPush(struct Machine *m, double x) {
   if (FpuGetTag(m, -1) != kFpuTagEmpty) OnFpuStackOverflow(m);
   m->fpu.sw = (m->fpu.sw & ~kFpuSwSp) | ((m->fpu.sw - (1 << 11)) & kFpuSwSp);
   *FpuSt(m, 0) = x;
-  FpuSetTag(m, 0, kFpuTagValid);
+  FpuSetTag(m, 0, FpuValueTag(x));
 }
 
 double FpuPop(struct Machine *m) {
@@ -1031,6 +1090,12 @@ void OpFpu(P) {
   bool ismemory;
   op = Opcode(rde) & 7;
   ismemory = ModrmMod(rde) != 3;
+  // FENI, FDISI and FSETPM leave every x87 state field unchanged (SDM 8.3.13).
+  // FNOP is different: it still updates the instruction pointer.
+  if (op == 3 && !ismemory && ModrmReg(rde) == 4 &&
+      (ModrmRm(rde) == 0 || ModrmRm(rde) == 1 || ModrmRm(rde) == 4)) {
+    return;
+  }
   m->fpu.ip = MaskAddress(m->mode.omode, m->ip - Oplength(rde));
   m->fpu.op = op << 8 | ModrmMod(rde) << 6 | ModrmReg(rde) << 3 | ModrmRm(rde);
   m->fpu.dp = ismemory ? ComputeAddress(A) : 0;
@@ -1053,7 +1118,6 @@ void OpFpu(P) {
     CASE(DISP(0xD8, MEMORY, 7), OpFdivrs(m));
     CASE(DISP(0xD9, FPUREG, 0), OpFld(m, rde));
     CASE(DISP(0xD9, FPUREG, 1), OpFxch(m, rde));
-    CASE(DISP(0xD9, FPUREG, 2), OpFnop(m));
     CASE(DISP(0xD9, FPUREG, 3), OpFstp(m, rde));
     CASE(DISP(0xD9, FPUREG, 5), OpFldConstant(m, rde));
     CASE(DISP(0xD9, MEMORY, 0), OpFlds(m));
@@ -1119,7 +1183,6 @@ void OpFpu(P) {
     CASE(DISP(0xDE, FPUREG, 0), OpFaddp(m, rde));
     CASE(DISP(0xDE, FPUREG, 1), OpFmulp(m, rde));
     CASE(DISP(0xDE, FPUREG, 2), OpFcomp(m, rde));
-    CASE(DISP(0xDE, FPUREG, 3), OpFcompp(m, rde));
     CASE(DISP(0xDE, FPUREG, 4), OpFsubp(m, rde));
     CASE(DISP(0xDE, FPUREG, 5), OpFsubrp(m, rde));
     CASE(DISP(0xDE, FPUREG, 6), OpFdivp(m, rde));
@@ -1136,7 +1199,6 @@ void OpFpu(P) {
     CASE(DISP(0xDF, FPUREG, 1), OpFxch(m, rde));
     CASE(DISP(0xDF, FPUREG, 2), OpFstp(m, rde));
     CASE(DISP(0xDF, FPUREG, 3), OpFstp(m, rde));
-    CASE(DISP(0xDF, FPUREG, 4), OpFstswAx(m));
     CASE(DISP(0xDF, FPUREG, 5), OpFucomip(m, rde));
     CASE(DISP(0xDF, FPUREG, 6), OpFcomip(m, rde));
     CASE(DISP(0xDF, MEMORY, 0), OpFilds(m));
@@ -1145,6 +1207,13 @@ void OpFpu(P) {
     CASE(DISP(0xDF, MEMORY, 3), OpFistps(m));
     CASE(DISP(0xDF, MEMORY, 5), OpFildll(m));
     CASE(DISP(0xDF, MEMORY, 7), OpFistpll(m));
+    case DISP(0xD9, FPUREG, 2):
+      switch (ModrmRm(rde)) {
+        CASE(0, OpFnop(m));
+        default:
+          OpUdImpl(m);
+      }
+      break;
     case DISP(0xD9, FPUREG, 4):
       switch (ModrmRm(rde)) {
         CASE(0, OpFchs(m));
@@ -1183,10 +1252,35 @@ void OpFpu(P) {
           __builtin_unreachable();
       }
       break;
+    case DISP(0xDA, FPUREG, 5):
+      switch (ModrmRm(rde)) {
+        CASE(1, OpFucompp(m, rde));
+        default:
+          OpUdImpl(m);
+      }
+      break;
     case DISP(0xDb, FPUREG, 4):
       switch (ModrmRm(rde)) {
+        // feni, fdisi and fsetpm are no-ops since the 80387
+        CASE(0, OpFnop(m));
+        CASE(1, OpFnop(m));
         CASE(2, OpFnclex(m));
         CASE(3, OpFinit(m));
+        CASE(4, OpFnop(m));
+        default:
+          OpUdImpl(m);
+      }
+      break;
+    case DISP(0xDE, FPUREG, 3):
+      switch (ModrmRm(rde)) {
+        CASE(1, OpFcompp(m, rde));
+        default:
+          OpUdImpl(m);
+      }
+      break;
+    case DISP(0xDF, FPUREG, 4):
+      switch (ModrmRm(rde)) {
+        CASE(0, OpFstswAx(m));
         default:
           OpUdImpl(m);
       }

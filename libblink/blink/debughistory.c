@@ -22,6 +22,7 @@ struct Entry {
   u8 *bytes;
   u32 allocated;
   struct Frame *stack_before;
+  bool exited;
 };
 struct Snapshot {
   u64 registers[17], pc;
@@ -136,7 +137,7 @@ static struct Entry *NewEntry(u32 bytes) {
   return e;
 }
 static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_count,
-                   const u8 *old_bytes, bool truncated) {
+                   const u8 *old_bytes, bool truncated, bool exited) {
   struct Snapshot after;
   Snapshot(&after);
   u32 mask = 0, bytes = 88;
@@ -156,6 +157,7 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
   }
   if (!capacity) return;
   struct Entry *e = NewEntry(bytes);
+  e->exited = exited;
   u8 *p = e->bytes;
   memset(p, 0, 88);
   Write32(p, 1);
@@ -220,9 +222,10 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
     stack = previous;
   }
 }
-void DebugHistoryFinish(void) {
+void DebugHistoryFinish(bool exited) {
   if (!pending || poke || !m) return;
-  Finish(false, m->writeold, m->writeoldcount, m->writeoldbytes, m->writeoldtruncated);
+  Finish(false, m->writeold, m->writeoldcount, m->writeoldbytes,
+         m->writeoldtruncated, exited);
   pending = false;
 }
 EMSCRIPTEN_KEEPALIVE
@@ -268,6 +271,12 @@ int blinkenlib_history_undo(void) {
     if (mask & (1u << i)) blinkenlib_set_register_u64(i, values[i]);
   if (fpu) blinkenlib_set_fpu_state(fpu);
   blinkenlib_set_flags(Read32(e->bytes + 40));
+  /* Only undoing the trapped exit resumes the retained machine. A host Poke
+   * made after termination must leave its exit state intact. */
+  if (e->exited) {
+    m->system->exited = false;
+    m->system->exitcode = 0;
+  }
   Release(stack);
   stack = Retain(e->stack_before);
   Release(e->stack_before);
@@ -352,7 +361,7 @@ int blinkenlib_history_end_poke(void) {
   Snapshot(&after);
   bool changed = write_count || memcmp(before.registers, after.registers, sizeof(before.registers)) ||
                  memcmp(before.fpu, after.fpu, sizeof(before.fpu));
-  if (changed) Finish(true, writes, write_count, old_bytes, false);
+  if (changed) Finish(true, writes, write_count, old_bytes, false, false);
   free(writes);
   free(old_bytes);
   poke_count = 0;

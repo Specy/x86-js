@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createX86Emulator, type X86Emulator } from '../src/x86-emulator'
-import { EmulatorStatus } from '../src/interface'
+import { BlinkRuntime } from '../src/blink-runtime'
+import { EmulatorStatus, RegisterSize, type ExecutionStep } from '../src/interface'
 
-async function build(source: string, capacity = 100, nativeHistory = true): Promise<X86Emulator> {
-    const emulator = await createX86Emulator({ nativeHistory })
+async function build(source: string, capacity = 100): Promise<X86Emulator> {
+    const emulator = await createX86Emulator()
     const result = await emulator.compile(source)
     expect(result.ok, result.report).toBe(true)
     emulator.initialize(capacity)
@@ -13,7 +14,7 @@ async function build(source: string, capacity = 100, nativeHistory = true): Prom
 const PREFIX = 'bits 64\nglobal _start\nsection .text\n_start:\n'
 
 describe('native undo recording', () => {
-    it('matches JavaScript history, CPU, FPU, memory and calls through batches and undo', async () => {
+    it('records the same history, CPU, FPU, memory and calls in batches as step by step, through undo', async () => {
         const source =
             PREFIX +
             `
@@ -33,32 +34,51 @@ ret
 section .data
 cell: dq 0
 `
-        const native = await build(source)
-        const legacy = await build(source, 100, false)
+        // A batch runs in a native slice and a step on its own: the two record
+        // through the same journal, and have to leave the same trace.
+        const batched = await build(source)
+        const stepped = await build(source)
         const check = () => {
-            expect(native.runtime.getRegisterSnapshot()).toEqual(
-                legacy.runtime.getRegisterSnapshot()
+            expect(batched.runtime.getRegisterSnapshot()).toEqual(
+                stepped.runtime.getRegisterSnapshot()
             )
-            expect(native.runtime.getFpuStateRaw()).toEqual(legacy.runtime.getFpuStateRaw())
-            expect(native.getCallStack()).toEqual(legacy.getCallStack())
-            expect(native.getUndoHistory(100)).toEqual(legacy.getUndoHistory(100))
-            expect(native.getFlags()).toEqual(legacy.getFlags())
+            expect(batched.runtime.getFpuStateRaw()).toEqual(stepped.runtime.getFpuStateRaw())
+            expect(batched.getCallStack()).toEqual(stepped.getCallStack())
+            expect(batched.getUndoHistory(100)).toEqual(stepped.getUndoHistory(100))
+            expect(batched.getFlags()).toEqual(stepped.getFlags())
         }
         try {
             for (const instructions of [3, 1, 7, 1, 25]) {
-                await native.run(instructions)
-                await legacy.run(instructions)
+                await batched.run(instructions)
+                for (let i = 0; i < instructions; i++) await stepped.step()
                 check()
             }
-            for (let i = 0; i < 37; i++) {
-                native.undo()
-                legacy.undo()
+            // Two set-up instructions and nine a loop: four calls made and
+            // returned from, stopped on the `jmp` that closes the fourth loop.
+            expect(batched.getUndoHistory(100)).toHaveLength(37)
+            expect(batched.getRegisterValue('rbx')).toBe(4n)
+            expect(batched.getCallStack()).toEqual([])
+            expect(batched.getNextInstruction()?.code).toContain('jmp')
+            // Six undone - fchs, paddq, both movs, inc and the ret - and the
+            // program is back inside the worker's frame, before its `ret`.
+            for (let i = 0; i < 6; i++) {
+                batched.undo()
+                stepped.undo()
                 check()
             }
-            expect(native.canUndo()).toBe(false)
+            expect(batched.getCallStack().map((frame) => frame.name)).toEqual(['worker'])
+            expect(batched.getNextInstruction()?.code).toContain('ret')
+            for (let i = 0; i < 31; i++) {
+                batched.undo()
+                stepped.undo()
+                check()
+            }
+            expect(batched.canUndo()).toBe(false)
+            expect(batched.getRegisterValue('rbx')).toBe(0n)
+            expect(batched.getFpuState().xmm[1]).toBe(0n)
         } finally {
-            native.dispose()
-            legacy.dispose()
+            batched.dispose()
+            stepped.dispose()
         }
     })
 
@@ -155,10 +175,13 @@ cell: dq 0
             'xor eax, eax\nxor edi, edi\nlea rsi, [rel buffer]\nmov edx, 8\nsyscall\ninc rbx\njmp _start\nsection .data\nbuffer: dq 0x0102030405060708\n'
         const emulator = await build(source)
         try {
+            expect(await emulator.run(4)).toBe(EmulatorStatus.Running)
+            // Save the state before SYSCALL starts: the paused read already
+            // contains its architectural RCX/R11 clobbers, which undo restores.
+            const before = emulator.runtime.getRegisterSnapshot()
             expect(await emulator.run(20, [source.split('\n').indexOf('inc rbx')])).toBe(
                 EmulatorStatus.WaitingForInput
             )
-            const before = emulator.runtime.getRegisterSnapshot()
             const address = emulator.getRegisterValue('rsi')
             const old = [...emulator.readMemoryBytes(address, 8n)]
             expect(emulator.getUndoHistory(100)).toHaveLength(4)
@@ -218,50 +241,108 @@ cell: dq 0
 
     it('allows later instructions to fault in new pages after recording a store', async () => {
         const source = PREFIX + 'push rbx\ninc rbx\njmp _start\n'
-        const native = await build(source, 8)
-        const legacy = await build(source, 8, false)
+        const emulator = await build(source, 8)
+        const word = (value: bigint) => {
+            const bytes = new Uint8Array(8)
+            new DataView(bytes.buffer).setBigUint64(0, value, true)
+            return [...bytes]
+        }
         try {
-            const initialSp = native.getSp()
-            await native.run(3000)
-            await legacy.run(3000)
-            expect(native.getSp()).toBe(initialSp - 8000n)
-            expect(native.runtime.getRegisterSnapshot()).toEqual(
-                legacy.runtime.getRegisterSnapshot()
-            )
-            expect(native.getUndoHistory(8)).toEqual(legacy.getUndoHistory(8))
-            for (let i = 0; i < 8; i++) {
-                native.undo()
-                legacy.undo()
-            }
-            expect(native.runtime.getRegisterSnapshot()).toEqual(
-                legacy.runtime.getRegisterSnapshot()
-            )
+            const initialSp = emulator.getSp()
+            // A thousand pushes, eight bytes apiece: the stack grows down two
+            // pages, each faulted in by a push after an earlier one was recorded.
+            await emulator.run(3000)
+            expect(emulator.getSp()).toBe(initialSp - 8000n)
+            expect(emulator.getRegisterValue('rbx')).toBe(1000n)
+            expect([...emulator.readMemoryBytes(initialSp - 8000n, 8n)]).toEqual(word(999n))
+            expect(emulator.getUndoHistory(8)).toHaveLength(8)
+            for (let i = 0; i < 8; i++) emulator.undo()
+            // Back before the last three loops' `inc`, `jmp` and `push`: the two
+            // newest pushes undone, the one before them kept.
+            expect(emulator.getRegisterValue('rbx')).toBe(997n)
+            expect(emulator.getSp()).toBe(initialSp - 7984n)
+            expect([...emulator.readMemoryBytes(initialSp - 8000n, 16n)]).toEqual(Array(16).fill(0))
+            expect([...emulator.readMemoryBytes(initialSp - 7984n, 8n)]).toEqual(word(997n))
+            expect(emulator.canUndo()).toBe(false)
         } finally {
-            native.dispose()
-            legacy.dispose()
+            emulator.dispose()
         }
     })
 
-    it.each([true, false])(
-        'reports and undoes an MXCSR Poke (native=%s)',
-        async (nativeHistory) => {
-            const emulator = await build(PREFIX + 'nop\njmp _start\n', 10, nativeHistory)
-            try {
-                const before = emulator.getFpuState()
-                emulator.beginPoke()
-                emulator.setFpuState({ ...before, mxcsr: before.mxcsr ^ 0x2000 })
-                expect(emulator.endPoke()).toBe(true)
-                expect(emulator.getUndoHistory(1)[0]?.writes).toContainEqual({
+    it('reports and undoes an MXCSR Poke, naming mxcsr once', async () => {
+        const emulator = await build(PREFIX + 'nop\njmp _start\n', 10)
+        try {
+            const before = emulator.getFpuState()
+            emulator.beginPoke()
+            emulator.setFpuState({ ...before, mxcsr: before.mxcsr ^ 0x2000 })
+            expect(emulator.endPoke()).toBe(true)
+            const [poke] = emulator.getUndoHistory(1)
+            expect(poke?.writes).toEqual([
+                {
                     type: 'register',
                     name: 'mxcsr',
                     old: BigInt(before.mxcsr),
                     new: BigInt(before.mxcsr ^ 0x2000)
-                })
-                emulator.undo()
-                expect(emulator.getFpuState()).toEqual(before)
-            } finally {
-                emulator.dispose()
-            }
+                }
+            ])
+            expect(mxcsrWrites(poke)).toHaveLength(1)
+            emulator.undo()
+            expect(emulator.getFpuState()).toEqual(before)
+        } finally {
+            emulator.dispose()
         }
-    )
+    })
+
+    it('reports an instruction that loads MXCSR as one write of mxcsr', async () => {
+        const emulator = await build(PREFIX + 'push 0x9fc0\nldmxcsr [rsp]\nnop\n', 10)
+        try {
+            const before = emulator.getFpuState().mxcsr
+            await emulator.step() // push
+            await emulator.step() // ldmxcsr
+            expect(mxcsrWrites(emulator.getUndoHistory(1)[0])).toEqual([
+                {
+                    type: 'WriteRegister',
+                    value: { register: 'mxcsr', old: BigInt(before), new: 0x9fc0n, size: RegisterSize.Long }
+                }
+            ])
+            emulator.undo()
+            expect(emulator.getFpuState().mxcsr).toBe(before)
+        } finally {
+            emulator.dispose()
+        }
+    })
+
+    it.each([
+        ['no history at all', undefined, 'records no undo history'],
+        ['history of another version', 2, 'records undo history version 2'],
+    ])('refuses a wasm with %s when the emulator is created', async (_, version, message) => {
+        const create = BlinkRuntime.create.bind(BlinkRuntime)
+        vi.spyOn(BlinkRuntime, 'create').mockImplementationOnce(async (options) => {
+            const runtime = await create(options)
+            runtime.module._blinkenlib_history_version =
+                version === undefined ? undefined : () => version
+            return runtime
+        })
+        try {
+            // An emulator that was created anyway is disposed, not formatted:
+            // printing one drags the whole wasm heap into the failure message.
+            const outcome = await createX86Emulator().then(
+                (emulator) => {
+                    emulator.dispose()
+                    return 'created'
+                },
+                (error: unknown) => String(error)
+            )
+            expect(outcome).toContain(message)
+        } finally {
+            vi.restoreAllMocks()
+        }
+    })
 })
+
+/** The writes of mxcsr a history entry reports, as mutations. */
+function mxcsrWrites(step: ExecutionStep | undefined) {
+    return (step?.mutations ?? []).filter(
+        (mutation) => mutation.type === 'WriteRegister' && mutation.value.register === 'mxcsr'
+    )
+}

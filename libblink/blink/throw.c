@@ -65,12 +65,14 @@ void HaltMachine(struct Machine *m, int code) {
   switch ((m->trapno = code)) {
     case kMachineDivideError:
       RestoreIp(m);
+      m->flags |= RF;
       m->faultaddr = m->ip;
       DeliverSignalToUser(m, SIGFPE_LINUX, FPE_INTDIV_LINUX);
       break;
     case kMachineFpuException:
     case kMachineSimdException:
       RestoreIp(m);
+      m->flags |= RF;
       m->faultaddr = m->ip;
       DeliverSignalToUser(m, SIGFPE_LINUX, FPE_FLTINV_LINUX);
       break;
@@ -78,16 +80,19 @@ void HaltMachine(struct Machine *m, int code) {
     case kMachineDecodeError:
     case kMachineUndefinedInstruction:
       RestoreIp(m);
+      m->flags |= RF;
       m->faultaddr = m->ip;
-      DeliverSignalToUser(m, SIGILL_LINUX, ILL_ILLOPC_LINUX);
+      DeliverSignalToUser(m, SIGILL_LINUX, ILL_ILLOPN_LINUX);
       break;
     case kMachineProtectionFault:
       RestoreIp(m);
-      m->faultaddr = m->ip;
-      DeliverSignalToUser(m, SIGILL_LINUX, ILL_PRVOPC_LINUX);
+      m->flags |= RF;
+      m->faultaddr = 0;
+      DeliverSignalToUser(m, SIGSEGV_LINUX, SI_KERNEL_LINUX);
       break;
     case kMachineSegmentationFault:
       RestoreIp(m);
+      m->flags |= RF;
       DeliverSignalToUser(m, SIGSEGV_LINUX,
                           m->segvcode ? m->segvcode : SEGV_MAPERR_LINUX);
       break;
@@ -95,6 +100,10 @@ void HaltMachine(struct Machine *m, int code) {
     case 3:
       m->faultaddr = m->ip - m->oplen;
       DeliverSignalToUser(m, SIGTRAP_LINUX, SI_KERNEL_LINUX);
+      break;
+    case kMachineSingleStep:
+      m->faultaddr = m->ip;
+      DeliverSignalToUser(m, SIGTRAP_LINUX, TRAP_TRACE_LINUX);
       break;
     case 4:
       m->faultaddr = 0;
@@ -130,6 +139,12 @@ void ThrowProtectionFault(struct Machine *m) {
   HaltMachine(m, kMachineProtectionFault);
 }
 
+void RaiseSingleStep(struct Machine *m) {
+  // #DB single stepping is a trap: the completed instruction stays retired.
+  m->oplen = 0;
+  HaltMachine(m, kMachineSingleStep);
+}
+
 void ThrowSegmentationFault(struct Machine *m, i64 va) {
   RestoreIp(m);
   m->faultaddr = va;
@@ -146,6 +161,7 @@ void OpUd(P) {
 }
 
 void OpHlt(P) {
+  if (Cpl(m)) ThrowProtectionFault(m);
   if (Cpl(m) == 0 && GetFlag(m->flags, FLAGS_IF)) {
     sched_yield();
   } else {

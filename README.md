@@ -148,7 +148,7 @@ const frames = emulator.getCallStack()
 console.log(frames.map((frame) => frame.name))
 ```
 
-When history is enabled, `run()` uses traced stepping so each executed instruction can be undone. If history is disabled with `initialize(0)` or by never calling `initialize`, normal fast execution remains available and `canUndo()` returns `false`.
+When history is enabled, every instruction `run()` or `step()` executes is recorded inside the wasm, so each one can be undone. If history is disabled with `initialize(0)` or by never calling `initialize`, nothing is recorded and `canUndo()` returns `false`.
 
 Very large or truncated memory writes may not be reversible. In that case `canUndo()` returns `false` for the latest step, and calling `undo()` throws instead of restoring a partial state.
 
@@ -163,6 +163,10 @@ emulator.on('inputRequest', ()        => { /* ... */ })
 ```
 
 Callbacks passed to `createX86Emulator()` and handlers registered with `on()` may return either `void` or `Promise<void>`. Async callbacks are observed but not awaited by the emulator, so UI work can be scheduled without blocking execution. `stdin` remains synchronous because it is called directly by Emscripten's filesystem; for non-blocking UI input, listen for `inputRequest` and call `provideInput()` when the user submits text.
+
+## Compiling C and C++
+
+The package has a second entry point, `@specy/x86/compiler-output`, that translates GCC 14.2's `-masm=intel` x86-64 output into NASM source this emulator builds like any other File, with the source location of every instruction. It is a bundle of its own with no WebAssembly in it, so a consumer that only translates never loads the emulator. The package README, [blink-js/README.md](blink-js/README.md#compiling-c-and-c), documents it: the `gcc-intel-v1` profile and the compiler flags it requires, the result and its diagnostics, what is rejected, and an example start unit, since the translator writes no startup code. `npm run test:dist` checks that the built subpath loads and translates with `WebAssembly` stubbed out, runs translated programs with that start unit, and fails if the root module's export names change.
 
 ## Building from Source
 

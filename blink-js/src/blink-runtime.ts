@@ -117,6 +117,13 @@ export class BlinkRuntime {
 
     private readonly callbacks: Required<BlinkRuntimeCallbacks>
     private readonly scheduler: (callback: () => void) => void
+    /**
+     * A preempted native loop is waiting for the scheduler to resume it: the
+     * only time `ProgramRunning` means the program moves on its own. A step,
+     * `starti()` or an undo also leaves it `ProgramRunning`, with nothing
+     * executing it.
+     */
+    private resumeScheduled = false
     private readonly stateWaiters: StateWaiter[] = []
     private readonly stdinBytes: number[] = []
     private sourceMap: SourceMap | null = null
@@ -491,15 +498,25 @@ export class BlinkRuntime {
     async runUntilBlocked(options: BlinkRunOptions = {}): Promise<BlinkState> {
         this.configureRunControls(options)
         if (this.state === BlinkState.ProgramLoaded || this.state === BlinkState.ProgramStopped) this.run()
-        if (this.state === BlinkState.ProgramPaused) this.continue()
-        if (this.state === BlinkState.ProgramRunning) {
-            return this.waitForState(
-                (state) =>
-                    state === BlinkState.ProgramStopped ||
-                    state === BlinkState.ProgramReadlinePause ||
-                    state === BlinkState.ProgramPaused,
-            )
+        // Waiting is right only for a loop that resumes itself: one left
+        // running by a step has to be continued, or nothing ever stops it.
+        if (
+            this.state === BlinkState.ProgramPaused ||
+            (this.state === BlinkState.ProgramRunning && !this.resumeScheduled)
+        ) {
+            this.continue()
         }
+        if (this.state === BlinkState.ProgramRunning) return this.waitUntilBlocked()
+        return this.state
+    }
+
+    /**
+     * Resolves once no preempted loop is left to resume itself, with the state
+     * it stopped in, and at once when there is none. Unlike `runUntilBlocked`
+     * it never starts or continues the program.
+     */
+    async settle(): Promise<BlinkState> {
+        if (this.state === BlinkState.ProgramRunning && this.resumeScheduled) return this.waitUntilBlocked()
         return this.state
     }
 
@@ -833,7 +850,11 @@ export class BlinkRuntime {
         }
 
         if (code === SIGTRAP_CODES.BLINK_PREEMPT) {
-            this.scheduler(() => this.module._blinkenlib_preempt_resume())
+            this.resumeScheduled = true
+            this.scheduler(() => {
+                this.resumeScheduled = false
+                this.module._blinkenlib_preempt_resume()
+            })
             return
         }
 
@@ -932,6 +953,15 @@ export class BlinkRuntime {
         this.state = state
         observeCallbackResult(this.callbacks.stateChange(state, oldState))
         this.resolveStateWaiters(state)
+    }
+
+    private waitUntilBlocked(): Promise<BlinkState> {
+        return this.waitForState(
+            (state) =>
+                state === BlinkState.ProgramStopped ||
+                state === BlinkState.ProgramReadlinePause ||
+                state === BlinkState.ProgramPaused,
+        )
     }
 
     private waitForState(predicate: (state: BlinkState) => boolean): Promise<BlinkState> {

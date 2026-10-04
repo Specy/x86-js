@@ -1,0 +1,997 @@
+{
+  "profile": "gcc-intel-v1",
+  "capturedAt": "2026-10-04T19:11:46.718Z",
+  "package": {
+    "name": "@specy/x86",
+    "version": "2.8.0"
+  },
+  "submodule": {
+    "path": "emulators/x86",
+    "revision": "47f6796b9c4a5ba2d08c8a90caf0ecc5ca80e636",
+    "dirty": true,
+    "changes": [
+      " M README.md",
+      " M blink-js/README.md",
+      " M blink-js/package.json",
+      " M blink-js/src/elf-symbols.ts",
+      " M blink-js/src/wasm/blinkenlib.wasm",
+      " M blink-js/tests/dist-smoke.mjs",
+      " M blink-js/tsdown.config.ts",
+      " M libblink/blink/fpu.c",
+      "?? blink-js/scripts/capture-gcc-fixtures.mjs",
+      "?? blink-js/scripts/generate-nasm-reserved-names.mjs",
+      "?? blink-js/src/compiler-output/analyze.ts",
+      "?? blink-js/src/compiler-output/diagnostics.ts",
+      "?? blink-js/src/compiler-output/emit.ts",
+      "?? blink-js/src/compiler-output/index.ts",
+      "?? blink-js/src/compiler-output/instructions.ts",
+      "?? blink-js/src/compiler-output/lexer.ts",
+      "?? blink-js/src/compiler-output/locations.ts",
+      "?? blink-js/src/compiler-output/names.ts",
+      "?? blink-js/src/compiler-output/nasm-instruction-set.ts",
+      "?? blink-js/src/compiler-output/nasm-reserved.ts",
+      "?? blink-js/src/compiler-output/operands.ts",
+      "?? blink-js/src/compiler-output/profile.ts",
+      "?? blink-js/src/compiler-output/sections.ts",
+      "?? blink-js/src/compiler-output/translate.ts",
+      "?? blink-js/src/compiler-output/types.ts",
+      "?? blink-js/tests/compiler-output/assemble.test.ts",
+      "?? blink-js/tests/compiler-output/corpus.test.ts",
+      "?? blink-js/tests/compiler-output/gcc-layout.ts",
+      "?? blink-js/tests/compiler-output/gnu-comparison.ts",
+      "?? blink-js/tests/compiler-output/gnu-reference.test.ts",
+      "?? blink-js/tests/compiler-output/helpers.ts",
+      "?? blink-js/tests/compiler-output/locations.test.ts",
+      "?? blink-js/tests/compiler-output/symbols.test.ts",
+      "?? blink-js/tests/compiler-output/translate.test.ts",
+      "?? blink-js/tests/compiler-output/x87-matrix.test.ts",
+      "?? blink-js/tests/elf-symbol-table.test.ts",
+      "?? blink-js/tests/x87-register-forms.test.ts"
+    ]
+  },
+  "sha256": {
+    "scripts/capture-gcc-fixtures.mjs": "c3071ac9898f0582c4d8f44686e8d74cc5131a0d68c1961947c45adb8a7c5e2f",
+    "dist/index.mjs": "ccc06b0f7a15484591e47498901deb1f812cc5d4ced5d258ed907596ca7083e6",
+    "dist/wasm/blinkenlib.js": "a4527ad8c0ec3a40ba9cd74462512155e984eab0fd703ffd3bfb6bc6479b00eb",
+    "dist/assets/assemblers/gnu-as.2.43.50.elf": "908b557e21e8000596abe12828d929cf82dd9abcc3ee840dbaf9c503d8e32534",
+    "dist/assets/assemblers/gnu-ld.2.43.50.elf": "8548fc86b738be62619889560995a127a9be6026ed4d6b21fe525c184d322206"
+  },
+  "assemblers": {
+    "nasm": {
+      "version": "3.00",
+      "mode": "NASM_trunk",
+      "description": "NASM 3.00 compiled to WebAssembly, + GNU ld v2.43.50 as a static MUSL binary"
+    },
+    "gnu": {
+      "as": "2.43.50",
+      "ld": "2.43.50",
+      "mode": "GNU_trunk",
+      "description": "GNU as + GNU ld, version 2.43.50. Compiled as a static MUSL binary"
+    },
+    "referenceAssembler": "/assembler --gdwarf-4 -L /assembly.s -o /program.o",
+    "referenceLinker": "/linker /program.o -o /program"
+  },
+  "compilerExplorer": {
+    "endpoint": "https://godbolt.org/api/compiler/<compiler>/compile",
+    "compilers": {
+      "c": "cg142",
+      "cpp": "g142"
+    },
+    "sourcePaths": {
+      "c": "src/main.c",
+      "cpp": "src/main.cpp"
+    },
+    "idents": [
+      "GCC: (Compiler-Explorer-Build-gcc--binutils-2.42) 14.2.0"
+    ]
+  },
+  "host": {
+    "node": "v24.18.1",
+    "platform": "linux",
+    "arch": "x64",
+    "nativeRuns": true
+  },
+  "cases": 187,
+  "x87Forms": 36,
+  "totalBytes": 1252012,
+  "files": {
+    "inventory.json": {
+      "bytes": 147799
+    },
+    "manifest.json": {
+      "bytes": 60838
+    },
+    "cases/aligned-O0.json.gz": {
+      "bytes": 3243,
+      "uncompressedBytes": 26645
+    },
+    "cases/aligned-O1.json.gz": {
+      "bytes": 3059,
+      "uncompressedBytes": 25638
+    },
+    "cases/aligned-O2.json.gz": {
+      "bytes": 3211,
+      "uncompressedBytes": 26736
+    },
+    "cases/aligned-O3.json.gz": {
+      "bytes": 3214,
+      "uncompressedBytes": 26736
+    },
+    "cases/aligned-Os.json.gz": {
+      "bytes": 3198,
+      "uncompressedBytes": 26668
+    },
+    "cases/alignedfn-O0.json.gz": {
+      "bytes": 4227,
+      "uncompressedBytes": 34647
+    },
+    "cases/alignedfn-O1.json.gz": {
+      "bytes": 3803,
+      "uncompressedBytes": 31559
+    },
+    "cases/alignedfn-O2.json.gz": {
+      "bytes": 4018,
+      "uncompressedBytes": 33259
+    },
+    "cases/alignedfn-O3.json.gz": {
+      "bytes": 4020,
+      "uncompressedBytes": 33259
+    },
+    "cases/alignedfn-Os.json.gz": {
+      "bytes": 3989,
+      "uncompressedBytes": 33112
+    },
+    "cases/asmcallsc-O0.json.gz": {
+      "bytes": 1557,
+      "uncompressedBytes": 11571
+    },
+    "cases/asmcallsc-O1.json.gz": {
+      "bytes": 1481,
+      "uncompressedBytes": 10542
+    },
+    "cases/asmcallsc-O2.json.gz": {
+      "bytes": 1533,
+      "uncompressedBytes": 11167
+    },
+    "cases/asmcallsc-O3.json.gz": {
+      "bytes": 1535,
+      "uncompressedBytes": 11167
+    },
+    "cases/asmcallsc-Os.json.gz": {
+      "bytes": 1527,
+      "uncompressedBytes": 11079
+    },
+    "cases/bigcopy-O0.json.gz": {
+      "bytes": 4951,
+      "uncompressedBytes": 32744
+    },
+    "cases/bigcopy-O1.json.gz": {
+      "bytes": 4177,
+      "uncompressedBytes": 26935
+    },
+    "cases/bigcopy-O2.json.gz": {
+      "bytes": 4894,
+      "uncompressedBytes": 36505
+    },
+    "cases/bigcopy-O3.json.gz": {
+      "bytes": 4565,
+      "uncompressedBytes": 34854
+    },
+    "cases/bigcopy-Os.json.gz": {
+      "bytes": 3800,
+      "uncompressedBytes": 25271
+    },
+    "cases/bitops-O0.json.gz": {
+      "bytes": 5177,
+      "uncompressedBytes": 38100
+    },
+    "cases/bitops-O1.json.gz": {
+      "bytes": 4128,
+      "uncompressedBytes": 31014
+    },
+    "cases/bitops-O2.json.gz": {
+      "bytes": 4265,
+      "uncompressedBytes": 32282
+    },
+    "cases/bitops-O3.json.gz": {
+      "bytes": 4267,
+      "uncompressedBytes": 32282
+    },
+    "cases/bitops-Os.json.gz": {
+      "bytes": 4037,
+      "uncompressedBytes": 31328
+    },
+    "cases/broad-O0.json.gz": {
+      "bytes": 9146,
+      "uncompressedBytes": 64523
+    },
+    "cases/broad-O1.json.gz": {
+      "bytes": 7465,
+      "uncompressedBytes": 53815
+    },
+    "cases/broad-O2.json.gz": {
+      "bytes": 15281,
+      "uncompressedBytes": 104478
+    },
+    "cases/broad-O3.json.gz": {
+      "bytes": 15669,
+      "uncompressedBytes": 110727
+    },
+    "cases/broad-Os.json.gz": {
+      "bytes": 6272,
+      "uncompressedBytes": 46456
+    },
+    "cases/callsasm-O0.json.gz": {
+      "bytes": 1367,
+      "uncompressedBytes": 8493
+    },
+    "cases/callsasm-O1.json.gz": {
+      "bytes": 1345,
+      "uncompressedBytes": 8306
+    },
+    "cases/callsasm-O2.json.gz": {
+      "bytes": 1371,
+      "uncompressedBytes": 8627
+    },
+    "cases/callsasm-O3.json.gz": {
+      "bytes": 1373,
+      "uncompressedBytes": 8627
+    },
+    "cases/callsasm-Os.json.gz": {
+      "bytes": 1364,
+      "uncompressedBytes": 8583
+    },
+    "cases/cfprotection-O2.json.gz": {
+      "bytes": 6836,
+      "uncompressedBytes": 49790
+    },
+    "cases/cppalias-O0.json.gz": {
+      "bytes": 4173,
+      "uncompressedBytes": 30617
+    },
+    "cases/cppalias-O1.json.gz": {
+      "bytes": 2669,
+      "uncompressedBytes": 18101
+    },
+    "cases/cppalias-O2.json.gz": {
+      "bytes": 2827,
+      "uncompressedBytes": 19245
+    },
+    "cases/cppalias-O3.json.gz": {
+      "bytes": 2829,
+      "uncompressedBytes": 19245
+    },
+    "cases/cppalias-Os.json.gz": {
+      "bytes": 2814,
+      "uncompressedBytes": 19177
+    },
+    "cases/cppclasses-O0.json.gz": {
+      "bytes": 4482,
+      "uncompressedBytes": 31211
+    },
+    "cases/cppclasses-O1.json.gz": {
+      "bytes": 2707,
+      "uncompressedBytes": 18420
+    },
+    "cases/cppclasses-O2.json.gz": {
+      "bytes": 2866,
+      "uncompressedBytes": 19564
+    },
+    "cases/cppclasses-O3.json.gz": {
+      "bytes": 2868,
+      "uncompressedBytes": 19564
+    },
+    "cases/cppclasses-Os.json.gz": {
+      "bytes": 2853,
+      "uncompressedBytes": 19496
+    },
+    "cases/cppfull-O0.json.gz": {
+      "bytes": 8001,
+      "uncompressedBytes": 56614
+    },
+    "cases/cppfull-O1.json.gz": {
+      "bytes": 3629,
+      "uncompressedBytes": 25388
+    },
+    "cases/cppfull-O2.json.gz": {
+      "bytes": 3168,
+      "uncompressedBytes": 21412
+    },
+    "cases/cppfull-O3.json.gz": {
+      "bytes": 3171,
+      "uncompressedBytes": 21412
+    },
+    "cases/cppfull-Os.json.gz": {
+      "bytes": 3157,
+      "uncompressedBytes": 21344
+    },
+    "cases/cpplocalstatic-O0.json.gz": {
+      "bytes": 5058,
+      "uncompressedBytes": 42864
+    },
+    "cases/cpplocalstatic-O1.json.gz": {
+      "bytes": 3976,
+      "uncompressedBytes": 33670
+    },
+    "cases/cpplocalstatic-O2.json.gz": {
+      "bytes": 4114,
+      "uncompressedBytes": 34655
+    },
+    "cases/cpplocalstatic-O3.json.gz": {
+      "bytes": 5038,
+      "uncompressedBytes": 44468
+    },
+    "cases/cpplocalstatic-Os.json.gz": {
+      "bytes": 4123,
+      "uncompressedBytes": 34648
+    },
+    "cases/cppunique-O0.json.gz": {
+      "bytes": 6758,
+      "uncompressedBytes": 56135
+    },
+    "cases/cppunique-O1.json.gz": {
+      "bytes": 5509,
+      "uncompressedBytes": 46769
+    },
+    "cases/cppunique-O2.json.gz": {
+      "bytes": 5901,
+      "uncompressedBytes": 50323
+    },
+    "cases/cppunique-O3.json.gz": {
+      "bytes": 5787,
+      "uncompressedBytes": 49644
+    },
+    "cases/cppunique-Os.json.gz": {
+      "bytes": 5730,
+      "uncompressedBytes": 49166
+    },
+    "cases/cppvague-O0.json.gz": {
+      "bytes": 11221,
+      "uncompressedBytes": 96846
+    },
+    "cases/cppvague-O1.json.gz": {
+      "bytes": 8104,
+      "uncompressedBytes": 74569
+    },
+    "cases/cppvague-O2.json.gz": {
+      "bytes": 8749,
+      "uncompressedBytes": 80336
+    },
+    "cases/cppvague-O3.json.gz": {
+      "bytes": 8734,
+      "uncompressedBytes": 80336
+    },
+    "cases/cppvague-Os.json.gz": {
+      "bytes": 8673,
+      "uncompressedBytes": 80131
+    },
+    "cases/cppvirtual-O0.json.gz": {
+      "bytes": 4908,
+      "uncompressedBytes": 48842
+    },
+    "cases/cppvirtual-O1.json.gz": {
+      "bytes": 2677,
+      "uncompressedBytes": 24766
+    },
+    "cases/cppvirtual-O2.json.gz": {
+      "bytes": 2648,
+      "uncompressedBytes": 24577
+    },
+    "cases/cppvirtual-O3.json.gz": {
+      "bytes": 2646,
+      "uncompressedBytes": 24577
+    },
+    "cases/cppvirtual-Os.json.gz": {
+      "bytes": 2621,
+      "uncompressedBytes": 24305
+    },
+    "cases/ctor-O0.json.gz": {
+      "bytes": 5085,
+      "uncompressedBytes": 42360
+    },
+    "cases/ctor-O1.json.gz": {
+      "bytes": 3947,
+      "uncompressedBytes": 35172
+    },
+    "cases/ctor-O2.json.gz": {
+      "bytes": 4119,
+      "uncompressedBytes": 36584
+    },
+    "cases/ctor-O3.json.gz": {
+      "bytes": 4121,
+      "uncompressedBytes": 36584
+    },
+    "cases/ctor-Os.json.gz": {
+      "bytes": 4014,
+      "uncompressedBytes": 36127
+    },
+    "cases/ctororder-O0.json.gz": {
+      "bytes": 7292,
+      "uncompressedBytes": 58717
+    },
+    "cases/ctororder-O1.json.gz": {
+      "bytes": 6313,
+      "uncompressedBytes": 54722
+    },
+    "cases/ctororder-O2.json.gz": {
+      "bytes": 7209,
+      "uncompressedBytes": 62610
+    },
+    "cases/ctororder-O3.json.gz": {
+      "bytes": 7213,
+      "uncompressedBytes": 62610
+    },
+    "cases/ctororder-Os.json.gz": {
+      "bytes": 7130,
+      "uncompressedBytes": 61779
+    },
+    "cases/ctorpriority-O0.json.gz": {
+      "bytes": 1843,
+      "uncompressedBytes": 14848
+    },
+    "cases/ctorpriority-O1.json.gz": {
+      "bytes": 1681,
+      "uncompressedBytes": 12665
+    },
+    "cases/ctorpriority-O2.json.gz": {
+      "bytes": 1781,
+      "uncompressedBytes": 14072
+    },
+    "cases/ctorpriority-O3.json.gz": {
+      "bytes": 1782,
+      "uncompressedBytes": 14072
+    },
+    "cases/ctorpriority-Os.json.gz": {
+      "bytes": 1762,
+      "uncompressedBytes": 13736
+    },
+    "cases/fixture-O0.json.gz": {
+      "bytes": 4000,
+      "uncompressedBytes": 31654
+    },
+    "cases/fixture-O1.json.gz": {
+      "bytes": 3551,
+      "uncompressedBytes": 28935
+    },
+    "cases/fixture-O2.json.gz": {
+      "bytes": 3617,
+      "uncompressedBytes": 29729
+    },
+    "cases/fixture-O3.json.gz": {
+      "bytes": 3619,
+      "uncompressedBytes": 29729
+    },
+    "cases/fixture-Os.json.gz": {
+      "bytes": 3644,
+      "uncompressedBytes": 29700
+    },
+    "cases/formatter-O2.json.gz": {
+      "bytes": 27640,
+      "uncompressedBytes": 197081
+    },
+    "cases/formatter-Os.json.gz": {
+      "bytes": 17970,
+      "uncompressedBytes": 116576
+    },
+    "cases/fptable-O0.json.gz": {
+      "bytes": 6368,
+      "uncompressedBytes": 46710
+    },
+    "cases/fptable-O1.json.gz": {
+      "bytes": 4165,
+      "uncompressedBytes": 32109
+    },
+    "cases/fptable-O2.json.gz": {
+      "bytes": 4383,
+      "uncompressedBytes": 33646
+    },
+    "cases/fptable-O3.json.gz": {
+      "bytes": 4383,
+      "uncompressedBytes": 33646
+    },
+    "cases/fptable-Os.json.gz": {
+      "bytes": 4296,
+      "uncompressedBytes": 33263
+    },
+    "cases/ifunc-O0.json.gz": {
+      "bytes": 1775,
+      "uncompressedBytes": 13718
+    },
+    "cases/ifunc-O1.json.gz": {
+      "bytes": 1602,
+      "uncompressedBytes": 10604
+    },
+    "cases/ifunc-O2.json.gz": {
+      "bytes": 1657,
+      "uncompressedBytes": 11273
+    },
+    "cases/ifunc-O3.json.gz": {
+      "bytes": 1659,
+      "uncompressedBytes": 11273
+    },
+    "cases/ifunc-Os.json.gz": {
+      "bytes": 1645,
+      "uncompressedBytes": 11141
+    },
+    "cases/inlineasm-O0.json.gz": {
+      "bytes": 1392,
+      "uncompressedBytes": 7819
+    },
+    "cases/inlineasm-O1.json.gz": {
+      "bytes": 1277,
+      "uncompressedBytes": 6943
+    },
+    "cases/inlineasm-O2.json.gz": {
+      "bytes": 1358,
+      "uncompressedBytes": 7761
+    },
+    "cases/inlineasm-O3.json.gz": {
+      "bytes": 1360,
+      "uncompressedBytes": 7761
+    },
+    "cases/inlineasm-Os.json.gz": {
+      "bytes": 1350,
+      "uncompressedBytes": 7717
+    },
+    "cases/int128-O0.json.gz": {
+      "bytes": 2152,
+      "uncompressedBytes": 13363
+    },
+    "cases/int128-O1.json.gz": {
+      "bytes": 2719,
+      "uncompressedBytes": 19712
+    },
+    "cases/int128-O2.json.gz": {
+      "bytes": 2727,
+      "uncompressedBytes": 19497
+    },
+    "cases/int128-O3.json.gz": {
+      "bytes": 2728,
+      "uncompressedBytes": 19497
+    },
+    "cases/int128-Os.json.gz": {
+      "bytes": 2110,
+      "uncompressedBytes": 13055
+    },
+    "cases/jumptable-O0.json.gz": {
+      "bytes": 5959,
+      "uncompressedBytes": 44407
+    },
+    "cases/jumptable-O1.json.gz": {
+      "bytes": 5259,
+      "uncompressedBytes": 39104
+    },
+    "cases/jumptable-O2.json.gz": {
+      "bytes": 3800,
+      "uncompressedBytes": 29925
+    },
+    "cases/jumptable-O3.json.gz": {
+      "bytes": 3802,
+      "uncompressedBytes": 29925
+    },
+    "cases/jumptable-Os.json.gz": {
+      "bytes": 4179,
+      "uncompressedBytes": 31981
+    },
+    "cases/keywords-O0.json.gz": {
+      "bytes": 3143,
+      "uncompressedBytes": 26516
+    },
+    "cases/keywords-O1.json.gz": {
+      "bytes": 2746,
+      "uncompressedBytes": 21909
+    },
+    "cases/keywords-O2.json.gz": {
+      "bytes": 2889,
+      "uncompressedBytes": 23417
+    },
+    "cases/keywords-O3.json.gz": {
+      "bytes": 2890,
+      "uncompressedBytes": 23417
+    },
+    "cases/keywords-Os.json.gz": {
+      "bytes": 2859,
+      "uncompressedBytes": 23073
+    },
+    "cases/large-O0.json.gz": {
+      "bytes": 54992,
+      "uncompressedBytes": 571832
+    },
+    "cases/large-O1.json.gz": {
+      "bytes": 36543,
+      "uncompressedBytes": 320607
+    },
+    "cases/large-O2.json.gz": {
+      "bytes": 37707,
+      "uncompressedBytes": 346585
+    },
+    "cases/large-O3.json.gz": {
+      "bytes": 4298,
+      "uncompressedBytes": 40005
+    },
+    "cases/large-Os.json.gz": {
+      "bytes": 38744,
+      "uncompressedBytes": 337487
+    },
+    "cases/memberpointers-O0.json.gz": {
+      "bytes": 11110,
+      "uncompressedBytes": 94915
+    },
+    "cases/memberpointers-O1.json.gz": {
+      "bytes": 8722,
+      "uncompressedBytes": 70238
+    },
+    "cases/memberpointers-O2.json.gz": {
+      "bytes": 8892,
+      "uncompressedBytes": 71575
+    },
+    "cases/memberpointers-O3.json.gz": {
+      "bytes": 9057,
+      "uncompressedBytes": 72801
+    },
+    "cases/memberpointers-Os.json.gz": {
+      "bytes": 8994,
+      "uncompressedBytes": 72347
+    },
+    "cases/memset-O0.json.gz": {
+      "bytes": 4832,
+      "uncompressedBytes": 32997
+    },
+    "cases/memset-O1.json.gz": {
+      "bytes": 4177,
+      "uncompressedBytes": 27639
+    },
+    "cases/memset-O2.json.gz": {
+      "bytes": 5088,
+      "uncompressedBytes": 35265
+    },
+    "cases/memset-O3.json.gz": {
+      "bytes": 6703,
+      "uncompressedBytes": 46233
+    },
+    "cases/memset-Os.json.gz": {
+      "bytes": 4155,
+      "uncompressedBytes": 27960
+    },
+    "cases/noreturn-O0.json.gz": {
+      "bytes": 2881,
+      "uncompressedBytes": 23967
+    },
+    "cases/noreturn-O1.json.gz": {
+      "bytes": 2716,
+      "uncompressedBytes": 23065
+    },
+    "cases/noreturn-O2.json.gz": {
+      "bytes": 2860,
+      "uncompressedBytes": 24163
+    },
+    "cases/noreturn-O3.json.gz": {
+      "bytes": 2862,
+      "uncompressedBytes": 24163
+    },
+    "cases/noreturn-Os.json.gz": {
+      "bytes": 2842,
+      "uncompressedBytes": 24089
+    },
+    "cases/printf-O0.json.gz": {
+      "bytes": 1744,
+      "uncompressedBytes": 10242
+    },
+    "cases/printf-O1.json.gz": {
+      "bytes": 1715,
+      "uncompressedBytes": 10020
+    },
+    "cases/printf-O2.json.gz": {
+      "bytes": 1814,
+      "uncompressedBytes": 10891
+    },
+    "cases/printf-O3.json.gz": {
+      "bytes": 1815,
+      "uncompressedBytes": 10891
+    },
+    "cases/printf-Os.json.gz": {
+      "bytes": 1795,
+      "uncompressedBytes": 10811
+    },
+    "cases/quicksort-O2.json.gz": {
+      "bytes": 11562,
+      "uncompressedBytes": 79043
+    },
+    "cases/quicksort-Os.json.gz": {
+      "bytes": 9547,
+      "uncompressedBytes": 63351
+    },
+    "cases/registername-O0.json.gz": {
+      "bytes": 1486,
+      "uncompressedBytes": 10094
+    },
+    "cases/registername-O1.json.gz": {
+      "bytes": 1424,
+      "uncompressedBytes": 9239
+    },
+    "cases/registername-O2.json.gz": {
+      "bytes": 1475,
+      "uncompressedBytes": 9864
+    },
+    "cases/registername-O3.json.gz": {
+      "bytes": 1477,
+      "uncompressedBytes": 9864
+    },
+    "cases/registername-Os.json.gz": {
+      "bytes": 1466,
+      "uncompressedBytes": 9776
+    },
+    "cases/statics-O0.json.gz": {
+      "bytes": 5632,
+      "uncompressedBytes": 41193
+    },
+    "cases/statics-O1.json.gz": {
+      "bytes": 4790,
+      "uncompressedBytes": 36272
+    },
+    "cases/statics-O2.json.gz": {
+      "bytes": 4761,
+      "uncompressedBytes": 35121
+    },
+    "cases/statics-O3.json.gz": {
+      "bytes": 4534,
+      "uncompressedBytes": 35106
+    },
+    "cases/statics-Os.json.gz": {
+      "bytes": 4723,
+      "uncompressedBytes": 35871
+    },
+    "cases/strings-O0.json.gz": {
+      "bytes": 3600,
+      "uncompressedBytes": 26648
+    },
+    "cases/strings-O1.json.gz": {
+      "bytes": 3406,
+      "uncompressedBytes": 25290
+    },
+    "cases/strings-O2.json.gz": {
+      "bytes": 3507,
+      "uncompressedBytes": 26314
+    },
+    "cases/strings-O3.json.gz": {
+      "bytes": 3509,
+      "uncompressedBytes": 26314
+    },
+    "cases/strings-Os.json.gz": {
+      "bytes": 3335,
+      "uncompressedBytes": 25069
+    },
+    "cases/strtol-O2.json.gz": {
+      "bytes": 11510,
+      "uncompressedBytes": 77435
+    },
+    "cases/strtol-Os.json.gz": {
+      "bytes": 9293,
+      "uncompressedBytes": 62973
+    },
+    "cases/tls-O0.json.gz": {
+      "bytes": 1568,
+      "uncompressedBytes": 10091
+    },
+    "cases/tls-O1.json.gz": {
+      "bytes": 1488,
+      "uncompressedBytes": 9466
+    },
+    "cases/tls-O2.json.gz": {
+      "bytes": 1557,
+      "uncompressedBytes": 10245
+    },
+    "cases/tls-O3.json.gz": {
+      "bytes": 1559,
+      "uncompressedBytes": 10245
+    },
+    "cases/tls-Os.json.gz": {
+      "bytes": 1554,
+      "uncompressedBytes": 10201
+    },
+    "cases/varargs-O0.json.gz": {
+      "bytes": 5006,
+      "uncompressedBytes": 36497
+    },
+    "cases/varargs-O1.json.gz": {
+      "bytes": 4619,
+      "uncompressedBytes": 33673
+    },
+    "cases/varargs-O2.json.gz": {
+      "bytes": 4227,
+      "uncompressedBytes": 32048
+    },
+    "cases/varargs-O3.json.gz": {
+      "bytes": 4229,
+      "uncompressedBytes": 32048
+    },
+    "cases/varargs-Os.json.gz": {
+      "bytes": 4188,
+      "uncompressedBytes": 31838
+    },
+    "cases/x87-O0.json.gz": {
+      "bytes": 4177,
+      "uncompressedBytes": 32020
+    },
+    "cases/x87-O1.json.gz": {
+      "bytes": 3848,
+      "uncompressedBytes": 30128
+    },
+    "cases/x87-O2.json.gz": {
+      "bytes": 4006,
+      "uncompressedBytes": 31259
+    },
+    "cases/x87-O3.json.gz": {
+      "bytes": 4007,
+      "uncompressedBytes": 31259
+    },
+    "cases/x87-Os.json.gz": {
+      "bytes": 3968,
+      "uncompressedBytes": 30876
+    },
+    "cases/x87ops-O0.json.gz": {
+      "bytes": 6153,
+      "uncompressedBytes": 46945
+    },
+    "cases/x87ops-O1.json.gz": {
+      "bytes": 4989,
+      "uncompressedBytes": 37092
+    },
+    "cases/x87ops-O2.json.gz": {
+      "bytes": 5709,
+      "uncompressedBytes": 42085
+    },
+    "cases/x87ops-O3.json.gz": {
+      "bytes": 5711,
+      "uncompressedBytes": 42085
+    },
+    "cases/x87ops-Os.json.gz": {
+      "bytes": 5138,
+      "uncompressedBytes": 38396
+    },
+    "x87/fadd-st-st1.json.gz": {
+      "bytes": 1892,
+      "uncompressedBytes": 16010
+    },
+    "x87/fadd-st-st2.json.gz": {
+      "bytes": 1946,
+      "uncompressedBytes": 16430
+    },
+    "x87/fadd-st1-st.json.gz": {
+      "bytes": 1887,
+      "uncompressedBytes": 16012
+    },
+    "x87/fadd-st2-st.json.gz": {
+      "bytes": 1941,
+      "uncompressedBytes": 16432
+    },
+    "x87/faddp-st1-st.json.gz": {
+      "bytes": 1865,
+      "uncompressedBytes": 15931
+    },
+    "x87/faddp-st2-st.json.gz": {
+      "bytes": 1941,
+      "uncompressedBytes": 16353
+    },
+    "x87/fdiv-st-st1.json.gz": {
+      "bytes": 1899,
+      "uncompressedBytes": 16010
+    },
+    "x87/fdiv-st-st2.json.gz": {
+      "bytes": 1953,
+      "uncompressedBytes": 16430
+    },
+    "x87/fdiv-st1-st.json.gz": {
+      "bytes": 1895,
+      "uncompressedBytes": 16012
+    },
+    "x87/fdiv-st2-st.json.gz": {
+      "bytes": 1949,
+      "uncompressedBytes": 16432
+    },
+    "x87/fdivp-st1-st.json.gz": {
+      "bytes": 1873,
+      "uncompressedBytes": 15931
+    },
+    "x87/fdivp-st2-st.json.gz": {
+      "bytes": 1949,
+      "uncompressedBytes": 16353
+    },
+    "x87/fdivr-st-st1.json.gz": {
+      "bytes": 1906,
+      "uncompressedBytes": 16012
+    },
+    "x87/fdivr-st-st2.json.gz": {
+      "bytes": 1961,
+      "uncompressedBytes": 16432
+    },
+    "x87/fdivr-st1-st.json.gz": {
+      "bytes": 1898,
+      "uncompressedBytes": 16014
+    },
+    "x87/fdivr-st2-st.json.gz": {
+      "bytes": 1952,
+      "uncompressedBytes": 16434
+    },
+    "x87/fdivrp-st1-st.json.gz": {
+      "bytes": 1875,
+      "uncompressedBytes": 15933
+    },
+    "x87/fdivrp-st2-st.json.gz": {
+      "bytes": 1951,
+      "uncompressedBytes": 16355
+    },
+    "x87/fmul-st-st1.json.gz": {
+      "bytes": 1900,
+      "uncompressedBytes": 16011
+    },
+    "x87/fmul-st-st2.json.gz": {
+      "bytes": 1954,
+      "uncompressedBytes": 16431
+    },
+    "x87/fmul-st1-st.json.gz": {
+      "bytes": 1895,
+      "uncompressedBytes": 16013
+    },
+    "x87/fmul-st2-st.json.gz": {
+      "bytes": 1948,
+      "uncompressedBytes": 16433
+    },
+    "x87/fmulp-st1-st.json.gz": {
+      "bytes": 1872,
+      "uncompressedBytes": 15932
+    },
+    "x87/fmulp-st2-st.json.gz": {
+      "bytes": 1948,
+      "uncompressedBytes": 16354
+    },
+    "x87/fsub-st-st1.json.gz": {
+      "bytes": 1894,
+      "uncompressedBytes": 16009
+    },
+    "x87/fsub-st-st2.json.gz": {
+      "bytes": 1948,
+      "uncompressedBytes": 16429
+    },
+    "x87/fsub-st1-st.json.gz": {
+      "bytes": 1891,
+      "uncompressedBytes": 16012
+    },
+    "x87/fsub-st2-st.json.gz": {
+      "bytes": 1944,
+      "uncompressedBytes": 16432
+    },
+    "x87/fsubp-st1-st.json.gz": {
+      "bytes": 1868,
+      "uncompressedBytes": 15931
+    },
+    "x87/fsubp-st2-st.json.gz": {
+      "bytes": 1944,
+      "uncompressedBytes": 16353
+    },
+    "x87/fsubr-st-st1.json.gz": {
+      "bytes": 1903,
+      "uncompressedBytes": 16012
+    },
+    "x87/fsubr-st-st2.json.gz": {
+      "bytes": 1957,
+      "uncompressedBytes": 16432
+    },
+    "x87/fsubr-st1-st.json.gz": {
+      "bytes": 1894,
+      "uncompressedBytes": 16013
+    },
+    "x87/fsubr-st2-st.json.gz": {
+      "bytes": 1948,
+      "uncompressedBytes": 16433
+    },
+    "x87/fsubrp-st1-st.json.gz": {
+      "bytes": 1872,
+      "uncompressedBytes": 15932
+    },
+    "x87/fsubrp-st2-st.json.gz": {
+      "bytes": 1947,
+      "uncompressedBytes": 16354
+    }
+  }
+}

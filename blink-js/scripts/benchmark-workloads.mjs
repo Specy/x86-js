@@ -3,7 +3,7 @@ function equal(actual, expected, message = '') {
     if (actual !== expected) throw new Error(`${message}: expected ${expected}, got ${actual}`)
 }
 export async function benchmarkExecution(createX86Emulator, {
-    count = 10000, samples = 5, nativeHistory = true,
+    count = 10000, samples = 5,
     paths = ['traced', 'untraced-steps', 'native-run']
 } = {}) {
     if (!Number.isSafeInteger(count) || count <= 0 || count % 4)
@@ -17,7 +17,7 @@ export async function benchmarkExecution(createX86Emulator, {
     const results = []
     for (const [workload, body] of Object.entries(programs)) {
         for (const path of paths) {
-            const emulator = await createX86Emulator({ nativeHistory })
+            const emulator = await createX86Emulator()
             const vectorSetup = workload === 'sse' ? 'pcmpeqd xmm1, xmm1\n' : ''
             const code = `bits 64\nglobal _start\nsection .data\ncell: dq 0\nsection .text\n_start:\n${vectorSetup}loop:\n${body}\n`
             const compiled = await emulator.compile(code)
@@ -69,7 +69,7 @@ export async function benchmarkExecution(createX86Emulator, {
     }
 
     // Attribution is a separate instrumented run, not part of throughput results.
-    const emulator = await createX86Emulator({ nativeHistory })
+    const emulator = await createX86Emulator()
     equal(
         (
             await emulator.compile(
@@ -105,5 +105,5 @@ export async function benchmarkExecution(createX86Emulator, {
     await emulator.run(count)
     const profiledMs = performance.now() - start
     emulator.dispose()
-    return { count, samples, nativeHistory, results, profile: { elapsedMs: profiledMs, methods: profile } }
+    return { count, samples, results, profile: { elapsedMs: profiledMs, methods: profile } }
 }

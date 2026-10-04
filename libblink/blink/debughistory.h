@@ -5,7 +5,7 @@
 
 void DebugHistoryClear(void);
 void DebugHistoryBegin(u32 control_flow, u32 instruction_size);
-void DebugHistoryFinish(void);
+void DebugHistoryFinish(bool exited);
 void DebugHistoryCancel(void);
 bool DebugHistoryPending(void);
 void DebugHistoryPokeByte(u64 address, u8 old);

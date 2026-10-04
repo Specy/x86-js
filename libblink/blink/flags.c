@@ -33,6 +33,16 @@ bool GetParity(u8 b) {
   return ~b & 1;
 }
 
+// copies the flags in mask from flags into the machine, leaving the others
+void ImportFlagsMasked(struct Machine *m, u64 flags, u64 mask) {
+  m->flags = (flags & mask) | (m->flags & ~mask);
+  m->flags = SetFlag(m->flags, FLAGS_RF, false);
+  // PF lives in the lazy parity byte; bit 2 is only up to date if imported
+  if (mask & PF) {
+    m->flags = SetLazyParityByte(m->flags, !((m->flags >> FLAGS_PF) & 1));
+  }
+}
+
 void ImportFlags(struct Machine *m, u64 flags) {
   u64 mask = 0;
   mask |= 1 << FLAGS_CF;
@@ -47,16 +57,26 @@ void ImportFlags(struct Machine *m, u64 flags) {
   mask |= 1 << FLAGS_NT;
   mask |= 1 << FLAGS_AC;
   mask |= 1 << FLAGS_ID;
-  m->flags = (flags & mask) | (m->flags & ~mask);
-  m->flags = SetFlag(m->flags, FLAGS_RF, false);
-  m->flags = SetLazyParityByte(m->flags, !((m->flags >> FLAGS_PF) & 1));
+  ImportFlagsMasked(m, flags, mask);
 }
 
-u64 ExportFlags(u64 flags) {
-  flags = SetFlag(flags, FLAGS_IOPL, 3);
-  flags = SetFlag(flags, FLAGS_F1, true);
-  flags = SetFlag(flags, FLAGS_F0, false);
-  flags = flags & ~((u64)1 << FLAGS_PF);
-  flags |= GetLazyParityBool(flags) << FLAGS_PF;
+// Returns the architectural flags word, including RF when an exception saves
+// it. PUSHF masks RF/VM from its image separately; LAHF takes only its low byte.
+u64 ExportFlags(struct Machine *m, u64 flags) {
+  bool pf;
+  pf = GetLazyParityBool(flags);
+  // bits 3, 5, 15 and 22+ read as zero, bit 1 as one; the lazy parity byte
+  // in 24..31 is blink's own, and PF is computed from it
+  flags &= 0x3fffff & ~(u64)(1 << FLAGS_F1 | 1 << FLAGS_KF | 1 << FLAGS_F0 |
+                             1 << FLAGS_PF);
+  flags |= 1 << FLAGS_VF | (u64)pf << FLAGS_PF;
+  if (!m->metal) {
+    // a linux program runs at an i/o privilege level of zero, so it can
+    // neither see an i/o privilege nor clear the interrupt flag
+    flags &= ~(u64)(3 << FLAGS_IOPL);
+    flags |= 1 << FLAGS_IF;
+  } else {
+    flags = SetFlag(flags, FLAGS_IOPL, 3);
+  }
   return flags;
 }

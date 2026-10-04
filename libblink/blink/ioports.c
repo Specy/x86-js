@@ -122,6 +122,7 @@ static int OpSerialOut(struct Machine *m, int r, u32 x) {
 }
 
 u64 OpIn(struct Machine *m, u16 p) {
+  if (!m->metal) ThrowProtectionFault(m);
   switch (p) {
     case 0xE9:
       return OpE9Read(m);
@@ -140,6 +141,7 @@ u64 OpIn(struct Machine *m, u16 p) {
 }
 
 int OpOut(struct Machine *m, u16 p, u32 x) {
+  if (!m->metal) ThrowProtectionFault(m);
   switch (p) {
     case 0xE9:
       return OpE9Write(m, x);

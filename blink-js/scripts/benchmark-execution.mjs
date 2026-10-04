@@ -10,7 +10,6 @@ const output = {
     ...(await benchmarkExecution(createX86Emulator, {
         count: Number(process.env.X86_BENCH_INSTRUCTIONS ?? 10000),
         samples: Number(process.env.X86_BENCH_SAMPLES ?? 5),
-        nativeHistory: process.env.X86_BENCH_NATIVE_HISTORY !== 'false',
         ...(process.env.X86_BENCH_PATHS ? { paths: process.env.X86_BENCH_PATHS.split(',') } : {})
     }))
 }

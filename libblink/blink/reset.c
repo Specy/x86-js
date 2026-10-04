@@ -94,6 +94,9 @@ void ResetCpu(struct Machine *m) {
   m->flags = 0;
   m->flags = SetFlag(m->flags, FLAGS_VF, 1);
   m->flags = SetFlag(m->flags, FLAGS_IOPL, 3);
+  // PF is the parity of a lazy byte, which reads as even (PF=1) when zero;
+  // the processor and the kernel both start a program with PF clear
+  m->flags = SetFlag(m->flags, FLAGS_PF, false);
   memset(m->beg, 0, sizeof(m->beg));
   memset(m->bofram, 0, sizeof(m->bofram));
   memset(&m->freelist, 0, sizeof(m->freelist));
