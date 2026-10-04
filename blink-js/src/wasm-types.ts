@@ -112,6 +112,18 @@ export type BlinkenlibModule = {
     _blinkenlib_get_fpu_snapshot?(): number
     _blinkenlib_get_pc?(): bigint
     _blinkenlib_get_flags?(): number
+    _blinkenlib_run_slice?(budget: number, skipAtPc: boolean): void
+    _blinkenlib_history_version?(): number
+    _blinkenlib_history_capacity?(capacity: number): void
+    _blinkenlib_history_clear?(): void
+    _blinkenlib_history_count?(): number
+    _blinkenlib_history_entry?(offset: number): number
+    _blinkenlib_history_can_undo?(): boolean
+    _blinkenlib_history_undo?(): number
+    _blinkenlib_history_stack_depth?(): number
+    _blinkenlib_history_frame?(index: number): number
+    _blinkenlib_history_begin_poke?(): boolean
+    _blinkenlib_history_end_poke?(): number
     blinkenlibGetRegister(register: X86RegisterName): bigint
     blinkenlibSetRegister(register: X86RegisterName, value: bigint): boolean
     blinkenlibSetFlags(flags: number): void

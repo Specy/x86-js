@@ -48,6 +48,7 @@ import {
     type X86HistoryEntry,
 } from './x86-emulator-utils'
 import { observeCallbackResult } from './callbacks'
+import { NativeHistory } from './native-history'
 import {
     X86_SSE_REGISTERS,
     X86_X87_REGISTERS,
@@ -71,6 +72,8 @@ export type X86RunOptions = {
 export type X86EmulatorOptions = Omit<BlinkRuntimeOptions, 'callbacks' | 'mode'> & {
     mode?: AssemblerMode | AssemblerId
     callbacks?: BlinkRuntimeCallbacks
+    /** Compatibility and benchmarking switch; defaults to native history when available. */
+    nativeHistory?: boolean
 }
 
 export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86CompileResult> {
@@ -91,16 +94,22 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     private history = new CircularHistory<X86HistoryEntry>(0)
     private callStack: StackFrame[] = []
     private openPoke: OpenPokeTransaction | null = null
+    private nativePokeOpen = false
+    private readonly nativeHistory: NativeHistory | null
     /** True while an instruction is running, so a Poke cannot open on top of one. */
     private executing = false
 
-    private constructor(runtime: BlinkRuntime) {
+    private constructor(runtime: BlinkRuntime, nativeHistory: boolean) {
         super({
             systemSize: RegisterSize.Double,
             registerNames: [...X86_REGISTER_NAMES],
             endianness: 'little',
         })
         this.runtime = runtime
+        this.nativeHistory =
+            nativeHistory && NativeHistory.available(runtime)
+                ? new NativeHistory(runtime, this.recordFpuMutations.bind(this))
+                : null
     }
 
     static async create(options: X86EmulatorOptions = {}): Promise<X86Emulator> {
@@ -136,7 +145,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 },
             },
         })
-        emulator = new X86Emulator(runtime)
+        emulator = new X86Emulator(runtime, options.nativeHistory ?? true)
         return emulator
     }
 
@@ -202,6 +211,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const undoLimit = Number.isFinite(undoSize) ? Math.max(0, Math.floor(undoSize)) : 0
         this.history = new CircularHistory<X86HistoryEntry>(undoLimit)
         this.clearExecutionTrace()
+        this.nativeHistory?.initialize(undoLimit)
         this.runtime.setStepRecording(this.isTracingEnabled())
     }
 
@@ -212,6 +222,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     dispose(): void {
         this.runtime.setStepRecording(false)
         this.clearExecutionTrace()
+        this.nativeHistory?.initialize(0)
         this.eventHandlers.stateChange.clear()
         this.eventHandlers.stdout.clear()
         this.eventHandlers.stderr.clear()
@@ -261,6 +272,10 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     undo(): void {
+        if (this.nativeHistory) {
+            if (this.nativeHistory.undo()) this.runtime.resumeAfterStateMutation()
+            return
+        }
         const entry = this.history.pop()
         if (!entry) return
         if (!entry.reversible) {
@@ -282,6 +297,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     canUndo(): boolean {
+        if (this.nativeHistory) return this.nativeHistory.canUndo()
         const entry = this.history.peekNewest()
         return Boolean(entry?.reversible)
     }
@@ -301,11 +317,17 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * poke, and undoing it would then revert the instruction too.
      */
     beginPoke(): void {
-        if (this.openPoke) {
+        if (this.isPokeOpen()) {
             throw new Error('A poke is already open: end it before beginning another')
         }
         if (this.executing) {
             throw new Error('Cannot begin a poke while an instruction is executing')
+        }
+
+        if (this.nativeHistory) {
+            this.nativeHistory.beginPoke()
+            this.nativePokeOpen = true
+            return
         }
 
         const snapshot = this.runtime.getRegisterSnapshot()
@@ -335,6 +357,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * Throws when no poke is open.
      */
     endPoke(): boolean {
+        if (this.nativeHistory) {
+            if (!this.nativePokeOpen) throw new Error('No poke is open: begin one before ending it')
+            this.nativePokeOpen = false
+            return this.nativeHistory.endPoke()
+        }
         const poke = this.openPoke
         if (!poke) throw new Error('No poke is open: begin one before ending it')
         this.openPoke = null
@@ -387,7 +414,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     /** True between `beginPoke()` and `endPoke()`. */
     isPokeOpen(): boolean {
-        return this.openPoke !== null
+        return this.nativePokeOpen || this.openPoke !== null
     }
 
     async step(): Promise<{ terminated: boolean }> {
@@ -395,7 +422,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const wasExecuting = this.executing
         this.executing = true
         try {
-            if (this.isTracingEnabled()) {
+            if (this.isTracingEnabled() && !this.nativeHistory) {
                 this.captureStep()
             } else {
                 this.prepareOneInstructionRun()
@@ -420,6 +447,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * into the machine and records nothing, as it always has.
      */
     writeMemoryBytes(address: bigint, data: Uint8Array): void {
+        if (this.nativePokeOpen && data.length) {
+            // Preflight the whole range, as the legacy Poke path does.
+            this.runtime.readMemoryBytes(address, BigInt(data.length))
+            this.runtime.writeMemoryBytes(address, data)
+            return
+        }
         const poke = this.openPoke
         if (!poke || data.length === 0) {
             this.runtime.writeMemoryBytes(address, data)
@@ -445,6 +478,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     getUndoHistory(max: number): ExecutionStep[] {
         const count = Math.max(0, Math.floor(max))
         if (count === 0) return []
+        if (this.nativeHistory) return this.nativeHistory.newestFirst(count)
         return this.history.newestFirst(count).map(stripPrivateHistory)
     }
 
@@ -458,8 +492,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     getFlags(): { name: string; value: number; prev?: number }[] {
         const flags = this.runtime.getFlags()
-        const latest = this.history.peekNewest()
-        const previousFlags = latest ? BigInt(latest.flagsBefore) : flags
+        const previous = this.nativeHistory?.previousFlags() ?? this.history.peekNewest()?.flagsBefore
+        const previousFlags = previous === undefined ? flags : BigInt(previous)
         return X86_FLAGS.map((flag) => ({
             name: flag.name,
             value: (flags & BigInt(flag.mask)) > 0n ? 1 : 0,
@@ -468,6 +502,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     getCallStack(): StackFrame[] {
+        if (this.nativeHistory) return this.nativeHistory.callStack()
         return cloneCallStack(this.callStack)
     }
 
@@ -574,6 +609,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const wasExecuting = this.executing
         this.executing = true
         try {
+            if (this.nativeHistory) return await this.runNativeSlices(limit, breakpointAddresses, options)
             //the instruction loop is what records history and what stops on a
             //breakpoint; the runtime's own loop is only for a run with neither
             if (this.isTracingEnabled() || breakpointAddresses.length) {
@@ -587,7 +623,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     private assertNoOpenPoke(what: string): void {
-        if (this.openPoke) throw new Error(`Cannot ${what} while a poke is open: end it first`)
+        if (this.isPokeOpen()) throw new Error(`Cannot ${what} while a poke is open: end it first`)
     }
 
     private validateRunLimit(limit: number | undefined): void {
@@ -669,11 +705,37 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     private clearExecutionTrace(): void {
+        this.nativeHistory?.clear()
         this.history.clear()
         this.callStack = []
         // A build or an initialize() throws the whole trace away; an open poke
         // has nothing left to be recorded against.
         this.openPoke = null
+        this.nativePokeOpen = false
+    }
+
+    private async runNativeSlices(
+        limit: number | undefined,
+        breakpoints: bigint[],
+        options: X86RunOptions,
+    ): Promise<EmulatorStatus> {
+        this.prepareOneInstructionRun()
+        const hasLimit = limit !== undefined && limit > 0
+        let executed = 0
+        let skipAtPc = options.skipBreakpointAtPc ?? true
+        while (this.runtime.state === BlinkState.ProgramRunning) {
+            const budget = hasLimit ? Math.min(50000, limit - executed) : 50000
+            executed += this.runtime.runSlice(budget, breakpoints, skipAtPc)
+            skipAtPc = false
+            if ((this.runtime.state as BlinkState) !== BlinkState.ProgramPaused || this.stopReason?.kind !== 'limit') break
+            if (hasLimit && executed >= limit) {
+                this.runtime.pauseForLimit(this.getPc(), BigInt(executed))
+                break
+            }
+            await deferToHost()
+            this.runtime.resumeAfterStateMutation()
+        }
+        return this.getStatus()
     }
 
     private prepareOneInstructionRun(): void {
@@ -783,6 +845,22 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
         const stateBefore = decodeFpuState(fpuBefore)
         const stateAfter = decodeFpuState(fpuAfter)
+
+        if (stateBefore.mxcsr !== stateAfter.mxcsr) {
+            mutations.push({
+                type: 'WriteRegister',
+                value: {
+                    register: 'mxcsr',
+                    old: BigInt(stateBefore.mxcsr),
+                    new: BigInt(stateAfter.mxcsr),
+                    size: RegisterSize.Long,
+                },
+            })
+            writes?.push({
+                type: 'register', name: 'mxcsr',
+                old: BigInt(stateBefore.mxcsr), new: BigInt(stateAfter.mxcsr),
+            })
+        }
 
         for (let index = 0; index < stateBefore.xmm.length; index += 1) {
             if (stateBefore.xmm[index] === stateAfter.xmm[index]) continue

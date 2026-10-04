@@ -503,6 +503,14 @@ export class BlinkRuntime {
         return this.state
     }
 
+    /** Synchronous bounded execution; input and exit callbacks may stop it early. */
+    runSlice(budget: number, breakpoints: bigint[], skipAtPc: boolean): number {
+        this.configureRunControls({ breakpointAddresses: breakpoints })
+        this.resumeAfterStateMutation()
+        this.module._blinkenlib_run_slice!(budget, skipAtPc)
+        return Number(this.module.blinkenlibGetRunStop().executedInstructions)
+    }
+
     provideInput(line: string): void {
         const bytes = Array.from(new TextEncoder().encode(line)).reverse()
         this.stdinBytes.length = 0

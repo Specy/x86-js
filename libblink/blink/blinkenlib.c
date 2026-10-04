@@ -8,6 +8,7 @@
 #include "blink/breakpoint.h"
 #include "blink/bus.h"
 #include "blink/dis.h"
+#include "blink/debughistory.h"
 #include "blink/endian.h"
 #include "blink/high.h"
 #include "blink/loader.h"
@@ -109,6 +110,7 @@ static bool step_recording_enabled = false;
  * legacy clstruct interface keeps its eager listing unless it opts in. */
 static bool deferred_disassembly = false;
 static bool active_step = false;
+static bool native_slice = false;
 static u64 active_pc_before = 0;
 static u64 active_sp_before = 0;
 static u32 active_flags_before = 0;
@@ -310,7 +312,8 @@ static void ClearLastStepInfo(void) {
 }
 
 static void BeginRecordedStep(u32 control_flow) {
-  if (!step_recording_enabled || !m) return;
+  if (!step_recording_enabled || !debugger_enabled || !m) return;
+  if (active_step && DebugHistoryPending()) return;
   ClearStepMemoryWrites();
   memset(&last_step_info, 0, sizeof(last_step_info));
   active_pc_before = GetPc(m);
@@ -318,6 +321,7 @@ static void BeginRecordedStep(u32 control_flow) {
   active_flags_before = m->flags;
   active_control_flow = control_flow;
   active_step = true;
+  DebugHistoryBegin(control_flow, Oplength(m->xedd->op.rde));
 }
 
 static void FinishRecordedStep(void) {
@@ -332,6 +336,7 @@ static void FinishRecordedStep(void) {
   last_step_info.control_flow = active_control_flow;
   last_step_info.memory_write_count = m->writeoldcount;
   last_step_info.memory_truncated = m->writeoldtruncated;
+  DebugHistoryFinish();
   active_step = false;
 }
 
@@ -488,7 +493,10 @@ void runLoop() {
     printf("handling machine interrupt: %d \n", interrupt);
     puts("--");
 #endif
-    FinishRecordedStep();
+    // A blocked read has not executed yet. Retain its before-state until the
+    // resumed syscall completes, so input is one reversible instruction.
+    if (interrupt != kMachineFakeTTYtrap || !DebugHistoryPending())
+      FinishRecordedStep();
     if (interrupt == kMachineExitTrap) {
       if (signal_callback) {
         update_clstruct(m);
@@ -546,6 +554,7 @@ void PostLoadSetup() {
 }
 
 void TearDown(void) {
+  DebugHistoryClear();
   // TODO: make sure free is ok when not allocated
   DisFree(dis);
   FreeMachine(m);
@@ -572,6 +581,7 @@ void stringToArgsArray(char *argsString, char **argsArray, int maxArgs) {
  */
 void setupProgram(bool withdebugger) {
   debugger_enabled = withdebugger;
+  native_slice = false;
 
   // terminal prompt
   printf("\n$ %s\n", argc_string);
@@ -643,6 +653,21 @@ void blinkenlib_stepi() {
   }
   // run a single step
   single_stepping = true;
+  native_slice = false;
+  blinkenlib_set_run_instruction_limit(0);
+  runLoop();
+}
+
+/* A bounded, synchronous debugger batch. Staying below MAX_CYCLES avoids an
+ * asynchronous preemption continuing after the caller thinks its slice ended. */
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_run_slice(u32 budget, bool skip_at_pc) {
+  if (!budget) budget = 1;
+  single_stepping = false;
+  native_slice = true;
+  blinkenlib_set_run_instruction_limit(budget < 50000 ? budget : 50000);
+  skip_current_breakpoint = skip_at_pc;
+  skip_breakpoint_address = GetPc(m);
   runLoop();
 }
 
@@ -672,6 +697,12 @@ void blinkenlib_faketty_resume() {
     unassert(!"Invalid state (tty)");
   }
   m->fakettycanhalt = false;
+  if (native_slice) {
+    // Feeding input completes only the blocked instruction. The caller owns
+    // resuming the following batch, including checking its first breakpoint.
+    single_stepping = true;
+    blinkenlib_set_run_instruction_limit(0);
+  }
   runLoop();
 }
 
@@ -862,6 +893,7 @@ bool blinkenlib_write_memory_byte(u64 virtual_address, u8 value) {
   ptr = SpyAddress(m, virtual_address);
   END_NO_PAGE_FAULTS;
   if (!ptr) return false;
+  DebugHistoryPokeByte(virtual_address, *ptr);
   *ptr = value;
   return true;
 }
@@ -1016,9 +1048,12 @@ void *blinkenlib_get_progname_string() {
 
 EMSCRIPTEN_KEEPALIVE
 u8 *blinkenlib_spy_address(u64 virtual_address) {
+  u8 *pointer;
+  if (!m || IsShadow(virtual_address)) return 0;
   BEGIN_NO_PAGE_FAULTS;
-  return SpyAddress(m, virtual_address);
+  pointer = SpyAddress(m, virtual_address);
   END_NO_PAGE_FAULTS;
+  return pointer;
 }
 
 EMSCRIPTEN_KEEPALIVE

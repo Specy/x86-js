@@ -2,7 +2,10 @@
 function equal(actual, expected, message = '') {
     if (actual !== expected) throw new Error(`${message}: expected ${expected}, got ${actual}`)
 }
-export async function benchmarkExecution(createX86Emulator, { count = 10000, samples = 5 } = {}) {
+export async function benchmarkExecution(createX86Emulator, {
+    count = 10000, samples = 5, nativeHistory = true,
+    paths = ['traced', 'untraced-steps', 'native-run']
+} = {}) {
     if (!Number.isSafeInteger(count) || count <= 0 || count % 4)
         throw new Error('count must be a positive multiple of four')
     if (!Number.isSafeInteger(samples) || samples <= 0) throw new Error('samples must be positive')
@@ -13,13 +16,13 @@ export async function benchmarkExecution(createX86Emulator, { count = 10000, sam
     }
     const results = []
     for (const [workload, body] of Object.entries(programs)) {
-        for (const path of ['traced', 'untraced-steps', 'native-run']) {
-            const emulator = await createX86Emulator()
+        for (const path of paths) {
+            const emulator = await createX86Emulator({ nativeHistory })
             const vectorSetup = workload === 'sse' ? 'pcmpeqd xmm1, xmm1\n' : ''
             const code = `bits 64\nglobal _start\nsection .data\ncell: dq 0\nsection .text\n_start:\n${vectorSetup}loop:\n${body}\n`
             const compiled = await emulator.compile(code)
             equal(compiled.ok, true, compiled.report)
-            emulator.initialize(path === 'traced' ? 1000 : 0)
+            emulator.initialize(path.startsWith('traced') ? 1000 : 0)
             emulator.getNextInstruction()
             // Nonzero lanes make the vector loop exercise FPU mutation history too.
             if (workload === 'sse') {
@@ -30,6 +33,8 @@ export async function benchmarkExecution(createX86Emulator, { count = 10000, sam
                 if (path === 'untraced-steps') {
                     emulator.runtime.resumeAfterStateMutation()
                     for (let i = 0; i < count; i++) emulator.runtime.step()
+                } else if (path === 'traced-steps') {
+                    for (let i = 0; i < count; i++) await emulator.step()
                 } else await emulator.run(count)
             }
             await run()
@@ -48,20 +53,23 @@ export async function benchmarkExecution(createX86Emulator, { count = 10000, sam
             }
             durations.sort((a, b) => a - b)
             const medianMs = durations[Math.floor(durations.length / 2)]
+            const historyStart = performance.now()
+            const historyRows = emulator.getUndoHistory(100).length
+            const historyDecodeMs = performance.now() - historyStart
             results.push({
                 workload,
                 path,
                 instructions: count,
                 medianMs,
                 instructionsPerSecond: (count / medianMs) * 1000,
-                samplesMs: durations
+                samplesMs: durations, historyRows, historyDecodeMs
             })
             emulator.dispose()
         }
     }
 
     // Attribution is a separate instrumented run, not part of throughput results.
-    const emulator = await createX86Emulator()
+    const emulator = await createX86Emulator({ nativeHistory })
     equal(
         (
             await emulator.compile(
@@ -75,6 +83,7 @@ export async function benchmarkExecution(createX86Emulator, { count = 10000, sam
     const profile = {}
     for (const method of [
         'step',
+        'runSlice',
         'getRegisterSnapshot',
         'getFpuStateRaw',
         'getInstructionAt',
@@ -96,5 +105,5 @@ export async function benchmarkExecution(createX86Emulator, { count = 10000, sam
     await emulator.run(count)
     const profiledMs = performance.now() - start
     emulator.dispose()
-    return { count, samples, results, profile: { elapsedMs: profiledMs, methods: profile } }
+    return { count, samples, nativeHistory, results, profile: { elapsedMs: profiledMs, methods: profile } }
 }

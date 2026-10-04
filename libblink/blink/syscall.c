@@ -2366,8 +2366,29 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   if (size) {
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
+      /* readv writes directly into guest pages. Capture the preimage before
+       * handing them to the host, then trim the journal to the actual read. */
+      u32 oldcount = m->writeoldcount, oldused = m->writeoldbytesused;
+      bool oldtruncated = m->writeoldtruncated;
+      SetWriteAddr(m, addr, MIN(size, 0xffffffffu));
       RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
-      if (rc != -1) SetWriteAddr(m, addr, rc);
+      if (rc > 0) {
+        m->writeaddr = addr;
+        m->writesize = rc;
+        if (m->writeoldcount > oldcount) {
+          struct MachineWriteRecord *record = &m->writeold[oldcount];
+          record->size = rc;
+          record->oldsize = MIN(record->oldsize, rc);
+          record->truncated = record->oldsize < rc;
+          m->writeoldbytesused = oldused + record->oldsize;
+          m->writeoldtruncated = oldtruncated || record->truncated;
+        }
+      } else {
+        m->writeoldcount = oldcount;
+        m->writeoldbytesused = oldused;
+        m->writeoldtruncated = oldtruncated;
+        m->writesize = 0;
+      }
     }
     FreeIovs(&iv);
   } else {

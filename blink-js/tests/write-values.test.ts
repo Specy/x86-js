@@ -12,8 +12,8 @@ import { isShadowAddress } from '../src/blink-runtime'
 const createX86Emulator = (options: X86EmulatorOptions = {}) =>
     createDefaultX86Emulator({ ...options, mode: 'GNU_trunk' })
 
-async function startedEmulator(source: string, undoSize = 32, steps = 0): Promise<X86Emulator> {
-    const emulator = await createX86Emulator()
+async function startedEmulator(source: string, undoSize = 32, steps = 0, nativeHistory = true): Promise<X86Emulator> {
+    const emulator = await createX86Emulator({ nativeHistory })
     const result = await emulator.compile(source)
     expect(result.ok).toBe(true)
     emulator.initialize(undoSize)
@@ -382,7 +382,8 @@ _start:
         // A step can unmap what it wrote. Both ways of reading the machine are
         // refused here, and recording still finishes with the bytes it does
         // have rather than throwing or guessing.
-        const emulator = await startedEmulator(STORE_TO_DATA, 32, 2)
+        // This injects failures into the legacy JS reader, not the native journal.
+        const emulator = await startedEmulator(STORE_TO_DATA, 32, 2, false)
         const buffer = emulator.getRegisterValue('rbx')
         const module = emulator.module as BlinkenlibModule & Record<string, unknown>
         const read = module.blinkenlibReadMemoryBytes.bind(module)
@@ -450,7 +451,7 @@ describe('the page lookup the recorder reads through', () => {
     })
 
     it('falls back to the bridge when the build has no page lookup to offer', async () => {
-        const emulator = await startedEmulator(STORE_TO_DATA, 32, 2)
+        const emulator = await startedEmulator(STORE_TO_DATA, 32, 2, false)
         const buffer = emulator.getRegisterValue('rbx')
         const module = emulator.module as BlinkenlibModule & Record<string, unknown>
         const spy = module._blinkenlib_spy_address?.bind(module)
@@ -619,7 +620,7 @@ describe('the history shape stays additive', () => {
 // and a run with tracing off never records and never looks.
 describe('recording both sides costs one page lookup per store and nothing else', () => {
     it('looks at memory once per memory write and never for a register-only step', async () => {
-        const emulator = await startedEmulator(SIZED_WRITES, 32, 3)
+        const emulator = await startedEmulator(SIZED_WRITES, 32, 3, false)
         const probe = countBridgeCalls(emulator)
 
         try {
