@@ -23,7 +23,7 @@ function native(program: Uint8Array): Uint8Array {
     return Uint8Array.from(result.stdout)
 }
 
-async function compare(lines: string[], expected: bigint[]): Promise<void> {
+async function compare(lines: string[], expected: bigint[], nativeRfMayClear: readonly number[] = []): Promise<void> {
     const emulator = await createX86Emulator()
     try {
         const build = await emulator.compile(lines.join('\n'))
@@ -34,7 +34,18 @@ async function compare(lines: string[], expected: bigint[]): Promise<void> {
             const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
             return Array.from({ length: data.length / 8 }, (_, i) => view.getBigUint64(i * 8, true))
         }
-        if (reference) expect(words(reference), 'native reference').toEqual(expected)
+        const referenceWords = reference ? words(reference) : undefined
+        if (referenceWords) {
+            // SDM Vol.3B 20.3.1.1 requires RF for an intermediate REP trap.
+            // CI run 37244320730 returned RF=0 for those two frames, while
+            // earlier hosts returned RF=1. Permit only that observed native
+            // difference; the Core must still satisfy the exact SDM word.
+            for (const index of nativeRfMayClear) {
+                expect([expected[index], expected[index]! & ~0x10000n], `native RF at word ${index}`).toContain(referenceWords[index])
+                referenceWords[index] = referenceWords[index]! | 0x10000n
+            }
+            expect(referenceWords, 'native reference').toEqual(expected)
+        }
         const actual: number[] = []
         emulator.on('stdout', (byte) => { actual.push(byte) })
         // Handled synchronous signals yield to JavaScript between instructions.
@@ -43,12 +54,8 @@ async function compare(lines: string[], expected: bigint[]): Promise<void> {
         expect(emulator.stopReason?.kind === 'exit' && emulator.stopReason.exitCode).toBe(0)
         // The runtime echoes the program command before its binary stdout.
         const bytes = Uint8Array.from(actual.slice(-expected.length * 8))
-        if (reference) {
-            expect(words(reference), 'native reference').toEqual(expected)
-            expect(words(bytes), 'Core versus native').toEqual(words(reference))
-        } else {
-            expect(words(bytes)).toEqual(expected)
-        }
+        expect(words(bytes), 'Core architectural expectation').toEqual(expected)
+        if (referenceWords) expect(words(bytes), 'Core versus native').toEqual(referenceWords)
     } finally {
         emulator.dispose()
     }
@@ -167,6 +174,6 @@ describe('TF single stepping in the interpreter', () => {
             'movsxd rax, dword [rsi + 8]', 'mov [r9 + r8 + 32], rax',
             'inc qword [rel count]', 'cmp qword [rel count], 3', 'jne keep_tf',
             'and qword [rdx + 176], ~0x100', 'keep_tf:', 'ret', 'restorer:', 'mov eax, 15', 'syscall',
-        ], [0x10302n, 0n, 0x202n, 2n, 2n, 0x10302n, 0n, 0x202n, 1n, 2n, 0x302n, 0n, 0x202n, 0n, 2n])
+        ], [0x10302n, 0n, 0x202n, 2n, 2n, 0x10302n, 0n, 0x202n, 1n, 2n, 0x302n, 0n, 0x202n, 0n, 2n], [0, 5])
     })
 })
