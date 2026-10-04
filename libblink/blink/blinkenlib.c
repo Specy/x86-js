@@ -105,6 +105,9 @@ static u64 last_stop_address = 0;
 static bool skip_current_breakpoint = false;
 static u64 skip_breakpoint_address = 0;
 static bool step_recording_enabled = false;
+/* Modern consumers request disassembly through refresh_disassembly(). The
+ * legacy clstruct interface keeps its eager listing unless it opts in. */
+static bool deferred_disassembly = false;
 static bool active_step = false;
 static u64 active_pc_before = 0;
 static u64 active_sp_before = 0;
@@ -405,7 +408,8 @@ void update_clstruct(struct Machine *m) {
   // only copy pointers.
   cls.dis__max_lines = DIS_MAX_LINES;
   cls.dis__max_line_len = DIS_MAX_LINE_LEN;
-  cls.dis__current_line = updateDisassembler();
+  cls.dis__current_line = deferred_disassembly ? dis_current_line
+                                            : updateDisassembler();
   cls.dis__buffer = (u32)&dis_buffer;
 
   // TODO: other useful data
@@ -696,6 +700,7 @@ bool blinkenlib_set_register_u64(int register_id, u64 value) {
   return true;
 }
 
+EMSCRIPTEN_KEEPALIVE
 u64 blinkenlib_get_pc() {
   return m ? GetPc(m) : 0;
 }
@@ -704,8 +709,28 @@ u64 blinkenlib_get_sp() {
   return m ? Read64(m->sp) : 0;
 }
 
+EMSCRIPTEN_KEEPALIVE
 u32 blinkenlib_get_flags() {
   return m ? m->flags : 0;
+}
+
+/* Fixed little-endian wasm32 layout: register IDs 0..16, PC, flags.
+ * JS copies the values before another call can reuse this static buffer. */
+EMSCRIPTEN_KEEPALIVE
+const u64 *blinkenlib_get_register_snapshot() {
+  static u64 snapshot[19];
+  for (int i = 0; i <= BLINKENLIB_REG_RIP; ++i) {
+    snapshot[i] = blinkenlib_get_register_u64(i);
+  }
+  snapshot[17] = blinkenlib_get_pc();
+  snapshot[18] = blinkenlib_get_flags();
+  return snapshot;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const u8 *blinkenlib_get_fpu_snapshot() {
+  static u8 snapshot[BLINKENLIB_FPU_STATE_SIZE];
+  return blinkenlib_get_fpu_state(snapshot) ? snapshot : 0;
 }
 
 void blinkenlib_set_flags(u32 flags) {
@@ -935,9 +960,15 @@ bool blinkenlib_resolve_symbol(u64 virtual_address, u64 *symbol_address,
   return true;
 }
 
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_set_deferred_disassembly(bool enabled) {
+  deferred_disassembly = enabled;
+}
+
 u32 blinkenlib_refresh_disassembly() {
   if (!m || !debugger_enabled) return 0;
-  return updateDisassembler();
+  cls.dis__current_line = updateDisassembler();
+  return cls.dis__current_line;
 }
 
 u32 blinkenlib_get_disassembly_current_line() {

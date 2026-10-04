@@ -13,6 +13,7 @@ import { stageX86Project, x86ProjectSourcePath } from './project'
 import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols } from './elf-symbols'
 import {
     BlinkState,
+    X86_REGISTER_NAMES,
     type StopReason,
     type X86CompilationDiagnostic,
     type X86CompileResult,
@@ -180,6 +181,7 @@ export class BlinkRuntime {
         const exitPointer = module.addFunction((code: number) => runtime?.handleExit(code), 'vi')
 
         module.callMain([signalPointer.toString(), exitPointer.toString()])
+        module._blinkenlib_set_deferred_disassembly?.(true)
 
         runtime = new BlinkRuntime(module, mode, callbacks, scheduler)
         await runtime.setMode(mode)
@@ -577,6 +579,23 @@ export class BlinkRuntime {
     }
 
     getRegisterSnapshot(): RegisterSnapshot {
+        const read = this.module._blinkenlib_get_register_snapshot
+        if (read && this.module.wasmExports?.memory) {
+            const pointer = read.call(this.module) >>> 0
+            // The native call may grow memory: acquire the view afterwards.
+            const view = new DataView(this.heapBytes().buffer, pointer, 19 * 8)
+            const registers = {} as RegisterSnapshot['registers']
+            for (let index = 0; index < X86_REGISTER_NAMES.length; index++) {
+                registers[X86_REGISTER_NAMES[index]!] = view.getBigUint64(index * 8, true)
+            }
+            return {
+                registers,
+                rip: registers.rip,
+                rsp: registers.rsp,
+                pc: view.getBigUint64(17 * 8, true),
+                flags: view.getUint32(18 * 8, true),
+            }
+        }
         return this.module.blinkenlibGetRegisterSnapshot()
     }
 
@@ -603,6 +622,13 @@ export class BlinkRuntime {
      * it throws instead.
      */
     getFpuStateRaw(): Uint8Array {
+        const read = this.module._blinkenlib_get_fpu_snapshot
+        if (read && this.module.wasmExports?.memory) {
+            const pointer = read.call(this.module) >>> 0
+            if (!pointer) return emptyFpuStateBlock()
+            // History owns its bytes; never retain a view into the reusable buffer.
+            return this.heapBytes().slice(pointer, pointer + X86_FPU_STATE_SIZE)
+        }
         const raw = this.module.blinkenlibGetFpuState()
         if (raw.length === 0) return emptyFpuStateBlock()
         if (raw.length !== X86_FPU_STATE_SIZE) {
@@ -640,6 +666,7 @@ export class BlinkRuntime {
     }
 
     getPc(): bigint {
+        if (this.module._blinkenlib_get_pc) return this.module._blinkenlib_get_pc()
         return this.getRegisterSnapshot().pc
     }
 
@@ -648,6 +675,7 @@ export class BlinkRuntime {
     }
 
     getFlags(): bigint {
+        if (this.module._blinkenlib_get_flags) return BigInt(this.module._blinkenlib_get_flags())
         return BigInt(this.getRegisterSnapshot().flags)
     }
 

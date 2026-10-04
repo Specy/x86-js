@@ -58,8 +58,8 @@ function countBridgeCalls(emulator: X86Emulator) {
     const module = emulator.module as BlinkenlibModule & Record<string, unknown>
     const counts = { memoryReads: 0, registerSnapshots: 0, fpuReads: 0 }
     const read = module.blinkenlibReadMemoryBytes.bind(module)
-    const snapshot = module.blinkenlibGetRegisterSnapshot.bind(module)
-    const fpu = module.blinkenlibGetFpuState.bind(module)
+    const snapshot = emulator.runtime.getRegisterSnapshot.bind(emulator.runtime)
+    const fpu = emulator.runtime.getFpuStateRaw.bind(emulator.runtime)
     const spy = module._blinkenlib_spy_address?.bind(module)
 
     module._blinkenlib_spy_address = spy
@@ -72,11 +72,11 @@ function countBridgeCalls(emulator: X86Emulator) {
         counts.memoryReads += 1
         return read(address, length)
     }
-    module.blinkenlibGetRegisterSnapshot = () => {
+    emulator.runtime.getRegisterSnapshot = () => {
         counts.registerSnapshots += 1
         return snapshot()
     }
-    module.blinkenlibGetFpuState = () => {
+    emulator.runtime.getFpuStateRaw = () => {
         counts.fpuReads += 1
         return fpu()
     }
@@ -90,8 +90,8 @@ function countBridgeCalls(emulator: X86Emulator) {
         },
         restore() {
             module.blinkenlibReadMemoryBytes = read
-            module.blinkenlibGetRegisterSnapshot = snapshot
-            module.blinkenlibGetFpuState = fpu
+            emulator.runtime.getRegisterSnapshot = snapshot
+            emulator.runtime.getFpuStateRaw = fpu
             module._blinkenlib_spy_address = spy
         },
     }

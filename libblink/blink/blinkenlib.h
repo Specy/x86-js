@@ -129,8 +129,11 @@ bool blinkenlib_set_register_u64(int register_id, u64 value);
 u64 blinkenlib_get_pc();
 u64 blinkenlib_get_sp();
 u32 blinkenlib_get_flags();
+const u64 *blinkenlib_get_register_snapshot();
+const u8 *blinkenlib_get_fpu_snapshot();
 void blinkenlib_set_flags(u32 flags);
 void blinkenlib_set_step_recording(bool enabled);
+void blinkenlib_set_deferred_disassembly(bool enabled);
 u64 blinkenlib_get_input_max_bytes();
 
 /**

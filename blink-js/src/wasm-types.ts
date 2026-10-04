@@ -105,6 +105,13 @@ export type BlinkenlibModule = {
     _blinkenlib_continue(): void
     _blinkenlib_preempt_resume(): void
     _blinkenlib_faketty_resume(): void
+    /** Opt in to refreshing the legacy listing only when explicitly requested. */
+    _blinkenlib_set_deferred_disassembly?(enabled: boolean): void
+    /** Optional bulk/scalar exports, with the Embind APIs retained as fallbacks. */
+    _blinkenlib_get_register_snapshot?(): number
+    _blinkenlib_get_fpu_snapshot?(): number
+    _blinkenlib_get_pc?(): bigint
+    _blinkenlib_get_flags?(): number
     blinkenlibGetRegister(register: X86RegisterName): bigint
     blinkenlibSetRegister(register: X86RegisterName, value: bigint): boolean
     blinkenlibSetFlags(flags: number): void
