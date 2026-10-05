@@ -46,16 +46,35 @@ void SetReadAddr(struct Machine *m, i64 addr, u32 size) {
   }
 }
 
+// Finds the bytes a write is about to replace. Writes are recorded before they
+// happen, so the first write into a page the guest hasn't touched yet finds it
+// only reserved: SpyAddress() declines it, and PageInAddress() faults it in
+// exactly as the write itself is about to, so the bytes captured are the ones
+// the write replaces (zeros for an anonymous page, the file's for a file-backed
+// one). Neither takes a page lock, and the m->segvcode the declined lookup set
+// is put back, so the write that follows finds the page as its own first access
+// would have left it, and locks it, faults on its protection or on unmapped
+// memory as it always did. (The errno it may set is left, as it always was:
+// whatever reports errno sets it after the write.) SpyAddress() goes first
+// because it answers from the TLB the write is about to hit anyway.
+static u8 *OldBytesAddress(struct Machine *m, i64 virt) {
+  u8 *page;
+  i8 segvcode = m->segvcode;
+  BEGIN_NO_PAGE_FAULTS;
+  page = SpyAddress(m, virt);
+  END_NO_PAGE_FAULTS;
+  if (page) return page;
+  m->segvcode = segvcode;
+  return PageInAddress(m, virt);
+}
+
 static u32 CopyOldBytes(struct Machine *m, i64 addr, u32 size, u8 *target) {
   u32 copied = 0;
   while (copied < size) {
     u8 *page;
     u32 chunk;
     i64 current = addr + copied;
-    BEGIN_NO_PAGE_FAULTS;
-    page = SpyAddress(m, current);
-    END_NO_PAGE_FAULTS;
-    if (!page) break;
+    if (!(page = OldBytesAddress(m, current))) break;
     chunk = MIN(size - copied, 4096 - (current & 4095));
     memcpy(target + copied, page, chunk);
     copied += chunk;
@@ -63,14 +82,91 @@ static u32 CopyOldBytes(struct Machine *m, i64 addr, u32 size, u8 *target) {
   return copied;
 }
 
-static void RecordWriteOldBytes(struct Machine *m, i64 addr, u32 size) {
+// The last record's old bytes normally follow the others in writeoldbytes.
+// A record growing downward (see ExtendWriteRecord) keeps them at the very end
+// of writeoldbytes instead, so that each write can be prepended in place; this
+// moves them back beside the others, which anything appending must do first.
+// Readers need no care: a record's old bytes are wherever its oldoffset says.
+static void SettleLastWriteRecord(struct Machine *m) {
+  u32 offset;
+  struct MachineWriteRecord *last;
+  if (!m->writeoldcount) return;
+  last = &m->writeold[m->writeoldcount - 1];
+  offset = m->writeoldbytesused - last->oldsize;
+  if (last->oldoffset != offset) {
+    memmove(m->writeoldbytes + offset, m->writeoldbytes + last->oldoffset,
+            last->oldsize);
+    last->oldoffset = offset;
+  }
+}
+
+// String instructions write one element at a time, so `rep stosq` with rcx
+// elements makes rcx writes in one step, far more than the records a step can
+// hold. Each element continues the previous one, upward or (with DF set)
+// downward, so it extends the last record instead of opening another. Undo
+// restores a record at once, which is the same as restoring the writes it
+// merged one by one in reverse: they're disjoint, and all came after every
+// earlier record. Returns false, changing nothing that matters, if the write
+// doesn't continue the last record or its old bytes can't all be captured.
+static bool ExtendWriteRecord(struct Machine *m, i64 addr, u32 size) {
+  u8 *old;
+  struct MachineWriteRecord *last;
+  if (!m->writeoldcount) return false;
+  last = &m->writeold[m->writeoldcount - 1];
+  if (last->truncated) {
+    // Old bytes it didn't capture already make the step irreversible, so the
+    // rest of a write too large to capture is only counted, not captured.
+    if (size > 0xffffffffu - last->size) return false;
+    if (addr == last->addr + last->size) {
+      last->size += size;
+      return true;
+    }
+    if (addr + size == last->addr) {
+      // what it did capture belonged to the address it no longer starts at
+      m->writeoldbytesused -= last->oldsize;
+      last->oldsize = 0;
+      last->addr = addr;
+      last->size += size;
+      return true;
+    }
+    return false;
+  }
+  if (size > MACHINE_WRITE_OLD_BYTES_MAX - m->writeoldbytesused) return false;
+  if (addr == last->addr + last->size) {
+    SettleLastWriteRecord(m);
+    old = m->writeoldbytes + m->writeoldbytesused;
+  } else if (addr + size == last->addr) {
+    if (last->oldoffset + last->oldsize != MACHINE_WRITE_OLD_BYTES_MAX) {
+      memmove(m->writeoldbytes + MACHINE_WRITE_OLD_BYTES_MAX - last->oldsize,
+              m->writeoldbytes + last->oldoffset, last->oldsize);
+      last->oldoffset = MACHINE_WRITE_OLD_BYTES_MAX - last->oldsize;
+    }
+    old = m->writeoldbytes + last->oldoffset - size;
+  } else {
+    return false;
+  }
+  if (CopyOldBytes(m, addr, size, old) < size) return false;
+  if (addr < last->addr) {
+    last->addr = addr;
+    last->oldoffset -= size;
+  }
+  last->size += size;
+  last->oldsize += size;
+  m->writeoldbytesused += size;
+  return true;
+}
+
+static void RecordWriteOldBytes(struct Machine *m, i64 addr, u32 size,
+                                bool extend) {
   struct MachineWriteRecord *record;
   u32 available, captured;
   if (!m->recordwrites || !size) return;
+  if (extend && ExtendWriteRecord(m, addr, size)) return;
   if (m->writeoldcount >= MACHINE_WRITE_RECORD_MAX) {
     m->writeoldtruncated = true;
     return;
   }
+  SettleLastWriteRecord(m);
   record = &m->writeold[m->writeoldcount++];
   record->addr = addr;
   record->size = size;
@@ -93,7 +189,18 @@ static void RecordWriteOldBytes(struct Machine *m, i64 addr, u32 size) {
 
 void SetWriteAddr(struct Machine *m, i64 addr, u32 size) {
   if (size) {
-    RecordWriteOldBytes(m, addr, size);
+    RecordWriteOldBytes(m, addr, size, true);
+    m->writeaddr = addr;
+    m->writesize = size;
+  }
+}
+
+// SetWriteAddr() for a write whose record the caller cuts to the length
+// actually written, or drops, once it's done (see SysRead), so it always
+// opens a record of its own instead of extending the last one.
+void SetWriteAddrUnmerged(struct Machine *m, i64 addr, u32 size) {
+  if (size) {
+    RecordWriteOldBytes(m, addr, size, false);
     m->writeaddr = addr;
     m->writesize = size;
   }

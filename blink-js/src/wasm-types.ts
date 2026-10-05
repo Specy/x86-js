@@ -141,7 +141,15 @@ export type BlinkenlibModule = {
      */
     _blinkenlib_spy_address?(address: bigint): number
     /** The wasm instance's own exports; `memory.buffer` is the heap `_blinkenlib_spy_address` points into. */
-    wasmExports?: { memory?: { buffer: ArrayBuffer } }
+    wasmExports?: {
+        memory?: { buffer: ArrayBuffer }
+        /**
+         * How many entries the history has recorded since the module loaded, never going down
+         * (see `X86Emulator.getRecordedEntryCount()`). The glue does not bind it, so it is
+         * reached here, unprefixed.
+         */
+        blinkenlib_history_recorded?: () => bigint
+    }
     blinkenlibReadMemoryBytes(address: bigint, length: number): MemoryReadResult
     blinkenlibWriteMemoryBytes(address: bigint, bytes: Uint8Array | number[]): MemoryWriteResult
     blinkenlibGetDisassembly(): DisassemblySnapshot

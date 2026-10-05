@@ -527,13 +527,17 @@ _start:
     syscall
 `
 
-/** Builds a translation beside the start unit and runs it, returning the exit code. */
+/** Builds a translation with the start unit as its library and runs it, returning the exit code. */
 async function runTranslated(name, translation) {
     const machine = await createX86Emulator()
     try {
+        // The archive `ld` takes the start unit from is written in TypeScript, so the
+        // bundle has to carry it as well as the property that announces it.
+        assert.equal(machine.projectLinking, 'archive', 'a Project links from an archive')
         const build = await machine.compileProject({
             entry: 'main.asm',
-            files: { 'main.asm': translation.text, 'start.asm': START_UNIT },
+            files: { 'main.asm': translation.text },
+            library: { 'start.asm': START_UNIT },
         })
         assert.equal(build.ok, true, `${name} should build: ${build.report}`)
         assert.deepEqual(build.diagnostics, [], `${name}: what the translator writes assembles with no NASM warnings`)

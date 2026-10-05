@@ -2370,10 +2370,11 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
       /* readv writes directly into guest pages. Capture the preimage before
-       * handing them to the host, then trim the journal to the actual read. */
+       * handing them to the host, then trim the journal to the actual read.
+       * The read takes a record of its own, so trimming touches no other. */
       u32 oldcount = m->writeoldcount, oldused = m->writeoldbytesused;
       bool oldtruncated = m->writeoldtruncated;
-      SetWriteAddr(m, addr, MIN(size, 0xffffffffu));
+      SetWriteAddrUnmerged(m, addr, MIN(size, 0xffffffffu));
       RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
       if (rc > 0) {
         m->writeaddr = addr;

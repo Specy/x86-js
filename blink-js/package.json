@@ -1,7 +1,7 @@
 {
   "name": "@specy/x86",
   "type": "module",
-  "version": "3.0.1",
+  "version": "4.0.0",
   "description": "X86 Emulator for JavaScript using Blink",
   "repository": {
     "type": "git",

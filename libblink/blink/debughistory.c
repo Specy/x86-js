@@ -1,8 +1,18 @@
 /* Debugger history stays in wasm. Slots retain their allocation when the ring
- * wraps; JS only decodes the compact packets that the History panel requests.
+ * wraps, unless it is far larger than the new packet; JS only decodes the
+ * compact packets that the History panel requests.
  * Packet v1: 88-byte LE header, changed GPR old/new pairs, optional two packed
  * FPU blocks, then 24-byte memory descriptors and their old/new byte images.
- * See native-history.ts for the matching reader. */
+ * See native-history.ts for the matching reader.
+ *
+ * The ring holds up to `capacity` entries, and the packets of its newest at
+ * most `budget` bytes between them: a step's packet carries up to 64 KiB of the
+ * bytes it replaced and as many it left, so a loop of large string stores would
+ * otherwise fill the wasm heap long before a 200,000-entry ring is full. Over
+ * budget, the oldest entries are hollowed: cut down to their header and marked
+ * irreversible, so undo stops at them as at any write it couldn't capture. They
+ * stay in the ring, which drops the oldest only when full, so its depth still
+ * grows by one entry a step until then. */
 #include "blink/debughistory.h"
 #include "blink/blinkenlib.h"
 #include "blink/endian.h"
@@ -30,8 +40,13 @@ struct Snapshot {
   u8 fpu[BLINKENLIB_FPU_STATE_SIZE];
 };
 struct PokeByte { u64 address; u32 sequence; u8 old; };
+#define HISTORY_BUDGET (256u << 20)
 static struct Entry *entries;
 static u32 capacity, count, start;
+static u32 hollow; /* the oldest `hollow` entries are hollow */
+static u8 (*headers)[88]; /* their headers, by slot, once any is hollowed */
+static u32 budget = HISTORY_BUDGET;
+static u64 held; /* bytes allocated to the packets of the others */
 static u64 serial;
 static struct Snapshot before;
 static bool pending, poke;
@@ -62,11 +77,21 @@ void DebugHistoryCancel(void) {
   poke_count = 0;
 }
 bool DebugHistoryPending(void) { return pending; }
+/* Leaves a slot as one no entry occupies: no packet, no frames. A hollow
+ * entry's header belongs to `headers`, which it leaves alone (allocated 0). */
+static void Empty(struct Entry *e) {
+  Release(e->stack_before);
+  e->stack_before = 0;
+  if (e->allocated) free(e->bytes);
+  e->bytes = 0;
+  e->allocated = 0;
+}
 void DebugHistoryClear(void) {
-  for (u32 i = 0; i < capacity; ++i) {
-    Release(entries[i].stack_before);
-    entries[i].stack_before = 0;
-  }
+  for (u32 i = 0; i < capacity; ++i) Empty(&entries[i]);
+  free(headers);
+  headers = 0;
+  held = 0;
+  hollow = 0;
   Release(stack);
   stack = 0;
   count = start = 0;
@@ -77,7 +102,6 @@ u32 blinkenlib_history_version(void) { return 1; }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_history_capacity(u32 size) {
   DebugHistoryClear();
-  for (u32 i = 0; i < capacity; ++i) free(entries[i].bytes);
   free(entries);
   capacity = size;
   entries = size ? calloc(size, sizeof(*entries)) : 0;
@@ -85,8 +109,22 @@ void blinkenlib_history_capacity(u32 size) {
 }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_history_clear(void) { DebugHistoryClear(); }
+/* For tests; @specy/x86 doesn't call it. Sets the budget the packets of the
+ * entries that aren't hollow share, from the next entry on (0 leaves it as it
+ * is), and returns the bytes they hold now. */
+EMSCRIPTEN_KEEPALIVE
+u32 blinkenlib_history_budget(u32 bytes) {
+  if (bytes) budget = bytes;
+  return held;
+}
 EMSCRIPTEN_KEEPALIVE
 u32 blinkenlib_history_count(void) { return count; }
+/* How many entries the history has recorded since the module loaded: one per
+ * instruction and one per Poke that changed something, including those since
+ * undone, hollowed or pushed out of a full ring. Nothing is recorded while the
+ * capacity is 0, so it doesn't move then. It is the last serial handed out. */
+EMSCRIPTEN_KEEPALIVE
+u64 blinkenlib_history_recorded(void) { return serial; }
 static struct Entry *EntryAt(u32 offset) {
   return offset < count ? &entries[(start + count - 1 - offset) % capacity] : 0;
 }
@@ -116,24 +154,68 @@ static bool CopyGuest(u8 *out, u64 address, u32 size) {
   }
   return true;
 }
+/* Gives an entry a buffer of a new size. Finish() writes the packet whole, so
+ * nothing is copied, and the old buffer is freed whole rather than cut down by
+ * realloc(): a large packet's small head left live in place would split its
+ * memory, and the next large packet would grow the heap instead of reusing it. */
+static void Reallocate(struct Entry *e, u32 allocated) {
+  u8 *p = malloc(allocated);
+  if (!p) abort();
+  if (e->allocated) free(e->bytes);
+  e->bytes = p;
+  e->allocated = allocated;
+}
+/* Cuts the oldest entry that isn't hollow down to its 88-byte header, which
+ * keeps its serial, addresses and flags but no longer offers it to undo. */
+static void HollowOldest(void) {
+  u32 slot = (start + hollow++) % capacity;
+  struct Entry *e = &entries[slot];
+  u8 *header;
+  if (!headers && !(headers = calloc(capacity, sizeof(*headers)))) abort();
+  header = headers[slot];
+  memcpy(header, e->bytes, 88);
+  Write32(header + 4, 88);
+  Write32(header + 20, 0); /* irreversible */
+  Write32(header + 56, 0); /* no registers */
+  Write32(header + 60, 0); /* no memory writes */
+  Write32(header + 64, 0); /* no FPU blocks */
+  held -= e->allocated;
+  free(e->bytes);
+  e->bytes = header;
+  e->allocated = 0;
+  Release(e->stack_before); /* only an undo of this entry would need it */
+  e->stack_before = 0;
+}
 static struct Entry *NewEntry(u32 bytes) {
-  u32 index;
+  struct Entry *e;
+  u32 room = bytes + bytes / 2, index;
+  /* Every step comes through here, so the ring wraps without dividing. */
   if (count == capacity) {
-    index = start;
-    start = (start + 1) % capacity;
+    /* The ring is full: the oldest entry goes, and its slot takes the new one. */
+    e = &entries[start];
+    if (hollow) {
+      --hollow;
+      e->bytes = 0; /* its header stays in `headers` */
+    } else {
+      held -= e->allocated;
+    }
+    if (++start == capacity) start = 0;
+    --count;
   } else {
-    index = (start + count++) % capacity;
+    index = start + count;
+    if (index >= capacity) index -= capacity;
+    e = &entries[index]; /* empty */
   }
-  struct Entry *e = &entries[index];
   Release(e->stack_before);
+  e->stack_before = 0;
+  /* Keep a buffer the packet fits, unless most of it would sit idle. */
+  if (bytes <= e->allocated && e->allocated <= 4 * (u64)bytes + 4096)
+    room = e->allocated;
+  while (hollow < count && held + room > budget) HollowOldest();
+  if (room != e->allocated) Reallocate(e, room);
+  held += room;
   e->stack_before = Retain(stack);
-  if (e->allocated < bytes) {
-    u32 allocated = bytes + bytes / 2;
-    void *p = realloc(e->bytes, allocated);
-    if (!p) abort();
-    e->bytes = p;
-    e->allocated = allocated;
-  }
+  ++count;
   return e;
 }
 static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_count,
@@ -202,10 +284,14 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
       /* Keep the packet layout valid even when the postimage is unreadable. */
       bytes -= newsize;
       newsize = 0;
+      /* Undo writes back through the lookup that just failed, which refuses
+       * blinkenlib's shadow range, where Blink's own mmap() puts pages. */
+      reversible = false;
     }
     p += 24 + w->oldsize + newsize;
   }
   Write32(e->bytes + 4, bytes);
+  Write32(e->bytes + 20, reversible);
   if (!is_poke && before.flow == BLINKENLIB_CONTROL_FLOW_CALL) {
     struct Frame *f = calloc(1, sizeof(*f));
     if (!f) abort();
@@ -279,8 +365,8 @@ int blinkenlib_history_undo(void) {
   }
   Release(stack);
   stack = Retain(e->stack_before);
-  Release(e->stack_before);
-  e->stack_before = 0;
+  held -= e->allocated; /* the newest entry is never hollow: it was reversible */
+  Empty(e);
   --count;
   DebugHistoryCancel();
   return 1;

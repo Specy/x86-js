@@ -19,6 +19,21 @@ export function validateX86Project(project: X86Project): void {
             throw new Error(`Invalid x86 Project file contents: ${path}`)
         }
     }
+    // A library unit is staged beside the Project's Files and named by its path wherever theirs
+    // are, so a path that is also a File's, or a directory of one, would leave every mention of
+    // it meaning two things - and the two could not both be written to the filesystem.
+    for (const [path, contents] of Object.entries(project.library ?? {})) {
+        if (!isProjectPath(path)) throw new Error(`Invalid x86 Project library path: ${path}`)
+        if (typeof contents !== 'string' && !(contents instanceof Uint8Array)) {
+            throw new Error(`Invalid x86 Project library contents: ${path}`)
+        }
+        const file = Object.keys(project.files).find(
+            (file) => file === path || file.startsWith(`${path}/`) || path.startsWith(`${file}/`),
+        )
+        if (file !== undefined) {
+            throw new Error(`x86 Project library path ${path} collides with the Project File ${file}`)
+        }
+    }
 }
 
 /**
@@ -66,26 +81,33 @@ export function selectX86Source(fs: EmscriptenFS, project: X86Project, path: str
     return path === project.entry ? '/assembly.s' : `${X86_PROJECT_ROOT}/${path}`
 }
 
-/** Maps a path emitted by NASM or DWARF back to the exact Project path. */
+/**
+ * Maps a path emitted by NASM or DWARF back to the exact Project path, or library path for a unit
+ * of the Project's library.
+ */
 export function x86ProjectSourcePath(
     sourcePath: string | undefined,
-    project: Pick<X86Project, 'entry' | 'files'>,
+    project: Pick<X86Project, 'entry' | 'files' | 'library'>,
 ): string {
     if (!sourcePath || sourcePath === '/assembly.s' || sourcePath === 'assembly.s') return project.entry
 
-    const withoutRoot = sourcePath.startsWith(`${X86_PROJECT_ROOT}/`)
-        ? sourcePath.slice(X86_PROJECT_ROOT.length + 1)
-        : sourcePath
+    const isKnown = (path: string) =>
+        path in project.files || (project.library !== undefined && path in project.library)
+    // A path under the Project root is the one a unit was assembled from, written out in full, so
+    // it names its File exactly, wherever the Entry is.
+    const underRoot = sourcePath.startsWith(`${X86_PROJECT_ROOT}/`)
+    const withoutRoot = underRoot ? sourcePath.slice(X86_PROJECT_ROOT.length + 1) : sourcePath
+    if (underRoot && isKnown(withoutRoot)) return withoutRoot
     const withoutLeadingSlash = withoutRoot.replace(/^\/+/, '')
     const entryDirectory = parentPath(project.entry)
     const relativeToEntry = resolvePath(entryDirectory, withoutLeadingSlash)
-    if (relativeToEntry && relativeToEntry in project.files) return relativeToEntry
+    if (relativeToEntry && isKnown(relativeToEntry)) return relativeToEntry
 
     const relativeToRoot = resolvePath('', withoutLeadingSlash)
-    if (relativeToRoot && relativeToRoot in project.files) return relativeToRoot
+    if (relativeToRoot && isKnown(relativeToRoot)) return relativeToRoot
 
     const suffix = `/${withoutLeadingSlash}`
-    const suffixMatches = Object.keys(project.files).filter(
+    const suffixMatches = [...Object.keys(project.files), ...Object.keys(project.library ?? {})].filter(
         (path) => path === withoutLeadingSlash || path.endsWith(suffix),
     )
     return suffixMatches.length === 1 ? suffixMatches[0]! : project.entry
@@ -129,7 +151,10 @@ function resolvePath(base: string, written: string): string | null {
     return parts.join('/') || null
 }
 
+/** The text of a Project File or library unit, and nothing for one that holds bytes or is absent. */
 export function x86ProjectText(project: X86Project, path: string): string {
-    const contents: X86ProjectFile | undefined = project.files[path]
+    const contents: X86ProjectFile | undefined = Object.hasOwn(project.files, path)
+        ? project.files[path]
+        : project.library?.[path]
     return typeof contents === 'string' ? contents : ''
 }

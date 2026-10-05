@@ -53,6 +53,29 @@ await emulator.runUntilBlocked()
 const result = await emulator.checkCode(sourceCode)
 ```
 
+### Projects
+
+`compileProject(project)` builds a program from several Files, named by path, and the Entry, the File the program is built from. `checkProject(project)` assembles a Project for its diagnostics without linking it.
+
+```ts
+const result = await emulator.compileProject({
+  entry: 'main.asm',
+  files: {
+    'main.asm': mainSource,
+    'lib/print.asm': printSource,
+    'lib/macros.inc': macros,     // %include "lib/macros.inc"
+    'data/table.bin': tableBytes, // incbin "data/table.bin", as a Uint8Array
+  },
+  library: { 'runtime/start.asm': startSource },
+})
+```
+
+With the default NASM assembler, the Entry and every `.asm`, `.s` or `.nasm` File that no other File `%include`s are each assembled as a unit of their own, and linked the way a C toolchain links objects and a static library. The Entry's unit is linked whole. Every other unit goes into an archive, and `ld` takes a unit from it only for a symbol the program still needs, `_start` included, which it needs from the start. A unit nothing needs is still assembled, and its mistakes are reported, but it is not part of the program, so a Project can hold a File with a `_start` of its own beside the program its Entry builds. Taking a unit for one symbol takes all of it, though: a `_start` in a unit the program needs for something else is a duplicate definition, reported where it is written. As in a static library, a unit's `.init_array` constructors run only when the unit is taken.
+
+`library` holds units built alongside the Project's own, such as the start code under [Starting the program](#starting-the-program). Each is assembled like a File and named by its path wherever a File is, in instructions, breakpoints and diagnostics, but it is never the Entry and no File can `%include` it. A library path and a File's path must differ, and neither may be a directory of the other: `compileProject` and `checkProject` throw for a Project that breaks this. The library's units come first in the archive, so for a symbol a library unit and a Project unit both define, `ld` takes the library's: its `_start` over one a File writes, and its weak definitions, such as a default `memcpy`, over a File's strong ones unless that File is taken for something else. Nothing is taken from the archive for a symbol the Entry defines. The blink-hosted assemblers, GNU as and fasm, assemble the Entry alone.
+
+This differs from 3.x, which linked every unit into the program, so that two Files defining one symbol always clashed. `projectLinking` is `'archive'` on an emulator that links Projects this way, and absent in 3.x.
+
 ### Read registers and memory
 
 ```ts
@@ -106,6 +129,25 @@ When history is enabled, every instruction `run()` or `step()` executes is recor
 
 Very large or truncated memory writes may not be reversible. In that case `canUndo()` returns `false` for the latest step, and calling `undo()` throws instead of restoring a partial state.
 
+`getUndoDepth()` says how many entries the history holds within `undo()`'s reach: one per instruction, and one per host edit recorded with `beginPoke()` and `endPoke()`. It never exceeds `undoSize`, since a full history drops its oldest entry for each new one. An entry `undo()` cannot take back is counted but stops `undo()`, which `canUndo()` reports: one whose memory writes were too large to capture or could not be read back, and an old one the history hollowed, keeping only its header, once its entries held more than 256 MiB.
+
+`getRecordedEntryCount()` counts every entry the history has recorded since the emulator was created, including those since undone, hollowed or dropped. It only grows, and stands still while nothing is recorded, so its difference across a `run()` or `step()` is how many instructions that executed.
+
+`setUndoEnabled(false)` turns undo off until `setUndoEnabled(true)`, so that nothing run in between can be undone. A debugger can use it to run a program's start code, such as the `start.asm` under [Starting the program](#starting-the-program), up to the program's own first instruction:
+
+```ts
+emulator.initialize(128)
+emulator.setUndoEnabled(false)
+while (emulator.getNextInstruction()?.file === 'start.asm') await emulator.step()
+emulator.setUndoEnabled(true)
+
+console.log(emulator.getUndoDepth(), emulator.canUndo()) // 0 false
+await emulator.step()
+console.log(emulator.getUndoDepth(), emulator.canUndo()) // 1 true
+```
+
+What runs while undo is off is still recorded, which keeps the call stack: above, `getCallStack()` holds the frame of the call that entered the program's own code, although that call ran with undo off. It can never be undone, though, and nothing recorded before undo was turned back on can be undone either, since undo goes newest first. While undo is off, `canUndo()` returns `false`, `getUndoDepth()` returns 0 and `getUndoHistory()` returns nothing; once it is back on they cover only what ran since. Entries recorded while it was off still take slots of the history until newer ones push them out. Asking for the state it is already in changes nothing, and `initialize()` turns undo back on. Changing it while a `beginPoke()` transaction is open, from a callback that runs during an instruction, or while an instruction waits for input, throws.
+
 ### Events
 
 ```ts
@@ -133,7 +175,7 @@ gcc -S -O2 -ffreestanding \
   -o main.s main.c
 ```
 
-Then translate the output, and build it beside a start unit of your own, since the translator writes no startup code (`start.asm` is the one under [Starting the program](#starting-the-program)):
+Then translate the output, and build it with a start unit of your own as the Project's library, since the translator writes no startup code (`start.asm` is the one under [Starting the program](#starting-the-program)):
 
 ```ts
 import { readFile } from 'node:fs/promises'
@@ -150,7 +192,8 @@ if (!result.ok) throw new Error('main.s did not translate')
 const emulator = await createX86Emulator()
 const build = await emulator.compileProject({
   entry: 'main.asm',
-  files: { 'main.asm': result.text, 'start.asm': await readFile('start.asm', 'utf8') },
+  files: { 'main.asm': result.text },
+  library: { 'start.asm': await readFile('start.asm', 'utf8') },
 })
 if (!build.ok) throw new Error(build.report)
 
@@ -158,7 +201,7 @@ await emulator.runUntilBlocked()
 console.log(emulator.stopReason?.exitCode) // what main returned
 ```
 
-Every `.asm`, `.s` or `.nasm` File of a Project that no other File includes is assembled on its own, with the default NASM assembler, and linked with the rest, so the translation and the start unit become one program.
+The translation is the Entry, so all of it is linked, and `ld` takes the start unit from the library for the `_start` it needs, which calls the translation's `main`. Any other File of the Project, such as NASM written by hand, joins the program when the translation refers to something it defines (see [Projects](#projects)).
 
 ### The `gcc-intel-v1` profile
 

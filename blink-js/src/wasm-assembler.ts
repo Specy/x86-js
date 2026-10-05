@@ -31,9 +31,11 @@ export type WasmAssemblyResult = {
     /** What it wrote to stderr, verbatim - the diagnostics a parser reads. */
     stderr: string
     /**
-     * The objects to link, Entry first. Empty when any translation unit failed:
-     * a partial link would report missing symbols that are only missing because
-     * the File defining them is the one that did not assemble.
+     * The objects to link: the Entry's, then the library's units and then the
+     * Project's other units, each group by path, which is the order the archive
+     * holds them in. Empty when any translation unit failed: a partial link would
+     * report missing symbols that are only missing because the File defining them
+     * is the one that did not assemble.
      */
     units: WasmAssemblyUnit[]
     /** The Entry's object, or null when the assembly failed. */
@@ -103,11 +105,23 @@ async function scanIncludedFiles(project: X86Project, candidates: readonly strin
     return included
 }
 
+/**
+ * The Project as a library unit's assembly sees it: its Files, and the unit among them at its
+ * library path, so that the unit is staged and selected exactly as a File would be and its DWARF
+ * names it by that path. Only its own assembly stages it, which is what keeps the Project's Files
+ * from `%include`ing it.
+ */
+function withLibraryUnit(project: X86Project, path: string): X86Project {
+    return { entry: project.entry, files: { ...project.files, [path]: project.library![path]! } }
+}
+
 export const nasmWasmAssembler: WasmAssembler = {
     async assemble(project: X86Project): Promise<WasmAssemblyResult> {
         const candidates = x86TranslationUnitCandidates(project)
         const included = await scanIncludedFiles(project, candidates)
-        const units = candidates.filter((path) => path === project.entry || !included.has(path))
+        const [entry, ...others] = candidates.filter((path) => path === project.entry || !included.has(path))
+        const library = new Set(Object.keys(project.library ?? {}))
+        const units = [entry!, ...[...library].sort(), ...others]
 
         let stdout = ''
         let stderr = ''
@@ -116,8 +130,9 @@ export const nasmWasmAssembler: WasmAssembler = {
 
         for (const path of units) {
             const { module, stdout: readStdout, stderr: readStderr } = await createNasmModule()
-            stageX86Project(module.FS, project)
-            const source = selectX86Source(module.FS, project, path)
+            const staged = library.has(path) ? withLibraryUnit(project, path) : project
+            stageX86Project(module.FS, staged)
+            const source = selectX86Source(module.FS, staged, path)
             const unitStatus = callNasm(module, [...NASM_ARGS, source, '-o', OBJECT_PATH])
             stdout += readStdout()
             stderr += readStderr()

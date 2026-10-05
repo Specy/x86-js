@@ -10,8 +10,9 @@ export interface Binary {
 export interface LinkerBinary {
     file: ResourceSource
     /**
-     * The command that links however many objects the Project's translation units produced. Every
-     * path it is given is one this package generated, so none of them needs escaping.
+     * The command that links the Entry's object, followed by the archive of the Project's other
+     * units and its library when there are any. Every path it is given is one this package
+     * generated, so none of them needs escaping.
      */
     link(objects: readonly string[]): string
 }
@@ -170,19 +171,63 @@ export function fasmDiagnostics(str: string): DiagnosticLine[] {
 }
 
 /**
- * What `ld` said, as diagnostics. Nothing else in the toolchain reports a symbol that no
- * translation unit defines: NASM accepts every `extern` on the author's word, and the mistake
- * only surfaces here. Without this the link simply failed and the build looked like it had
- * succeeded, leaving the program unrunnable and nothing on screen to say why.
- *
- * `ld` writes a location as `file:line:(section+offset):`, and writes the notes that introduce an
- * error - "in function `_start':" - as lines ending in a colon, which are skipped in favour of
- * the error itself.
+ * An object as `ld` names it: one of its inputs, `/program.o`, or a member of an archive among
+ * them, `/program.a(u3.o)`.
  */
-export function ldDiagnostics(str: string): DiagnosticLine[] {
+const LD_OBJECT = String.raw`[^:\s]+\.o|[^:\s(]+\.a\([^():\s]+\)`
+const LD_OBJECT_ALONE = new RegExp(`^(?:${LD_OBJECT})$`)
+
+/**
+ * Where `ld` locates a message: the source path and its line, `file:line:`, before a symbol
+ * defined twice; the section and offset, `file:(.data+0x0):`, where the debug information has no
+ * line for the address, as in data; or both, `file:line:(.text+0x6):`, before an undefined
+ * reference. When no symbol comes before the address it names the object first,
+ * `/program.a(u1.o):file:line:`, which says nothing the source path does not; and where it finds
+ * no source path at all, as for data with no label before it, the object is all it names:
+ * `/program.a(u1.o):(.data+0x8):`.
+ *
+ * Paths never hold a colon here, so a path runs to the first colon and the line or section has to
+ * follow it at once: a message that merely contains `:12:` further on is never read as a location.
+ */
+const LD_LOCATION = new RegExp(
+    String.raw`^(?:(?:${LD_OBJECT}):)?([^:]+):(?:(\d+):(?:\([^)]*\):)?|\([^)]*\):)\s*(.+)$`,
+)
+
+/**
+ * Where a symbol defined twice was defined first, which `ld` writes at the end of the message
+ * about the second definition: `; /program.o:file:line: first defined here`, with the section and
+ * offset in place of the line where there is none, and in place of both where there is no source
+ * path either. It always names the object first, and an object is a name this package gave a
+ * unit, which a reader has never seen.
+ */
+const LD_FIRST_DEFINITION = new RegExp(
+    String.raw`; (${LD_OBJECT}):(?:([^:]+):)?(?:(\d+)|\([^)]*\)): first defined here$`,
+)
+
+/**
+ * What `ld` said, as diagnostics. Nothing else in the toolchain reports a symbol that no
+ * translation unit defines, or that two of them do: NASM accepts every `extern` on the author's
+ * word and sees one unit at a time, so the mistake only surfaces here. Without this the link
+ * simply failed and the build looked like it had succeeded, leaving the program unrunnable and
+ * nothing on screen to say why.
+ *
+ * A message goes on the File and line `ld` locates it at, in any of the shapes `LD_LOCATION`
+ * reads, or on line 1 when it gives no line. `ld` writes the notes that introduce an error - "in
+ * function `_start':" - as lines ending in a colon, which are skipped in favour of the error
+ * itself. A duplicate definition's mention of the first one is rewritten to name its File and
+ * line instead of the object: `projectPath` names that File, and by default leaves the path as
+ * `ld` wrote it. `file` is always the path as written, as the other parsers here leave it.
+ *
+ * Where `ld` names only an object, `objectSource` says which source the object was assembled
+ * from, in the form `ld` writes a source path in, and the message is located there as if `ld` had
+ * written it; by default it knows none, and the message keeps the object's name.
+ */
+export function ldDiagnostics(
+    str: string,
+    projectPath: (path: string) => string = (path) => path,
+    objectSource: (object: string) => string | undefined = () => undefined,
+): DiagnosticLine[] {
     const diagnostics: DiagnosticLine[] = []
-    // `file:line:` optionally followed by the `(.text+0x6)` that names where in the section it is.
-    const locatedRegex = /^(.*?):(\d+):(?:\([^)]*\))?:\s*(.+)$/
     for (const line of str.split(/\r?\n/)) {
         // `ld` prefixes some of its messages with its own name and others not at all; dropping it
         // keeps a prefixed location from being read as part of the file path.
@@ -191,8 +236,23 @@ export function ldDiagnostics(str: string): DiagnosticLine[] {
         // the message on the line after it.
         if (!text || text.startsWith('$ ') || text.endsWith(':')) continue
 
-        const located = text.match(locatedRegex)
-        const message = (located?.[3] ?? text).trim()
+        // An object with no source path after it, `/program.a(u1.o):(.data+0x8):`, names no File
+        // itself: the message goes on the one the object was assembled from, or keeps the object's
+        // name where that is not known.
+        const match = text.match(LD_LOCATION)
+        const file = match && LD_OBJECT_ALONE.test(match[1]!) ? objectSource(match[1]!) : match?.[1]
+        const located = file === undefined ? null : match
+        const message = (located?.[3] ?? text)
+            .trim()
+            .replace(
+                LD_FIRST_DEFINITION,
+                (written: string, object: string, path: string | undefined, firstLine: string | undefined) => {
+                    const source = path ?? objectSource(object)
+                    if (source === undefined) return written
+                    const where = firstLine ? `, line ${firstLine}` : ''
+                    return `; first defined in ${projectPath(source)}${where}`
+                },
+            )
         if (!message) continue
         // The missing entry point is reported against the source with a far better explanation
         // than `ld` can give, so its warning here would only say the same thing twice.
@@ -200,8 +260,8 @@ export function ldDiagnostics(str: string): DiagnosticLine[] {
 
         const isWarning = message.startsWith('warning:')
         diagnostics.push({
-            ...(located?.[1] ? { file: located[1] } : {}),
-            line: located ? Number.parseInt(located[2] ?? '0', 10) : 1,
+            ...(located && file ? { file } : {}),
+            line: located?.[2] ? Number.parseInt(located[2], 10) : 1,
             error: isWarning ? message.slice('warning:'.length).trim() : message,
             severity: isWarning ? 'warning' : 'error',
         })

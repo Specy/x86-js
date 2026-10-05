@@ -7,9 +7,10 @@ import {
     type AssemblerId,
     type AssemblerMode,
 } from './assemblers'
+import { writeArchive } from './archive'
 import { readResourceBytes } from './resources'
 import { parseSourceMap, type SourceMap } from './source-map'
-import { stageX86Project, x86ProjectSourcePath } from './project'
+import { stageX86Project, validateX86Project, X86_PROJECT_ROOT, x86ProjectSourcePath } from './project'
 import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols } from './elf-symbols'
 import {
     BlinkState,
@@ -33,6 +34,18 @@ import type {
 
 /** The machine's page size: a page is contiguous in the host heap, the next page need not be. */
 const BLINK_PAGE_SIZE = 4096
+
+/** The Entry's object, which the link always takes whole. */
+const ENTRY_OBJECT = '/program.o'
+/** Every other unit's object, as a member `ld` takes only when the program needs it. */
+const UNIT_ARCHIVE = '/program.a'
+/** How `ld` names an archive member in its messages, `/program.a(u3.o)`, with the member's position. */
+const ARCHIVE_MEMBER = /^\/program\.a\(u(\d+)\.o\)$/
+
+/** The name of the archive's member at `position`: short enough to need no long-name table. */
+function archiveMemberName(position: number): string {
+    return `u${position}.o`
+}
 
 /**
  * The shadow-memory range blink keeps for its own bookkeeping, which the
@@ -130,6 +143,8 @@ export class BlinkRuntime {
     private sourceProject: X86Project | null = null
     private assembleOnly = false
     private assembledObjects: Uint8Array[] = []
+    /** The path of the unit each member of the archive was assembled from, in member order. */
+    private archiveMembers: string[] = []
     /** What the linker said, kept apart from the assembler's log so `ld`'s own parser reads it. */
     private linkerLogs: string | null = null
 
@@ -231,6 +246,7 @@ export class BlinkRuntime {
     }
 
     private async checkProjectWithWasmAssembler(project: X86Project): Promise<X86CompileResult> {
+        validateX86Project(project)
         const sourceProject = copyX86Project(project)
         const assembled = await this.mode.wasmAssembler!.assemble(sourceProject)
         const report = assembled.stdout + assembled.stderr
@@ -246,6 +262,9 @@ export class BlinkRuntime {
 
     private async buildProject(project: X86Project, options: { link: boolean }): Promise<X86CompileResult> {
         this.assertReadyForCompile()
+        // Before anything changes, so that a Project the build cannot take leaves the previous
+        // program, and the state it is in, exactly as they were.
+        validateX86Project(project)
         const sourceProject = copyX86Project(project)
         this.sourceProject = sourceProject
         this.stopReason = null
@@ -253,6 +272,7 @@ export class BlinkRuntime {
         this.assemblerErrors = []
         this.assemblerDiagnostics = []
         this.assembledObjects = []
+        this.archiveMembers = []
         this.linkerLogs = null
         this.sourceMap = null
         this.assembleOnly = !options.link
@@ -303,9 +323,11 @@ export class BlinkRuntime {
      */
     private linkDiagnostics(sourceProject: X86Project): X86CompilationDiagnostic[] {
         if (this.linkerLogs === null) return []
-        const diagnostics = ldDiagnostics(this.linkerLogs).map((diagnostic) => ({
+        const projectPath = (path: string | undefined) => x86ProjectSourcePath(path, sourceProject)
+        const objectSource = (object: string) => this.objectSource(object)
+        const diagnostics = ldDiagnostics(this.linkerLogs, projectPath, objectSource).map((diagnostic) => ({
             ...diagnostic,
-            file: x86ProjectSourcePath(diagnostic.file, sourceProject),
+            file: projectPath(diagnostic.file),
         }))
         const linked = this.state === BlinkState.ProgramLoaded
         if (linked || diagnostics.some((diagnostic) => diagnostic.severity === 'error')) {
@@ -323,6 +345,19 @@ export class BlinkRuntime {
     }
 
     /**
+     * The source an object `ld` names was assembled from, written as the assembler wrote it into
+     * the object, which is how `ld` writes the source paths it finds: `/assembly.s` for the
+     * Entry's, the staged path for an archive member's. Undefined for an object this build did not
+     * make.
+     */
+    private objectSource(object: string): string | undefined {
+        if (object === ENTRY_OBJECT) return '/assembly.s'
+        const member = ARCHIVE_MEMBER.exec(object)
+        const path = member ? this.archiveMembers[Number(member[1])] : undefined
+        return path === undefined ? undefined : `${X86_PROJECT_ROOT}/${path}`
+    }
+
+    /**
      * Nothing in the toolchain treats a missing entry point as a failure: NASM
      * has no opinion on it and `ld` only warns, then starts the program at the
      * top of its text segment, where it runs whatever happens to be first. That
@@ -334,8 +369,9 @@ export class BlinkRuntime {
         sourceProject: X86Project,
     ): X86CompilationDiagnostic[] {
         if (!objects.length || !this.mode.binaries.linker) return []
-        // Any translation unit may be the one that exports the entry point, so the question is
-        // whether the Project as a whole defines it, not whether the Entry File does.
+        // Any translation unit may be the one that exports the entry point, a library's included:
+        // `ld` needs the entry symbol from the start, so it takes the archive member that defines
+        // it. The question is whether the Project as a whole defines it, not whether the Entry does.
         const globals = objects.flatMap((object) => readDefinedGlobalSymbols(object))
         if (globals.includes(DEFAULT_ENTRY_SYMBOL)) return []
 
@@ -408,16 +444,28 @@ export class BlinkRuntime {
             return
         }
 
-        // One object per translation unit, named by position so the linker command never has to
-        // carry a Project path. The Entry leads, which is the order the units were assembled in.
-        const objectPaths = assembled.units.map((_, index) =>
-            index === 0 ? '/program.o' : `/program.${index}.o`,
-        )
-        assembled.units.forEach((unit, index) => this.writeExecutableSync(objectPaths[index]!, unit.object))
+        // Linked the way a C toolchain links a program's objects with a static library: the Entry's
+        // unit as an object, and every other unit as a member of an archive, which `ld` takes a
+        // member from only for a symbol still undefined - the entry symbol among them, undefined
+        // from the start. A unit nothing needs is then left out of the program instead of clashing
+        // with it, as a second `_start` would. The library's units lead the archive, which makes
+        // them the ones taken for a symbol a Project unit defines too. Members are named by
+        // position, so the linker command never has to carry a Project path.
+        const [entry, ...members] = assembled.units
+        this.writeExecutableSync(ENTRY_OBJECT, entry!.object)
+        const inputs = [ENTRY_OBJECT]
+        if (members.length) {
+            const archive = writeArchive(
+                members.map((unit, position) => ({ name: archiveMemberName(position), data: unit.object })),
+            )
+            this.writeExecutableSync(UNIT_ARCHIVE, archive)
+            inputs.push(UNIT_ARCHIVE)
+        }
+        this.archiveMembers = members.map((unit) => unit.path)
 
         this.beginLinking()
         await defer()
-        this.setEmulationArgs('/linker', this.mode.binaries.linker?.link(objectPaths) ?? '', '')
+        this.setEmulationArgs('/linker', this.mode.binaries.linker?.link(inputs) ?? '', '')
         this.module._blinkenlib_run_fast()
         await this.waitForState((state) => state !== BlinkState.Linking)
     }
@@ -1057,13 +1105,16 @@ function toCompileResult(diagnostics: X86CompilationDiagnostic[], report: string
 
 /** Detaches a Project from the caller, who is free to mutate its own copy afterwards. */
 function copyX86Project(project: X86Project): X86Project {
-    return {
-        entry: project.entry,
-        files: Object.fromEntries(
-            Object.entries(project.files).map(([path, contents]) => [
+    const copy = (files: X86Project['files']) =>
+        Object.fromEntries(
+            Object.entries(files).map(([path, contents]) => [
                 path,
                 contents instanceof Uint8Array ? contents.slice() : contents,
             ]),
-        ),
+        )
+    return {
+        entry: project.entry,
+        files: copy(project.files),
+        ...(project.library ? { library: copy(project.library) } : {}),
     }
 }

@@ -308,41 +308,34 @@ _start:
 // about a write. `old` is the machine's capture, so a write it could not
 // capture keeps the valueless shape it always had; `new` is read back, so it
 // is there whenever the addresses can still be read.
-describe('a write the machine could not capture keeps its old shape', () => {
-    it('reports neither value for a store into a page the machine has not touched yet', async () => {
-        // .bss is faulted in on demand, so the FIRST store to a page finds no
-        // page to copy the replaced bytes out of: the native record comes back
-        // truncated and the entry keeps its `Other` shape, with neither the
-        // bytes it replaced nor the bytes it left.
+describe('a store into a page the machine has not touched yet', () => {
+    it('reports both values, the first store and the next alike, and undoes both', async () => {
+        // .bss is faulted in on demand, and the FIRST store to a page used to
+        // find no page to copy the replaced bytes out of, leaving the entry in
+        // its valueless `Other` shape and the step out of undo. The journal now
+        // pages the page in as the store is about to, so it captures the zeros
+        // the store replaces (tests/undo-capture.test.ts has the other cases).
         const emulator = await startedEmulator(FRESH_PAGE_WRITE, 32, 2)
         const buffer = emulator.getRegisterValue('rbx')
+        const stored = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
 
         await emulator.step()
-        const truncated = emulator.getUndoHistory(1)[0]!
-        expect(truncated.mutations).toContainEqual({
-            type: 'Other',
-            value: `Wrote 8 bytes to 0x${buffer.toString(16)}`,
-        })
-        expect(truncated.mutations.some((mutation) => mutation.type === 'WriteMemoryBytes')).toBe(false)
-        // A step whose writes the machine could not capture stays out of undo,
-        // exactly as before this change.
-        expect(emulator.canUndo()).toBe(false)
-
-        // The very same instruction over the now-resident page reports both
-        // sides in full.
-        await emulator.step()
-        expect(memoryWrites(emulator)).toEqual([
-            {
-                address: buffer,
-                old: [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
-                new: [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
-            },
-        ])
+        expect(memoryWrites(emulator)).toEqual([{ address: buffer, old: new Array(8).fill(0), new: stored }])
         expect(emulator.canUndo()).toBe(true)
 
+        // The very same instruction over the now-resident page.
+        await emulator.step()
+        expect(memoryWrites(emulator)).toEqual([{ address: buffer, old: stored, new: stored }])
+        expect(emulator.canUndo()).toBe(true)
+
+        emulator.undo()
+        emulator.undo()
+        expect([...emulator.readMemoryBytes(buffer, 8n)]).toEqual(new Array(8).fill(0))
         emulator.dispose()
     })
+})
 
+describe('a write the machine could not capture keeps its old shape', () => {
     it('reports neither value for a store the journal could only capture in part', async () => {
         // `rep stosb` over more than the journal's 64 KiB of replaced bytes is
         // one record the machine marks truncated.

@@ -70,6 +70,40 @@ describe('translation units', () => {
     emulator.dispose()
   })
 
+  it('puts a symbol two Files define on the second definition, naming the first', async () => {
+    const emulator = await createX86Emulator()
+    // Linked as a compiled program is: its own code as the Entry, start code from the library that
+    // defines `_start`, and a hand-written File that defines `_start` too. A File nothing needs is
+    // left out of the program, but the Entry calls `helper`, so the link takes `main.asm` after the
+    // start code it took for `_start`, and `main.asm` holds the second definition.
+    const start = ['global _start', 'extern main', 'section .text', '_start:', '  call main', EXIT_SYSCALL].join('\n')
+    const main = ['global helper', 'global _start', 'section .text', 'helper:', '  ret', '_start:', EXIT_SYSCALL].join('\n')
+    const result = await emulator.compileProject({
+      entry: 'src/main.c.asm',
+      files: {
+        'src/main.c.asm': ['global main', 'extern helper', 'section .text', 'main:', '  call helper', '  xor eax, eax', '  ret'].join(
+          '\n',
+        ),
+        'main.asm': main,
+      },
+      library: { '@runtime/x86-start.asm': start },
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    // `ld` puts a symbol on the line of the first instruction at its address, the one below its label.
+    const below = (source: string, label: string) => source.split('\n').indexOf(label) + 2
+    expect(result.errors).toEqual([
+      {
+        file: 'main.asm',
+        line: below(main, '_start:'),
+        error: `multiple definition of \`_start'; first defined in @runtime/x86-start.asm, line ${below(start, '_start:')}`,
+        severity: 'error',
+      },
+    ])
+    emulator.dispose()
+  })
+
   it('finds the entry point when another File exports it', async () => {
     const emulator = await createX86Emulator()
     const result = await emulator.compileProject({

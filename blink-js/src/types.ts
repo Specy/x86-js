@@ -61,9 +61,29 @@ export type X86CompilationDiagnostic = {
 
 export type X86ProjectFile = string | Uint8Array
 
+/**
+ * The Files of a program, by path, and the Entry, the File it is built from.
+ *
+ * The default NASM assembler assembles the Entry and every `.asm`, `.s` or `.nasm` File that no
+ * other File `%include`s, each as a unit of its own, and links them the way a C toolchain links
+ * objects and a static library: the Entry's unit as an object, and every other unit as a member
+ * of an archive that `ld` takes a member from only for a symbol still undefined, `_start`
+ * included. A unit nothing needs is assembled, and its mistakes reported, but it is not part of
+ * the program, so a Project can hold Files that would otherwise clash, such as a second `_start`.
+ * The blink-hosted assemblers, GNU as and fasm, assemble the Entry alone.
+ */
 export type X86Project = {
     entry: string
     files: Readonly<Record<string, X86ProjectFile>>
+    /**
+     * Units built alongside the Project's own, such as start code that defines `_start` and calls
+     * `main`: each is assembled like a Project File, under its own path, which instructions,
+     * breakpoints and diagnostics name as they name a File's. A library path and a File's path
+     * must differ, and neither may be a directory of the other. A library unit is never the
+     * Entry, and the Project's Files cannot `%include` it. It goes into the archive ahead of the
+     * Project's other units, so `ld` takes it first for a symbol both define.
+     */
+    library?: Readonly<Record<string, X86ProjectFile>>
 }
 
 export type X86SourceLocation = {

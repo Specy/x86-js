@@ -15,10 +15,11 @@ export function isX86Source(path: string): boolean {
 }
 
 /**
- * Every File that could be its own translation unit: assembled separately and linked with the
- * rest, which is what makes `global` in one File and `extern` in another resolve to each other.
- * The Entry comes first so it leads the link, and the rest follow in a stable order so two builds
- * of the same Project lay out identically.
+ * Every File that could be its own translation unit: assembled separately and linked into the
+ * program when it defines something the program needs, which is what makes `global` in one File
+ * and `extern` in another resolve to each other. The Entry comes first, since its unit is the one
+ * the link always takes, and the rest follow in a stable order so two builds of the same Project
+ * lay out identically.
  */
 export function x86TranslationUnitCandidates(project: X86Project): string[] {
     const others = Object.keys(project.files)

@@ -555,6 +555,7 @@ int GetDescriptor(struct Machine *, int, u64 *);
 void ResetRam(struct Machine *);
 void SetReadAddr(struct Machine *, i64, u32);
 void SetWriteAddr(struct Machine *, i64, u32);
+void SetWriteAddrUnmerged(struct Machine *, i64, u32);
 int SyncVirtual(struct System *, i64, i64, int);
 int ProtectVirtual(struct System *, i64, i64, int, bool);
 bool IsFullyMapped(struct System *, i64, i64);

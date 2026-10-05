@@ -82,6 +82,19 @@ cell: dq 0
         }
     })
 
+    it("counts a breakpoint stop after several slices as the whole run's instructions", async () => {
+        // A loop of 60,000 two-instruction passes, then the breakpoint: three slices of 50,000.
+        const source = PREFIX + 'mov ecx, 60000\nnext:\ndec ecx\njnz next\nnop\nmov eax, 60\nxor edi, edi\nsyscall\n'
+        const emulator = await build(source)
+        try {
+            expect(await emulator.run(undefined, [source.split('\n').indexOf('nop')])).toBe(EmulatorStatus.Running)
+            expect(emulator.stopReason?.kind).toBe('breakpoint')
+            expect(emulator.stopReason?.executedInstructions).toBe(120001n)
+        } finally {
+            emulator.dispose()
+        }
+    })
+
     it('records inside WASM without JavaScript snapshots, disassembly or per-instruction bridge calls', async () => {
         const emulator = await build(PREFIX + 'inc rbx\njmp _start\n', 3)
         const methods = [

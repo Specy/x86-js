@@ -55,6 +55,13 @@ export type X86EmulatorOptions = Omit<BlinkRuntimeOptions, 'callbacks' | 'mode'>
 
 export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86CompileResult> {
     readonly runtime: BlinkRuntime
+    /**
+     * How `compileProject` links a Project: the Entry's unit as an object, every other unit and
+     * the library from an archive, which `ld` takes a member from only for a symbol still
+     * undefined. Versions that linked every unit have no such property, so its presence alone
+     * tells the two apart.
+     */
+    readonly projectLinking = 'archive' as const
 
     private readonly eventHandlers: {
         [K in X86EmulatorEventName]: Set<X86EmulatorEventHandler<K>>
@@ -159,6 +166,16 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.compileProject({ entry: 'assembly.s', files: { 'assembly.s': code } })
     }
 
+    /**
+     * Assembles a Project and links it into the program to run. With the default NASM assembler,
+     * the Entry and every `.asm`, `.s` or `.nasm` File no other File `%include`s are assembled as
+     * units of their own, with `project.library`'s units beside them, and linked as a C toolchain
+     * links objects and a static library: the Entry's unit as an object, and every other unit,
+     * the library's ahead of the rest, as a member of an archive from which `ld` takes a member
+     * only for a symbol still undefined (see {@link X86Emulator.projectLinking}). A unit nothing
+     * needs is assembled, and its mistakes reported, but left out of the program. Throws for a
+     * Project it cannot take, such as one whose library path is also a File's.
+     */
     async compileProject(project: X86Project): Promise<X86CompileResult> {
         this.clearExecutionTrace()
         this.lastSourceCode = x86ProjectText(project, project.entry)
@@ -223,7 +240,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     /**
      * Diagnostics only: this assembles but does not link, and for an assembler
      * that runs as its own wasm module it does not touch blink at all, so a
-     * loaded or paused program survives a check.
+     * loaded or paused program survives a check. The library is assembled too,
+     * so a `_start` only it defines satisfies the check as it satisfies a build.
      */
     async checkProject(project: X86Project): Promise<MonacoError[]> {
         // Warnings included: a program that assembles is where they matter, and
@@ -258,6 +276,58 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     canUndo(): boolean {
         return this.history.canUndo()
+    }
+
+    /**
+     * Turns undo off and back on, so that what runs in between can never be undone: start-up code
+     * run on the program's behalf before it is handed over, for instance. What runs while undo is
+     * off is still recorded, which keeps the call stack - a frame entered then still shows in
+     * `getCallStack()` - but until undo is back on `canUndo()` answers false, `getUndoDepth()` 0
+     * and `getUndoHistory()` nothing, and from then on they cover only what ran since. Nothing
+     * recorded before that point can be undone either, since undo goes newest first, and a Poke
+     * made while undo is off applies but is never undone. Entries recorded while it was off still
+     * take slots of the history until newer ones push them out.
+     *
+     * Asking for the state it is already in changes nothing, and `initialize()` turns undo back
+     * on. Throws when a change is asked for while a poke is open, an instruction is executing or
+     * one is waiting for input: the entry each is recording would otherwise finish on the other
+     * side of the change from the one it began on.
+     */
+    setUndoEnabled(enabled: boolean): void {
+        if (enabled === this.history.isUndoEnabled()) return
+        const change = enabled ? 'turn undo on' : 'turn undo off'
+        this.assertNoOpenPoke(change)
+        if (this.executing) throw new Error(`Cannot ${change} while an instruction is executing`)
+        if (this.getStatus() === EmulatorStatus.WaitingForInput)
+            throw new Error(`Cannot ${change} while an instruction is waiting for input`)
+
+        this.history.setUndoEnabled(enabled)
+    }
+
+    /**
+     * How many entries the history holds within `undo()`'s reach now, one per instruction and one
+     * per Poke. Only what ran since undo was last turned on counts, of what the history still
+     * holds, so it never exceeds the size `initialize()` was given, and it is 0 while undo is off.
+     * An entry `undo()` cannot take back counts too: one whose memory writes were too large to
+     * capture or could not be read back, and an old one the history hollowed to keep its byte
+     * budget. `undo()` stops at it, so fewer `undo()` calls in a row may succeed: `canUndo()` says
+     * whether the next one will.
+     */
+    getUndoDepth(): number {
+        return this.history.depth()
+    }
+
+    /**
+     * How many entries the history has recorded since this emulator was created: one per
+     * instruction executed and one per Poke that changed something. It counts every entry it ever
+     * recorded, whether since undone, hollowed or pushed out of a full history, and whether or not
+     * undo was on, so it only grows: `initialize()` and a new build do not reset it, and it stands
+     * still while `initialize(0)` records nothing. The difference across a `run()` or `step()` is
+     * how many instructions that executed, a read that waited for input counting once, when
+     * `provideInput()` finishes it.
+     */
+    getRecordedEntryCount(): number {
+        return this.history.recorded()
     }
 
     /**
@@ -569,6 +639,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             }
             await deferToHost()
             this.runtime.resumeAfterStateMutation()
+        }
+        // The wasm counts a breakpoint stop within its own slice, so a run longer than one
+        // slice is given the whole run's count, as a limit stop already is.
+        const stop = this.runtime.stopReason
+        if (stop?.kind === 'breakpoint' && stop.executedInstructions !== undefined) {
+            this.runtime.stopReason = { ...stop, executedInstructions: BigInt(executed) }
         }
         return this.getStatus()
     }
