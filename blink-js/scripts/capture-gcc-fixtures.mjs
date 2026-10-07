@@ -243,12 +243,19 @@ function referenceOutcome(entry) {
 }
 
 /**
+ * The line markers GCC frames an `asm` statement's text with inside `#APP` (`# 13 "src/main.c" 1`,
+ * then `# 0 "" 2`). GNU as reads them as `.linefile`, which would file the statement's instructions
+ * under the C source's line in the reference's own line table.
+ */
+const LINE_MARKER = /^# (?:[1-9][0-9]* ".*" 1|0 "" 2)$/
+
+/**
  * GCC's output as GNU as reads it in the reference build. Debug material goes, since GNU as writes
- * its own line table for the prepared file (`--gdwarf-4`): `.file`, `.loc`, `.cfi_*`, `.ident` and
- * the contents of `.debug_*` sections, apart from symbol directives that happen to sit inside one
- * (GCC declares libcalls such as `__divti3` at the end of the file). Merge flags are cleared, so
- * `ld` keeps every literal's own bytes and label. `inputLines[i]` is the input line prepared line
- * `i` came from, null for the start.
+ * its own line table for the prepared file (`--gdwarf-4`): `.file`, `.loc`, `.cfi_*`, `.ident`,
+ * inline assembly's line markers and the contents of `.debug_*` sections, apart from symbol
+ * directives that happen to sit inside one (GCC declares libcalls such as `__divti3` at the end of
+ * the file). Merge flags are cleared, so `ld` keeps every literal's own bytes and label.
+ * `inputLines[i]` is the input line prepared line `i` came from, null for the start.
  */
 function prepareForGnuAs(input) {
     const lines = [...START]
@@ -264,6 +271,7 @@ function prepareForGnuAs(input) {
             return
         }
         if (/^\s*\.(file|loc|ident)\b/.test(text) || /^\s*\.cfi_\w+/.test(text)) return
+        if (LINE_MARKER.test(text.trim())) return
         lines.push(clearMergeFlags(text))
         inputLines.push(index)
     })
@@ -401,6 +409,7 @@ function createReferenceBuilder() {
     }
 }
 
+/** The native run's status or signal, and what the program wrote to standard output, as UTF-8. */
 function runNatively(elf, label) {
     const path = join(scratch, `${label}.elf`)
     writeFileSync(path, elf, { mode: 0o755 })
@@ -408,7 +417,8 @@ function runNatively(elf, label) {
     rmSync(path, { force: true })
     if (run.error?.code === 'ETIMEDOUT') return { timedOut: true }
     if (run.error) return { error: run.error.message }
-    return run.signal ? { signal: run.signal } : { status: run.status }
+    const stdout = run.stdout.toString('utf8')
+    return run.signal ? { signal: run.signal, stdout } : { status: run.status, stdout }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,6 +832,8 @@ function summarize(entry, response, { reference, referenceSkipped, blink: blinkR
             const nativeAgrees = native === (outcome.value & 255)
             if (blinkRun.kind !== 'exit' || blink !== outcome.value || !nativeAgrees)
                 finding = `${entry.name}: intended ${outcome.value}, reference ${observed}`
+            else if (reference.native.stdout !== (outcome.output ?? ''))
+                finding = `${entry.name}: intended output ${JSON.stringify(outcome.output ?? '')}, native ${JSON.stringify(reference.native.stdout)}`
         }
     } else if (reference && outcome.kind === 'link-failure') {
         observed = reference.status === 'link-failed' ? `link-failed ${reference.undefinedSymbols.join(', ')}` : reference.status

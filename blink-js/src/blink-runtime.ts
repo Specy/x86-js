@@ -5,35 +5,55 @@ import {
     DEFAULT_ASSEMBLER_ID,
     ldDiagnostics,
     type AssemblerId,
-    type AssemblerMode,
+    type AssemblerMode
 } from './assemblers'
 import { writeArchive } from './archive'
 import { readResourceBytes } from './resources'
 import { parseSourceMap, type SourceMap } from './source-map'
-import { stageX86Project, validateX86Project, X86_PROJECT_ROOT, x86ProjectSourcePath } from './project'
+import {
+    stageX86Project,
+    validateX86Project,
+    X86_PROJECT_ROOT,
+    x86ProjectSourcePath
+} from './project'
 import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols } from './elf-symbols'
+import { captureFileSystemSkeleton, resetFileSystem, type FileSystemSkeleton } from './file-system'
+import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
 import {
     BlinkState,
+    END_OF_INPUT,
     X86_REGISTER_NAMES,
+    X86EnvironmentError,
     type StopReason,
     type X86CompilationDiagnostic,
     type X86CompileResult,
+    type X86ImplementedSyscall,
+    type X86Input,
+    type X86InputRequest,
+    type X86WaitRequest,
+    type X86Environment,
     type X86Project,
-    type X86SourceLocation,
+    type X86SourceLocation
 } from './types'
 import { observeCallbackResult, type MaybePromise } from './callbacks'
 import { X86_FPU_STATE_SIZE, emptyFpuStateBlock } from './fpu-state'
+import { describeSignal } from './signals'
 import type {
     BlinkenlibModule,
     DisassemblySnapshot,
     NativeInstruction,
     NativeStepInfo,
     NativeSymbol,
-    RegisterSnapshot,
+    RegisterSnapshot
 } from './wasm-types'
 
 /** The machine's page size: a page is contiguous in the host heap, the next page need not be. */
 const BLINK_PAGE_SIZE = 4096
+
+/** Where the program is written to be loaded, and removed from once it is. */
+const PROGRAM = '/program'
+/** The terminal's output channels, as the wasm numbers them. */
+const STDERR_CHANNEL = 2
 
 /** The Entry's object, which the link always takes whole. */
 const ENTRY_OBJECT = '/program.o'
@@ -57,50 +77,45 @@ export function isShadowAddress(address: bigint): boolean {
     return address >= 0x7fff8000n && address < 0x100080000000n
 }
 
-const SIGNALS = {
-    SIGTRAP: 5,
-    SIGXCPU: 24,
-} as const
+const SIGTRAP = 5
 
+/**
+ * The events the wasm sends as SIGTRAP with a code of its own. Linux never sends SIGTRAP with
+ * these codes (its own are 1 to 6, `SI_KERNEL` and the negative `SI_*`), so a SIGTRAP with any other
+ * code is the signal itself, which ends the program when no handler takes it.
+ */
 const SIGTRAP_CODES = {
     BLINK_PREEMPT: 40,
     BLINK_STEP: 41,
     BLINK_FAKE_TTY: 42,
     BLINK_BREAKPOINT: 43,
     BLINK_RUN_LIMIT: 44,
+    BLINK_WAIT: 45
 } as const
 
-const SIGNAL_INFO: Record<number, { name: string; description: string }> = {
-    1: { name: 'SIGHUP', description: 'Hang up controlling terminal or process.' },
-    2: { name: 'SIGINT', description: 'Interrupt from keyboard, Control-C.' },
-    3: { name: 'SIGQUIT', description: 'Quit from keyboard, Control-\\.' },
-    4: { name: 'SIGILL', description: 'Illegal instruction.' },
-    5: { name: 'SIGTRAP', description: 'Breakpoint for debugging.' },
-    6: { name: 'SIGABRT', description: 'Abnormal termination.' },
-    7: { name: 'SIGBUS', description: 'Bus error.' },
-    8: { name: 'SIGFPE', description: 'Floating-point exception.' },
-    9: { name: 'SIGKILL', description: 'Forced-process termination.' },
-    10: { name: 'SIGUSR1', description: 'Available to processes.' },
-    11: { name: 'SIGSEGV', description: 'Invalid memory reference.' },
-    12: { name: 'SIGUSR2', description: 'Available to processes.' },
-    13: { name: 'SIGPIPE', description: 'Write to pipe with no readers.' },
-    14: { name: 'SIGALRM', description: 'Real-timer clock.' },
-    15: { name: 'SIGTERM', description: 'Process termination.' },
-    24: { name: 'SIGXCPU', description: 'CPU time limit exceeded, execution took too long.' },
-}
+const BLINK_EVENT_CODES: ReadonlySet<number> = new Set(Object.values(SIGTRAP_CODES))
 
 export type BlinkRuntimeCallbacks = {
-    stdin?: () => number | null
-    stdout?: (charCode: number) => MaybePromise<void>
-    stderr?: (charCode: number) => MaybePromise<void>
+    /**
+     * The bytes of one write a program made to its standard output, or to the terminal opened by
+     * another name, such as `/dev/tty`: one call per write, in the order the program wrote, with
+     * `stderr`'s calls in between where they came. The assembler and the linker write only to the
+     * build's report.
+     */
+    stdout?: (bytes: Uint8Array) => MaybePromise<void>
+    /** The bytes of one write a program made to its standard error. */
+    stderr?: (bytes: Uint8Array) => MaybePromise<void>
     signal?: (signal: number, code: number) => MaybePromise<void>
     stateChange?: (state: BlinkState, oldState: BlinkState) => MaybePromise<void>
-    inputRequest?: (event: { maxBytes: bigint }) => MaybePromise<void>
+    /** A read found the terminal empty: answer it with `provideInput()`. */
+    inputRequest?: (event: X86InputRequest) => MaybePromise<void>
+    waitRequest?: (event: X86WaitRequest) => MaybePromise<void>
 }
 
 export type BlinkRuntimeOptions = {
     mode?: AssemblerMode | AssemblerId
     callbacks?: BlinkRuntimeCallbacks
+    environment?: X86Environment
     scheduler?: (callback: () => void) => void
 }
 
@@ -128,6 +143,13 @@ export class BlinkRuntime {
     /** Everything the assembler said, warnings included. */
     assemblerDiagnostics: X86CompilationDiagnostic[] = []
 
+    private environment: X86Environment = {}
+    private waitController: AbortController | null = null
+    private waitTimer: ReturnType<typeof setTimeout> | null = null
+    private waitRequest: X86WaitRequest | null = null
+    private waitResumeState = BlinkState.ProgramRunning
+    private programSources = false
+    private generation = 0
     private readonly callbacks: Required<BlinkRuntimeCallbacks>
     private readonly scheduler: (callback: () => void) => void
     /**
@@ -138,7 +160,14 @@ export class BlinkRuntime {
      */
     private resumeScheduled = false
     private readonly stateWaiters: StateWaiter[] = []
-    private readonly stdinBytes: number[] = []
+    /** The file system every program starts with, captured before anything ran. */
+    private readonly skeleton: FileSystemSkeleton
+    private projectMount: ProjectFileSystemMount | null = null
+    private projectMountUsed = false
+    /** The executable the last build linked, or `loadElf()` was given, written out at each start. */
+    private programBytes: Uint8Array | null = null
+    /** The assembler's and the linker's executables, by path, written out before each of their runs. */
+    private readonly tools = new Map<string, Uint8Array>()
     private sourceMap: SourceMap | null = null
     private sourceProject: X86Project | null = null
     private assembleOnly = false
@@ -155,12 +184,13 @@ export class BlinkRuntime {
         module: BlinkenlibModule,
         mode: AssemblerMode,
         callbacks: Required<BlinkRuntimeCallbacks>,
-        scheduler: (callback: () => void) => void,
+        scheduler: (callback: () => void) => void
     ) {
         this.module = module
         this.mode = mode
         this.callbacks = callbacks
         this.scheduler = scheduler
+        this.skeleton = captureFileSystemSkeleton(module.FS)
     }
 
     static async create(options: BlinkRuntimeOptions = {}): Promise<BlinkRuntime> {
@@ -178,34 +208,54 @@ export class BlinkRuntime {
             instantiateWasm: (imports, receiveInstance) => {
                 const wasmInit = initBlinkWasm(imports)
                 resolveWasmInit?.(wasmInit)
-                void wasmInit.then((instance) => receiveInstance(instance), () => undefined)
-            },
-            preRun: (moduleInstance) => {
-                moduleInstance.FS.init(
-                    () => (runtime?.stdinBytes.length ? runtime.stdinBytes.pop() ?? null : callbacks.stdin()),
-                    (charCode) => {
-                        runtime?.collectAssemblerLog(charCode)
-                        observeCallbackResult(callbacks.stdout(charCode))
-                    },
-                    (charCode) => {
-                        runtime?.collectAssemblerLog(charCode)
-                        observeCallbackResult(callbacks.stderr(charCode))
-                    },
+                void wasmInit.then(
+                    (instance) => receiveInstance(instance),
+                    () => undefined
                 )
             },
+            preRun: (moduleInstance) => {
+                // Programs read and write the terminal without these: Emscripten's standard
+                // streams only hold descriptors 0 to 2 for it, and take what blink itself writes.
+                moduleInstance.FS.init(
+                    () => null,
+                    (byte) => runtime?.deliverOutput(1, Uint8Array.of(byte)),
+                    (byte) => runtime?.deliverOutput(STDERR_CHANNEL, Uint8Array.of(byte))
+                )
+            }
         })
         const module = await awaitBlinkenlibModule(modulePromise, wasmInitStarted)
 
         const signalPointer = module.addFunction(
             (signal: number, code: number) => runtime?.handleSignal(signal, code),
-            'vii',
+            'vii'
         )
         const exitPointer = module.addFunction((code: number) => runtime?.handleExit(code), 'vi')
+        const outputPointer = module.addFunction(
+            (channel: number, pointer: number, length: number) =>
+                runtime?.handleOutput(channel, pointer, length),
+            'viii'
+        )
 
-        module.callMain([signalPointer.toString(), exitPointer.toString()])
+        module.blinkHostNow = (clock) => runtime?.hostNow(clock) ?? hostNow(clock)
+        module.blinkHostRandom = (pointer, length) => {
+            const serial = runtime?.getCurrentInstructionSerial() ?? null
+            const bytes =
+                runtime?.programSources && runtime.environment.random
+                    ? runtime.environment.random(length, serial)
+                    : hostRandom(length)
+            if (!(bytes instanceof Uint8Array) || bytes.length !== length)
+                throw new Error('Random source must return exactly the requested bytes')
+            runtime!.heapBytes().set(bytes, pointer)
+        }
+        module.callMain([
+            signalPointer.toString(),
+            exitPointer.toString(),
+            outputPointer.toString()
+        ])
         module._blinkenlib_set_deferred_disassembly?.(true)
 
         runtime = new BlinkRuntime(module, mode, callbacks, scheduler)
+        runtime.environment = options.environment ?? {}
         await runtime.setMode(mode)
         return runtime
     }
@@ -215,11 +265,12 @@ export class BlinkRuntime {
         this.assemblerLogs = ''
         this.assemblerErrors = []
         this.setState(BlinkState.NotReady)
+        this.tools.clear()
         if (this.mode.binaries.assembler) {
-            await this.writeExecutable('/assembler', await readResourceBytes(this.mode.binaries.assembler.file))
+            this.tools.set('/assembler', await readResourceBytes(this.mode.binaries.assembler.file))
         }
         if (this.mode.binaries.linker) {
-            await this.writeExecutable('/linker', await readResourceBytes(this.mode.binaries.linker.file))
+            this.tools.set('/linker', await readResourceBytes(this.mode.binaries.linker.file))
         }
         this.setState(BlinkState.Ready)
     }
@@ -254,19 +305,29 @@ export class BlinkRuntime {
             ...this.parseAssemblerDiagnostics(report, sourceProject),
             ...this.entryPointDiagnostics(
                 assembled.units.map((unit) => unit.object),
-                sourceProject,
-            ),
+                sourceProject
+            )
         ]
         return toCompileResult(diagnostics, report)
     }
 
-    private async buildProject(project: X86Project, options: { link: boolean }): Promise<X86CompileResult> {
+    private async buildProject(
+        project: X86Project,
+        options: { link: boolean }
+    ): Promise<X86CompileResult> {
         this.assertReadyForCompile()
         // Before anything changes, so that a Project the build cannot take leaves the previous
         // program, and the state it is in, exactly as they were.
         validateX86Project(project)
+        this.detachProjectFileSystem()
         const sourceProject = copyX86Project(project)
         this.sourceProject = sourceProject
+        // The build starts from the file system every program does, so nothing an earlier run
+        // left behind can stand in for a File, an object or a tool; it replaces the program, and
+        // what was typed for that one is not for the next.
+        resetFileSystem(this.module.FS, this.skeleton)
+        this.module.blinkenlibClearInput()
+        this.programBytes = null
         this.stopReason = null
         this.assemblerLogs = ''
         this.assemblerErrors = []
@@ -291,10 +352,10 @@ export class BlinkRuntime {
         const diagnostics = [
             ...this.assemblerDiagnostics.map((diagnostic) => ({
                 ...diagnostic,
-                file: x86ProjectSourcePath(diagnostic.file, sourceProject),
+                file: x86ProjectSourcePath(diagnostic.file, sourceProject)
             })),
             ...this.entryPointDiagnostics(this.takeAssembledObjects(), sourceProject),
-            ...this.linkDiagnostics(sourceProject),
+            ...this.linkDiagnostics(sourceProject)
         ]
 
         if (this.state === BlinkState.ProgramLoaded) this.sourceMap = this.tryReadSourceMap()
@@ -325,10 +386,12 @@ export class BlinkRuntime {
         if (this.linkerLogs === null) return []
         const projectPath = (path: string | undefined) => x86ProjectSourcePath(path, sourceProject)
         const objectSource = (object: string) => this.objectSource(object)
-        const diagnostics = ldDiagnostics(this.linkerLogs, projectPath, objectSource).map((diagnostic) => ({
-            ...diagnostic,
-            file: projectPath(diagnostic.file),
-        }))
+        const diagnostics = ldDiagnostics(this.linkerLogs, projectPath, objectSource).map(
+            (diagnostic) => ({
+                ...diagnostic,
+                file: projectPath(diagnostic.file)
+            })
+        )
         const linked = this.state === BlinkState.ProgramLoaded
         if (linked || diagnostics.some((diagnostic) => diagnostic.severity === 'error')) {
             return diagnostics
@@ -339,8 +402,8 @@ export class BlinkRuntime {
                 line: 1,
                 file: sourceProject.entry,
                 severity: 'error',
-                error: 'linking failed, so there is no program to run.',
-            },
+                error: 'linking failed, so there is no program to run.'
+            }
         ]
     }
 
@@ -366,7 +429,7 @@ export class BlinkRuntime {
      */
     private entryPointDiagnostics(
         objects: readonly Uint8Array[],
-        sourceProject: X86Project,
+        sourceProject: X86Project
     ): X86CompilationDiagnostic[] {
         if (!objects.length || !this.mode.binaries.linker) return []
         // Any translation unit may be the one that exports the entry point, a library's included:
@@ -390,9 +453,8 @@ export class BlinkRuntime {
                 severity: 'error',
                 warningClass: 'entry-point',
                 error:
-                    `no \`${DEFAULT_ENTRY_SYMBOL}\` to start from.` +
-                    `${nearestHint}${exportHint}`,
-            },
+                    `no \`${DEFAULT_ENTRY_SYMBOL}\` to start from.` + `${nearestHint}${exportHint}`
+            }
         ]
     }
 
@@ -400,10 +462,9 @@ export class BlinkRuntime {
         stageX86Project(this.module.FS, sourceProject)
         this.setState(BlinkState.Assembling)
         await defer()
-        this.setEmulationArgs('/assembler', this.mode.binaries.assembler!.commands, '')
-        this.module._blinkenlib_run_fast()
+        this.runTool('/assembler', this.mode.binaries.assembler!.commands)
         await this.waitForState(
-            (state) => state !== BlinkState.Assembling && state !== BlinkState.Linking,
+            (state) => state !== BlinkState.Assembling && state !== BlinkState.Linking
         )
         if (this.assemblerErrors.length === 0) {
             try {
@@ -422,15 +483,13 @@ export class BlinkRuntime {
      */
     private async assembleWithWasmAssembler(
         sourceProject: X86Project,
-        options: { link: boolean },
+        options: { link: boolean }
     ): Promise<void> {
         this.setState(BlinkState.Assembling)
         const assembled = await this.mode.wasmAssembler!.assemble(sourceProject)
 
-        // The assembler no longer writes through blink's stdout, so its output
-        // reaches the host's callbacks and the log the same way by hand.
-        this.emitAssemblerOutput(assembled.stdout, this.callbacks.stdout)
-        this.emitAssemblerOutput(assembled.stderr, this.callbacks.stderr)
+        // What the assembler said goes into the report, as a blink-hosted tool's does.
+        this.assemblerLogs += assembled.stdout + assembled.stderr
 
         this.collectAssemblerDiagnostics()
         if (!assembled.units.length) {
@@ -456,7 +515,10 @@ export class BlinkRuntime {
         const inputs = [ENTRY_OBJECT]
         if (members.length) {
             const archive = writeArchive(
-                members.map((unit, position) => ({ name: archiveMemberName(position), data: unit.object })),
+                members.map((unit, position) => ({
+                    name: archiveMemberName(position),
+                    data: unit.object
+                }))
             )
             this.writeExecutableSync(UNIT_ARCHIVE, archive)
             inputs.push(UNIT_ARCHIVE)
@@ -465,8 +527,7 @@ export class BlinkRuntime {
 
         this.beginLinking()
         await defer()
-        this.setEmulationArgs('/linker', this.mode.binaries.linker?.link(inputs) ?? '', '')
-        this.module._blinkenlib_run_fast()
+        this.runTool('/linker', this.mode.binaries.linker?.link(inputs) ?? '')
         await this.waitForState((state) => state !== BlinkState.Linking)
     }
 
@@ -483,35 +544,41 @@ export class BlinkRuntime {
     private collectAssemblerDiagnostics(): void {
         this.assemblerDiagnostics = this.mode.diagnosticsParser?.(this.assemblerLogs) ?? []
         this.assemblerErrors = this.assemblerDiagnostics.filter(
-            (diagnostic) => diagnostic.severity === 'error',
+            (diagnostic) => diagnostic.severity === 'error'
         )
-    }
-
-    private emitAssemblerOutput(text: string, callback: (charCode: number) => MaybePromise<void>): void {
-        for (let index = 0; index < text.length; index += 1) {
-            const charCode = text.charCodeAt(index)
-            this.assemblerLogs += String.fromCharCode(charCode)
-            observeCallbackResult(callback(charCode))
-        }
     }
 
     private parseAssemblerDiagnostics(
         report: string,
-        sourceProject: X86Project,
+        sourceProject: X86Project
     ): X86CompilationDiagnostic[] {
         return (this.mode.diagnosticsParser?.(report) ?? []).map((error) => ({
             ...error,
-            file: x86ProjectSourcePath(error.file, sourceProject),
+            file: x86ProjectSourcePath(error.file, sourceProject)
         }))
     }
 
     loadElf(data: ArrayBuffer | Uint8Array): void {
+        this.clearWaitTransport()
+        ++this.generation
+        this.detachProjectFileSystem()
+        this.module._blinkenlib_abandon_execution()
         if (this.state === BlinkState.NotReady) throw new Error('Blink runtime is not ready')
-        this.writeExecutableSync('/program', data instanceof Uint8Array ? data : new Uint8Array(data))
+        this.programBytes =
+            data instanceof Uint8Array ? data.slice() : new Uint8Array(data.slice(0))
+        this.module.blinkenlibClearInput()
         this.stopReason = null
         this.sourceMap = null
         this.sourceProject = null
         this.setState(BlinkState.ProgramLoaded)
+    }
+
+    /**
+     * The executable the last build linked, or the one `loadElf()` was given: a copy, or null
+     * before either. The program never sees it on the file system (see `startProgram`).
+     */
+    getExecutable(): Uint8Array | null {
+        return this.programBytes?.slice() ?? null
     }
 
     starti(): void {
@@ -533,6 +600,7 @@ export class BlinkRuntime {
             throw new Error(`Cannot step while emulator is ${this.state}`)
         }
         this.module._blinkenlib_stepi()
+        this.checkHostError()
     }
 
     continue(): void {
@@ -541,11 +609,13 @@ export class BlinkRuntime {
             throw new Error(`Cannot continue while emulator is ${this.state}`)
         }
         this.module._blinkenlib_continue()
+        this.checkHostError()
     }
 
     async runUntilBlocked(options: BlinkRunOptions = {}): Promise<BlinkState> {
         this.configureRunControls(options)
-        if (this.state === BlinkState.ProgramLoaded || this.state === BlinkState.ProgramStopped) this.run()
+        if (this.state === BlinkState.ProgramLoaded || this.state === BlinkState.ProgramStopped)
+            this.run()
         // Waiting is right only for a loop that resumes itself: one left
         // running by a step has to be continued, or nothing ever stops it.
         if (
@@ -564,7 +634,8 @@ export class BlinkRuntime {
      * it never starts or continues the program.
      */
     async settle(): Promise<BlinkState> {
-        if (this.state === BlinkState.ProgramRunning && this.resumeScheduled) return this.waitUntilBlocked()
+        if (this.state === BlinkState.ProgramRunning && this.resumeScheduled)
+            return this.waitUntilBlocked()
         return this.state
     }
 
@@ -573,20 +644,158 @@ export class BlinkRuntime {
         this.configureRunControls({ breakpointAddresses: breakpoints })
         this.resumeAfterStateMutation()
         this.module._blinkenlib_run_slice!(budget, skipAtPc)
+        this.checkHostError()
         return Number(this.module.blinkenlibGetRunStop().executedInstructions)
     }
 
-    provideInput(line: string): void {
-        const bytes = Array.from(new TextEncoder().encode(line)).reverse()
-        this.stdinBytes.length = 0
-        this.stdinBytes.push(...bytes)
+    /**
+     * Gives the terminal input: bytes its line discipline released, a string as its UTF-8 bytes,
+     * or `END_OF_INPUT`. It queues after what earlier calls gave and no read has taken, and reads
+     * take it as on a Linux terminal (see the README's "Standard streams"). A read waiting for
+     * input resumes and starts over: returns true for that. Otherwise the input waits for the
+     * program's next read, of this run or, between runs, of the next one.
+     */
+    setEnvironment(environment: X86Environment): void {
+        if (this.isWaiting())
+            throw new Error('Cannot replace sources while an instruction is waiting')
+        this.environment = environment
+    }
+    getInstructionsExecuted(): bigint {
+        return this.module._blinkenlib_instructions_executed()
+    }
+    getCurrentInstructionSerial(): string | null {
+        const serial = this.module._blinkenlib_active_instruction()
+        return serial ? serial.toString() : null
+    }
+    isWaiting(): boolean {
+        return (
+            this.state === BlinkState.ProgramReadlinePause ||
+            this.state === BlinkState.ProgramWaitPause
+        )
+    }
+    getWaitRequest(): X86WaitRequest | null {
+        return this.waitRequest
+    }
+    private hostNow(clock: number): number {
+        const value =
+            this.programSources && this.environment.now
+                ? this.environment.now(clock)
+                : hostNow(clock)
+        if (!Number.isFinite(value) || value < 0)
+            throw new Error('Clock source must return finite nonnegative milliseconds')
+        return value
+    }
+    private checkHostError(): void {
+        if (this.module.blinkHostError === undefined) return
+        const error = new X86EnvironmentError(this.module.blinkHostError)
+        delete this.module.blinkHostError
+        this.clearWaitTransport()
+        this.module._blinkenlib_abandon_execution()
+        this.stopReason = {
+            loadFail: false,
+            exitCode: 0,
+            kind: 'host-error',
+            details: error.message
+        }
+        this.setState(BlinkState.ProgramStopped)
+        throw error
+    }
+    private clearWaitTransport(): void {
+        this.waitController?.abort()
+        this.waitController = null
+        if (this.waitTimer !== null) clearTimeout(this.waitTimer)
+        this.waitTimer = null
+        this.waitRequest = null
+    }
+    private scheduleInputTimer(): void {
+        const deadline = this.module._blinkenlib_timer_deadline()
+        if (deadline < 0n) return
+        const delay = Math.max(0, Number(deadline) / 1e6 - this.hostNow(1))
+        const generation = this.generation
+        this.waitTimer = setTimeout(
+            () => {
+                this.waitTimer = null
+                if (
+                    generation !== this.generation ||
+                    this.state !== BlinkState.ProgramReadlinePause
+                )
+                    return
+                this.stopReason = null
+                this.setState(BlinkState.ProgramRunning)
+                this.module._blinkenlib_faketty_resume()
+                this.checkHostError()
+            },
+            Math.min(2147483647, Math.ceil(delay))
+        )
+    }
+    resumeWait(cancel = false): boolean {
+        if (
+            this.state !== BlinkState.ProgramWaitPause &&
+            !(this.waitRequest && !this.programSources)
+        )
+            return false
+        const resumeState = this.waitResumeState
+        this.clearWaitTransport()
+        if (cancel) this.module._blinkenlib_wait_cancel()
+        this.stopReason = null
+        this.setState(resumeState)
+        this.module._blinkenlib_faketty_resume()
+        this.checkHostError()
+        return true
+    }
+    cancelWait(): boolean {
+        return this.resumeWait(true)
+    }
+    /** End a session while retaining the module, environment sources and callback registrations. */
+    clearExecution(): void {
+        if (
+            this.state === BlinkState.Assembling ||
+            this.state === BlinkState.Linking ||
+            (this.getCurrentInstructionSerial() !== null && !this.isWaiting())
+        )
+            throw new Error('Cannot clear x86 execution from an active native instruction or build')
+        this.clearWaitTransport()
+        ++this.generation
+        this.resumeScheduled = false
+        this.detachProjectFileSystem()
+        this.module._blinkenlib_clear_execution()
+        delete this.module.blinkHostError
+        this.programSources = false
+        this.programBytes = null
+        this.sourceMap = null
+        this.sourceProject = null
+        this.stopReason = null
+        resetFileSystem(this.module.FS, this.skeleton)
+        this.setState(BlinkState.Ready)
+    }
+    dispose(): void {
+        this.clearExecution()
+        this.setState(BlinkState.ProgramStopped)
+    }
+    provideInput(input: X86Input): boolean {
+        if (input === END_OF_INPUT) {
+            this.module.blinkenlibProvideEndOfInput()
+        } else {
+            const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input
+            if (!(bytes instanceof Uint8Array))
+                throw new TypeError('provideInput takes bytes, a string or END_OF_INPUT')
+            this.module.blinkenlibProvideInput(bytes)
+        }
+        if (this.state === BlinkState.ProgramWaitPause && this.waitRequest?.acceptsInput)
+            return this.resumeWait()
+        if (this.state !== BlinkState.ProgramReadlinePause) return false
+        if (this.waitTimer !== null) clearTimeout(this.waitTimer)
+        this.waitTimer = null
         this.setState(BlinkState.ProgramRunning)
         this.module._blinkenlib_faketty_resume()
+        this.checkHostError()
+        return true
     }
 
     readMemoryBytes(address: bigint, length: bigint): Uint8Array {
         const size = Number(length)
-        if (!Number.isSafeInteger(size) || size < 0) throw new Error(`Invalid memory read length: ${length}`)
+        if (!Number.isSafeInteger(size) || size < 0)
+            throw new Error(`Invalid memory read length: ${length}`)
         const result = this.module.blinkenlibReadMemoryBytes(address, size)
         if (!result.ok) throw new Error(`${result.error}: 0x${address.toString(16)}`)
         return Uint8Array.from(result.bytes)
@@ -634,7 +843,8 @@ export class BlinkRuntime {
      */
     private heapBytes(): Uint8Array {
         const buffer = this.module.wasmExports!.memory!.buffer
-        if (!this.heapView || this.heapView.buffer !== buffer) this.heapView = new Uint8Array(buffer)
+        if (!this.heapView || this.heapView.buffer !== buffer)
+            this.heapView = new Uint8Array(buffer)
         return this.heapView
     }
 
@@ -666,7 +876,7 @@ export class BlinkRuntime {
                 rip: registers.rip,
                 rsp: registers.rsp,
                 pc: view.getBigUint64(17 * 8, true),
-                flags: view.getUint32(18 * 8, true),
+                flags: view.getUint32(18 * 8, true)
             }
         }
         return this.module.blinkenlibGetRegisterSnapshot()
@@ -706,7 +916,7 @@ export class BlinkRuntime {
         if (raw.length === 0) return emptyFpuStateBlock()
         if (raw.length !== X86_FPU_STATE_SIZE) {
             throw new Error(
-                `The x86 FPU bridge returned ${raw.length} bytes, expected ${X86_FPU_STATE_SIZE}: the wasm and blink-js are out of step`,
+                `The x86 FPU bridge returned ${raw.length} bytes, expected ${X86_FPU_STATE_SIZE}: the wasm and blink-js are out of step`
             )
         }
         return raw
@@ -723,7 +933,9 @@ export class BlinkRuntime {
         // machine; check the length here so a hand-built block is named for
         // what it is instead of sending the caller hunting for the machine.
         if (bytes.length !== X86_FPU_STATE_SIZE) {
-            throw new Error(`An x86 FPU state block must be ${X86_FPU_STATE_SIZE} bytes, got ${bytes.length}`)
+            throw new Error(
+                `An x86 FPU state block must be ${X86_FPU_STATE_SIZE} bytes, got ${bytes.length}`
+            )
         }
         if (!this.module.blinkenlibSetFpuState(bytes)) {
             throw new Error('Cannot write the x86 FPU state: no machine is loaded')
@@ -756,6 +968,19 @@ export class BlinkRuntime {
         return this.module.blinkenlibGetInputMaxBytes()
     }
 
+    /**
+     * The system calls this Core implements, by number: the arms of the dispatch table the wasm
+     * was compiled with, so a call its configuration leaves out is not listed. A number not listed
+     * answers ENOSYS. The list is the same for every program and never changes while the module
+     * lives.
+     */
+    getImplementedSyscalls(): X86ImplementedSyscall[] {
+        return this.module
+            .blinkenlibGetSyscalls()
+            .map(({ number, name, arity }) => ({ number, name, arity }))
+            .sort((a, b) => a.number - b.number)
+    }
+
     getInstructionAt(address: bigint): NativeInstruction | null {
         return this.module.blinkenlibGetInstructionAt(address)
     }
@@ -779,7 +1004,7 @@ export class BlinkRuntime {
             path: this.sourceProject
                 ? x86ProjectSourcePath(location.file, this.sourceProject)
                 : (location.file ?? 'assembly.s'),
-            line: location.lineIndex,
+            line: location.lineIndex
         }
     }
 
@@ -791,7 +1016,7 @@ export class BlinkRuntime {
         if (!this.sourceMap || !this.sourceProject) return []
         return this.sourceMap.getAddressesMatching(
             location.line,
-            (file) => x86ProjectSourcePath(file, this.sourceProject!) === location.path,
+            (file) => x86ProjectSourcePath(file, this.sourceProject!) === location.path
         )
     }
 
@@ -807,7 +1032,7 @@ export class BlinkRuntime {
             details: `execution paused at breakpoint 0x${address.toString(16)}`,
             address,
             lineNumber: location?.line,
-            file: location?.path,
+            file: location?.path
         }
         this.setState(BlinkState.ProgramPaused)
     }
@@ -822,12 +1047,13 @@ export class BlinkRuntime {
             address,
             lineNumber: location?.line,
             file: location?.path,
-            executedInstructions,
+            executedInstructions
         }
         this.setState(BlinkState.ProgramPaused)
     }
 
     resumeAfterStateMutation(): void {
+        if (this.isWaiting()) throw new Error('Cannot change state while an instruction is waiting')
         this.stopReason = null
         if (
             this.state === BlinkState.ProgramStopped ||
@@ -838,20 +1064,75 @@ export class BlinkRuntime {
         }
     }
 
-    private startProgram(method: '_blinkenlib_run' | '_blinkenlib_start' | '_blinkenlib_starti'): void {
+    /**
+     * Starts the program afresh. It finds the file system every program starts with, the empty
+     * working directory its current one, and descriptors 0 to 2 the terminal, whatever the run
+     * before it did: the Core closes what that run left open. The executable is written out only
+     * for the loader and removed before the first instruction, so the program sees none of the
+     * toolchain's files. Input given for a run that never ended is forgotten; input given after
+     * a run ended, or since the build, is the new run's.
+     */
+    private startProgram(method: '_blinkenlib_run' | '_blinkenlib_starti'): void {
+        this.clearWaitTransport()
+        ++this.generation
+        this.programSources = true
         try {
+            if (this.projectMountUsed) this.detachProjectFileSystem()
+            if (
+                this.state !== BlinkState.ProgramLoaded &&
+                this.state !== BlinkState.ProgramStopped
+            ) {
+                this.module.blinkenlibClearInput()
+            }
             this.stopReason = null
             this.setState(BlinkState.ProgramRunning)
-            this.setEmulationArgs('/program', this.defaultArgc, this.defaultArgv)
-            this.module[method]()
-        } catch {
-            this.stopReason = { loadFail: true, exitCode: 0, details: 'invalid ELF', kind: 'load-fail' }
+            resetFileSystem(this.module.FS, this.skeleton)
+            this.projectMountUsed = this.projectMount !== null
+            if (this.programBytes) this.writeExecutableSync(PROGRAM, this.programBytes)
+            this.setEmulationArgs(PROGRAM, this.defaultArgc, this.defaultArgv)
+            this.module._blinkenlib_starti()
+            this.checkHostError()
+            this.module.FS.unlink(PROGRAM)
+            if (method === '_blinkenlib_run') {
+                this.module._blinkenlib_continue()
+                this.checkHostError()
+            }
+        } catch (error) {
+            const cause = this.module.blinkHostError ?? error
+            delete this.module.blinkHostError
+            this.stopReason = {
+                loadFail: true,
+                exitCode: 0,
+                details: cause instanceof Error ? cause.message : String(cause),
+                kind: 'load-fail'
+            }
             this.setState(BlinkState.ProgramStopped)
         }
     }
 
-    private async writeExecutable(path: string, data: Uint8Array): Promise<void> {
-        this.writeExecutableSync(path, data)
+    /** Mount a one-run capability after Build and before the first instruction (or loader). */
+    mountProjectFileSystem(capability: X86ProjectFileSystem | null): void {
+        if (
+            this.state === BlinkState.Assembling ||
+            this.state === BlinkState.Linking ||
+            this.state === BlinkState.NotReady ||
+            this.isWaiting() ||
+            this.resumeScheduled ||
+            (this.programSources && this.state !== BlinkState.ProgramLoaded)
+        )
+            throw new Error('Cannot change the x86 Project FileSystem while a program is active')
+        this.detachProjectFileSystem()
+        if (capability) {
+            this.projectMount = new ProjectFileSystemMount(this.module, capability, () =>
+                this.getCurrentInstructionSerial()
+            )
+        }
+    }
+
+    private detachProjectFileSystem(): void {
+        this.projectMount?.detach()
+        this.projectMount = null
+        this.projectMountUsed = false
     }
 
     private writeExecutableSync(path: string, data: Uint8Array): void {
@@ -865,33 +1146,80 @@ export class BlinkRuntime {
         this.module.blinkenlibSetEmulationArgs(progname, argc, argv)
     }
 
+    /**
+     * Runs the assembler or the linker inside the wasm. The report gets the command first, the
+     * way a shell echoes it, so it says which tool wrote what follows; neither reaches the
+     * `stdout` and `stderr` callbacks, which are the program's.
+     */
+    private runTool(progname: string, command: string): void {
+        this.clearWaitTransport()
+        ++this.generation
+        this.programSources = false
+        this.assemblerLogs += `\n$ ${command}\n`
+        // Written each time: a program may have left a file of that name.
+        const tool = this.tools.get(progname)
+        if (tool) this.writeExecutableSync(progname, tool)
+        this.setEmulationArgs(progname, command, '')
+        this.module._blinkenlib_run_fast()
+    }
+
     private configureRunControls(options: BlinkRunOptions): void {
         const limit = options.limit ?? 0
         this.module.blinkenlibSetRunControls(
             BigInt(limit),
-            (options.breakpointAddresses ?? []).map((address) => address.toString()),
+            (options.breakpointAddresses ?? []).map((address) => address.toString())
         )
     }
 
-    private collectAssemblerLog(charCode: number): void {
-        if (this.state !== BlinkState.Assembling && this.state !== BlinkState.Linking) return
-        const character = String.fromCharCode(charCode)
-        this.assemblerLogs += character
-        if (this.state === BlinkState.Linking && this.linkerLogs !== null) this.linkerLogs += character
+    /**
+     * What a program wrote to the terminal, `length` bytes at `pointer` in the wasm heap: one
+     * write, which the host receives as one call. The assembler's and the linker's go to the
+     * report instead.
+     */
+    private handleOutput(channel: number, pointer: number, length: number): void {
+        this.deliverOutput(channel, this.heapBytes().slice(pointer, pointer + length))
+    }
+
+    private deliverOutput(channel: number, bytes: Uint8Array): void {
+        if (this.state === BlinkState.Assembling || this.state === BlinkState.Linking) {
+            this.collectToolOutput(bytes)
+            return
+        }
+        const callback = channel === STDERR_CHANNEL ? this.callbacks.stderr : this.callbacks.stdout
+        // A handler that throws must not unwind the wasm in the middle of a system call; it is
+        // reported as an asynchronous callback's failure is.
+        try {
+            observeCallbackResult(callback(bytes))
+        } catch (error) {
+            observeCallbackResult(Promise.reject(error))
+        }
+    }
+
+    /** A tool's output, a character per byte, as the diagnostics parsers read it. */
+    private collectToolOutput(bytes: Uint8Array): void {
+        let text = ''
+        for (let index = 0; index < bytes.length; index += 8192) {
+            text += String.fromCharCode(...bytes.subarray(index, index + 8192))
+        }
+        this.assemblerLogs += text
+        if (this.state === BlinkState.Linking && this.linkerLogs !== null) this.linkerLogs += text
     }
 
     private handleSignal(signal: number, code: number): void {
-        if (signal !== SIGNALS.SIGTRAP) {
+        if (signal !== SIGTRAP || !BLINK_EVENT_CODES.has(code)) {
+            // A signal no handler took, which ends the program as Linux's default action does: a
+            // shell reports it as 128 plus the signal's number.
             const exitCode = 128 + signal
-            const signalInfo = SIGNAL_INFO[signal]
+            const info = describeSignal(signal, code)
             this.stopReason = {
                 loadFail: false,
                 exitCode,
                 kind: 'signal',
-                details: signalInfo
-                    ? `Program terminated with Exit(${exitCode}) due to signal ${signalInfo.name}: ${signalInfo.description}`
-                    : `Program terminated with Exit(${exitCode}) due to signal ${signal}`,
+                signal: info,
+                details: `Program terminated with Exit(${exitCode}) due to signal ${info.name}: ${info.description}`
             }
+            // what was typed for the run is not for the next one
+            this.module.blinkenlibClearInput()
             this.setState(BlinkState.ProgramStopped)
             observeCallbackResult(this.callbacks.signal(signal, code))
             return
@@ -899,22 +1227,93 @@ export class BlinkRuntime {
 
         if (code === SIGTRAP_CODES.BLINK_PREEMPT) {
             this.resumeScheduled = true
+            const generation = this.generation
             this.scheduler(() => {
+                if (generation !== this.generation) return
                 this.resumeScheduled = false
                 this.module._blinkenlib_preempt_resume()
+                this.checkHostError()
             })
             return
         }
 
+        if (code === SIGTRAP_CODES.BLINK_WAIT) {
+            if (this.module.blinkHostError !== undefined) return
+            this.clearWaitTransport()
+            const deadline = this.module._blinkenlib_wait_deadline()
+            const clock = this.module._blinkenlib_wait_clock()
+            const request: X86WaitRequest = {
+                clock,
+                deadlineNanoseconds: deadline < 0n ? null : deadline,
+                remainingMilliseconds:
+                    deadline < 0n
+                        ? null
+                        : Math.max(0, Number(deadline) / 1e6 - this.hostNow(clock)),
+                acceptsInput: Boolean(this.module._blinkenlib_wait_input()),
+                instructionSerial: this.getCurrentInstructionSerial()!
+            }
+            this.waitRequest = request
+            this.waitResumeState = this.programSources ? BlinkState.ProgramRunning : this.state
+            if (this.programSources)
+                this.stopReason = {
+                    loadFail: false,
+                    exitCode: 0,
+                    kind: 'wait',
+                    details: 'program is waiting'
+                }
+            if (this.programSources) {
+                this.setState(BlinkState.ProgramWaitPause)
+                observeCallbackResult(this.callbacks.waitRequest(request))
+                if (this.state !== BlinkState.ProgramWaitPause) return
+            }
+            const controller = new AbortController()
+            this.waitController = controller
+            if (this.programSources && this.environment.wait) {
+                const timerDeadline = this.module._blinkenlib_timer_deadline()
+                if (timerDeadline >= 0n)
+                    this.waitTimer = setTimeout(
+                        () => {
+                            if (!controller.signal.aborted) this.resumeWait()
+                        },
+                        Math.min(
+                            2147483647,
+                            Math.ceil(Math.max(0, Number(timerDeadline) / 1e6 - this.hostNow(1)))
+                        )
+                    )
+                Promise.resolve()
+                    .then(() => {
+                        if (!controller.signal.aborted)
+                            return this.environment.wait!(request, controller.signal)
+                    })
+                    .then(
+                        () => {
+                            if (!controller.signal.aborted) this.resumeWait()
+                        },
+                        () => {
+                            if (!controller.signal.aborted) this.cancelWait()
+                        }
+                    )
+            } else if (request.remainingMilliseconds !== null) {
+                this.waitTimer = setTimeout(
+                    () => {
+                        if (!controller.signal.aborted) this.resumeWait()
+                    },
+                    Math.min(2147483647, Math.ceil(request.remainingMilliseconds))
+                )
+            }
+        }
         if (code === SIGTRAP_CODES.BLINK_FAKE_TTY) {
             this.stopReason = {
                 loadFail: false,
                 exitCode: 0,
                 kind: 'input',
-                details: 'program is waiting for input',
+                details: 'program is waiting for input'
             }
             this.setState(BlinkState.ProgramReadlinePause)
-            observeCallbackResult(this.callbacks.inputRequest({ maxBytes: this.getInputMaxBytes() }))
+            this.scheduleInputTimer()
+            observeCallbackResult(
+                this.callbacks.inputRequest({ maxBytes: this.getInputMaxBytes() })
+            )
         }
 
         if (code === SIGTRAP_CODES.BLINK_BREAKPOINT || code === SIGTRAP_CODES.BLINK_RUN_LIMIT) {
@@ -931,7 +1330,7 @@ export class BlinkRuntime {
                 address: stop.address,
                 lineNumber: location?.line,
                 file: location?.path,
-                executedInstructions: stop.executedInstructions,
+                executedInstructions: stop.executedInstructions
             }
             this.setState(BlinkState.ProgramPaused)
         }
@@ -949,12 +1348,15 @@ export class BlinkRuntime {
             return
         }
 
+        // The wasm keeps the status as a parent sees it, its low eight bits.
         this.stopReason = {
             loadFail: false,
             exitCode: code,
             kind: 'exit',
-            details: `program terminated with Exit(${code})`,
+            details: `program terminated with Exit(${code})`
         }
+        // what was typed for the run is not for the next one
+        this.module.blinkenlibClearInput()
         this.setState(BlinkState.ProgramStopped)
     }
 
@@ -974,16 +1376,14 @@ export class BlinkRuntime {
         }
 
         if (!this.mode.binaries.linker) {
-            this.module.FS.chmod('/program', 0o777)
-            this.setState(BlinkState.ProgramLoaded)
+            this.takeProgram()
             return
         }
 
         this.beginLinking()
-        this.scheduler(() => {
-            this.setEmulationArgs('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '', '')
-            this.module._blinkenlib_run_fast()
-        })
+        this.scheduler(() =>
+            this.runTool('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '')
+        )
     }
 
     private handleLinkerExit(code: number): void {
@@ -991,7 +1391,13 @@ export class BlinkRuntime {
             this.setState(BlinkState.Ready)
             return
         }
-        this.module.FS.chmod('/program', 0o777)
+        this.takeProgram()
+    }
+
+    /** Keeps the executable the build wrote, which every start of the program writes out again. */
+    private takeProgram(): void {
+        this.module.FS.chmod(PROGRAM, 0o777)
+        this.programBytes = Uint8Array.from(this.module.FS.readFile(PROGRAM) as Uint8Array)
         this.setState(BlinkState.ProgramLoaded)
     }
 
@@ -1008,7 +1414,8 @@ export class BlinkRuntime {
             (state) =>
                 state === BlinkState.ProgramStopped ||
                 state === BlinkState.ProgramReadlinePause ||
-                state === BlinkState.ProgramPaused,
+                state === BlinkState.ProgramWaitPause ||
+                state === BlinkState.ProgramPaused
         )
     }
 
@@ -1044,10 +1451,9 @@ export class BlinkRuntime {
     }
 
     private tryReadSourceMap(): SourceMap | null {
+        if (!this.programBytes) return null
         try {
-            const file = this.module.FS.readFile('/program', { encoding: 'binary' })
-            const bytes = typeof file === 'string' ? new TextEncoder().encode(file) : file
-            return parseSourceMap(bytes)
+            return parseSourceMap(this.programBytes)
         } catch {
             return null
         }
@@ -1060,20 +1466,22 @@ function resolveAssemblerMode(mode: AssemblerMode | AssemblerId | undefined): As
     return mode
 }
 
-function withDefaultCallbacks(callbacks: BlinkRuntimeCallbacks = {}): Required<BlinkRuntimeCallbacks> {
+function withDefaultCallbacks(
+    callbacks: BlinkRuntimeCallbacks = {}
+): Required<BlinkRuntimeCallbacks> {
     return {
-        stdin: callbacks.stdin ?? (() => null),
         stdout: callbacks.stdout ?? (() => undefined),
         stderr: callbacks.stderr ?? (() => undefined),
         signal: callbacks.signal ?? (() => undefined),
         stateChange: callbacks.stateChange ?? (() => undefined),
         inputRequest: callbacks.inputRequest ?? (() => undefined),
+        waitRequest: callbacks.waitRequest ?? (() => undefined)
     }
 }
 
 async function awaitBlinkenlibModule(
     modulePromise: Promise<BlinkenlibModule>,
-    wasmInitStarted: Promise<Promise<WebAssembly.Instance>>,
+    wasmInitStarted: Promise<Promise<WebAssembly.Instance>>
 ): Promise<BlinkenlibModule> {
     const wasmInit = await Promise.race([modulePromise.then(() => null), wasmInitStarted])
     if (!wasmInit) return modulePromise
@@ -1097,7 +1505,10 @@ function defer(): Promise<void> {
  * A build succeeded when nothing in it was an error. Warnings ride along on both
  * outcomes, because a program that assembles is exactly where they matter.
  */
-function toCompileResult(diagnostics: X86CompilationDiagnostic[], report: string): X86CompileResult {
+function toCompileResult(
+    diagnostics: X86CompilationDiagnostic[],
+    report: string
+): X86CompileResult {
     const errors = diagnostics.filter((diagnostic) => diagnostic.severity === 'error')
     if (errors.length === 0) return { ok: true, report, diagnostics }
     return { ok: false, errors, report, diagnostics }
@@ -1109,12 +1520,22 @@ function copyX86Project(project: X86Project): X86Project {
         Object.fromEntries(
             Object.entries(files).map(([path, contents]) => [
                 path,
-                contents instanceof Uint8Array ? contents.slice() : contents,
-            ]),
+                contents instanceof Uint8Array ? contents.slice() : contents
+            ])
         )
     return {
         entry: project.entry,
         files: copy(project.files),
-        ...(project.library ? { library: copy(project.library) } : {}),
+        ...(project.library ? { library: copy(project.library) } : {})
     }
+}
+
+function hostNow(clock: number): number {
+    return clock === 0 || clock === 5 ? Date.now() : performance.now()
+}
+function hostRandom(length: number): Uint8Array {
+    const bytes = new Uint8Array(length)
+    for (let i = 0; i < length; i += 65536)
+        crypto.getRandomValues(bytes.subarray(i, Math.min(length, i + 65536)))
+    return bytes
 }

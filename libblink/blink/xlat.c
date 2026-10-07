@@ -761,7 +761,21 @@ int XlatClock(int x, clock_t *clock) {
     CASE(CLOCK_MONOTONIC_LINUX, res = CLOCK_MONOTONIC);
     CASE(CLOCK_PROCESS_CPUTIME_ID_LINUX, res = CLOCK_PROCESS_CPUTIME_ID);
     CASE(CLOCK_THREAD_CPUTIME_ID_LINUX, res = CLOCK_THREAD_CPUTIME_ID);
-#ifndef DISABLE_NONPOSIX
+#if !defined(DISABLE_NONPOSIX) && defined(__EMSCRIPTEN__)
+    // Emscripten's libc keeps only a wall clock and a monotonic one, and
+    // refuses linux's other clock ids, so each reads the host clock that
+    // keeps its time: the coarse clocks are their fine ones, a browser has
+    // no clock adjustment for the raw one to skip, nor a suspend for the
+    // boot time to count, and TAI is the wall clock, as linux keeps it
+    // until something sets the kernel's TAI offset
+    CASE(CLOCK_MONOTONIC_RAW_LINUX, res = CLOCK_MONOTONIC);
+    CASE(CLOCK_REALTIME_COARSE_LINUX, res = CLOCK_REALTIME);
+    CASE(CLOCK_MONOTONIC_COARSE_LINUX, res = CLOCK_MONOTONIC);
+    CASE(CLOCK_BOOTTIME_LINUX, res = CLOCK_MONOTONIC);
+    CASE(CLOCK_REALTIME_ALARM_LINUX, res = CLOCK_REALTIME);
+    CASE(CLOCK_BOOTTIME_ALARM_LINUX, res = CLOCK_MONOTONIC);
+    CASE(CLOCK_TAI_LINUX, res = CLOCK_REALTIME);
+#elif !defined(DISABLE_NONPOSIX)
 #ifdef CLOCK_REALTIME_COARSE
     CASE(CLOCK_REALTIME_COARSE_LINUX, res = CLOCK_REALTIME_COARSE);
 #elif defined(CLOCK_REALTIME_FAST)

@@ -232,8 +232,8 @@ export function ldDiagnostics(
         // `ld` prefixes some of its messages with its own name and others not at all; dropping it
         // keeps a prefixed location from being read as part of the file path.
         const text = line.trim().replace(/^\/linker:\s*/, '')
-        // Blink echoes the command it is about to run, and a note ending in a colon belongs to
-        // the message on the line after it.
+        // The report carries the command each tool ran, as a shell echoes it, and a note ending in
+        // a colon belongs to the message on the line after it.
         if (!text || text.startsWith('$ ') || text.endsWith(':')) continue
 
         // An object with no source path after it, `/program.a(u1.o):(.data+0x8):`, names no File

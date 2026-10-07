@@ -57,6 +57,7 @@
 #include "blink/case.h"
 #include "blink/checked.h"
 #include "blink/debug.h"
+#include "blink/debughistory.h"
 #include "blink/endian.h"
 #include "blink/flags.h"
 #include "blink/errno.h"
@@ -78,6 +79,9 @@
 #include "blink/stats.h"
 #include "blink/strace.h"
 #include "blink/swap.h"
+#include "blink/terminal.h"
+#include "blink/environment.h"
+#include "blink/browserpipe.h"
 #include "blink/thread.h"
 #include "blink/timespec.h"
 #include "blink/util.h"
@@ -123,7 +127,17 @@
 #define SYSARGS5 , di, si, dx, r0, r8
 #define SYSARGS6 , di, si, dx, r0, r8, r9
 
+// Every arm of OpSyscall()'s dispatch table also leaves a description of
+// itself in the blink_syscalls data section, which GetSyscalls() reads: the
+// list a host is given is the table the dispatcher was compiled from, so an
+// arm the configuration leaves out leaves no description either.
+#define DESCRIBE_SYSCALL(arity, ordinal, name)                     \
+  static const struct SyscallDescription kSyscall##ordinal         \
+      __attribute__((__used__, __section__("blink_syscalls"))) = { \
+          ordinal, arity, name};
+
 #define SYSCALL(arity, ordinal, name, func, signature)            \
+  DESCRIBE_SYSCALL(arity, ordinal, name)                          \
   case ordinal:                                                   \
     if (STRACE && FLAG_strace >= (signature)[0]) {                \
       Strace(m, name, true, &(signature)[1] SYSARGS##arity);      \
@@ -266,13 +280,27 @@ bool DeliverSignalRecursively(struct Machine *m, int sig) {
 bool CheckInterrupt(struct Machine *m, bool restartable) {
   bool res, restart;
   int sig, delivered;
+#ifdef __EMSCRIPTEN__
+  u64 syscall_number = Read64(m->ax);
+  u64 syscall_pc = m->ip - 2;
+#endif
   // an actual i/o call just received EINTR from the kernel
 HandleSomeMoreInterrupts:
   // determine if there's any signals pending for our guest
   Put64(m->ax, -EINTR_LINUX);
   if ((sig = ConsumeSignal(m, &delivered, &restart))) {
-    TerminateSignal(m, sig, 0);
+    TerminateSignal(m, sig, m->signal_codes[sig - 1]);
   }
+#ifdef __EMSCRIPTEN__
+  /* The handler's first instruction runs in runLoop, with its own serial and
+   * count. Recursive SignalActor execution would hide all of its effects. */
+  res = !!(sig || delivered);
+  if (delivered && restart && restartable)
+    RestartSignalSyscall(m, syscall_number, syscall_pc);
+  if (res) errno = EINTR;
+  m->interrupted = res;
+  return res;
+#endif
   if (delivered) {
     if (DeliverSignalRecursively(m, delivered)) {
       if (restart && restartable) {
@@ -356,7 +384,9 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
    * Every trapped exit must halt, including one replayed after an undo. */
   if (m->system->trapexit) {
     m->system->exited = true;
-    m->system->exitcode = rc;
+    /* A parent sees only the low eight bits of the status, as wait(2)'s
+     * WEXITSTATUS() does on Linux: exit(256) is exit(0), exit(-1) is 255. */
+    m->system->exitcode = rc & 0xff;
     HaltMachine(m, kMachineExitTrap);
   }
   ClearChildTid(m);
@@ -903,9 +933,9 @@ static i32 SysSetRobustList(struct Machine *m, i64 head_addr, u64 len) {
   return 0;
 }
 
+// This process is the only one there is, so any other pid names nobody.
 static int ValidateAffinityPid(struct Machine *m, int pid) {
-  if (pid < 0) return esrch();
-  if (pid && pid != m->tid && pid != m->system->pid) return eperm();
+  if (pid && pid != m->tid && pid != m->system->pid) return esrch();
   return 0;
 }
 
@@ -964,7 +994,9 @@ static int SysSchedGetaffinity(struct Machine *m,  //
   unsigned i, rc, count;
   count = GetCpuCount();
   rc = ROUNDUP(count, 64) / 8;
-  if (cpusetsize < rc) return einval();
+  // linux copies whole longs, so it refuses a size that is not a multiple
+  // of one, as well as one too small for the cpus there are
+  if (cpusetsize < rc || (cpusetsize & 7)) return einval();
   if (!(mask = (u8 *)AddToFreeList(m, calloc(1, rc)))) return -1;
   count = MIN(count, rc * 8);
   for (i = 0; i < count; ++i) {
@@ -994,6 +1026,29 @@ static int SysPrctlSetTsc(struct Machine *m, i64 arg2) {
   }
 }
 
+// PR_SET_NAME: the name is at most 15 bytes, copied up to its terminator
+// one byte at a time, as strncpy_from_user() reads no further than it must.
+static int SysPrctlSetName(struct Machine *m, i64 addr) {
+  int i;
+  char name[16] = {0};
+  for (i = 0; i < 15; ++i) {
+    if (CopyFromUserRead(m, name + i, addr + i, 1) == -1) return -1;
+    if (!name[i]) break;
+  }
+  memcpy(m->system->comm, name, sizeof(name));
+  return 0;
+}
+
+static int SysPrctlGetName(struct Machine *m, i64 addr) {
+  return CopyToUserWrite(m, addr, m->system->comm, sizeof(m->system->comm));
+}
+
+static int SysPrctlGetPdeathsig(struct Machine *m, i64 addr) {
+  u8 word[4];
+  Write32(word, m->system->pdeathsig);
+  return CopyToUserWrite(m, addr, word, sizeof(word));
+}
+
 static int SysPrctl(struct Machine *m, int op, i64 arg2, i64 arg3, i64 arg4,
                     i64 arg5) {
   switch (op) {
@@ -1001,6 +1056,25 @@ static int SysPrctl(struct Machine *m, int op, i64 arg2, i64 arg3, i64 arg4,
       return SysPrctlGetTsc(m, arg2);
     case PR_SET_TSC_LINUX:
       return SysPrctlSetTsc(m, arg2);
+    // the task's name, its parent death signal and its dumpability are
+    // state of the process alone, kept as linux keeps them; the death
+    // signal is never sent, since the process has no parent to lose
+    case PR_SET_NAME_LINUX:
+      return SysPrctlSetName(m, arg2);
+    case PR_GET_NAME_LINUX:
+      return SysPrctlGetName(m, arg2);
+    case PR_SET_PDEATHSIG_LINUX:
+      if ((u64)arg2 > 64) return einval();
+      m->system->pdeathsig = arg2;
+      return 0;
+    case PR_GET_PDEATHSIG_LINUX:
+      return SysPrctlGetPdeathsig(m, arg2);
+    case PR_GET_DUMPABLE_LINUX:
+      return !m->system->undumpable;
+    case PR_SET_DUMPABLE_LINUX:
+      if (arg2 != 0 && arg2 != 1) return einval();
+      m->system->undumpable = !arg2;
+      return 0;
 #ifdef PR_CAPBSET_DROP
     case PR_CAPBSET_DROP_LINUX:
       return prctl(PR_CAPBSET_DROP, arg2, arg3, arg4, arg5);
@@ -1012,8 +1086,15 @@ static int SysPrctl(struct Machine *m, int op, i64 arg2, i64 arg3, i64 arg4,
     case PR_SET_NO_NEW_PRIVS_LINUX:
       return prctl(PR_SET_NO_NEW_PRIVS, arg2, arg3, arg4, arg5);
 #else
+    // with no host to restrict, the flag is only kept: nothing this
+    // process can do would grant it privileges anyway, there being no exec
     case PR_SET_NO_NEW_PRIVS_LINUX:
-      return einval();
+      if (arg2 != 1 || arg3 || arg4 || arg5) return einval();
+      m->system->nonewprivs = true;
+      return 0;
+    case PR_GET_NO_NEW_PRIVS_LINUX:
+      if (arg2 || arg3 || arg4 || arg5) return einval();
+      return m->system->nonewprivs;
 #endif
     case PR_GET_SECCOMP_LINUX:
     case PR_SET_SECCOMP_LINUX:
@@ -1091,50 +1172,69 @@ static int SysMadvise(struct Machine *m, i64 addr, u64 len, int advice) {
   return 0;
 }
 
+// Moves the program break as Linux's brk(2) does: the break is kept exactly
+// where it is asked to go, with only the pages under it mapped, a request
+// below where the heap started, or reaching within a page of memory already
+// mapped, is refused by leaving the break where it was, and either way the
+// break is returned.
 static i64 SysBrk(struct Machine *m, i64 addr) {
-  i64 rc, size;
+  i64 rc, oldend, newend;
   long pagesize;
+  struct System *s = m->system;
   BEGIN_NO_PAGE_FAULTS;
-  LOCK(&m->system->mmap_lock);
-  MEM_LOGF("brk(%#" PRIx64 ") currently %#" PRIx64, addr, m->system->brk);
+  LOCK(&s->mmap_lock);
+  MEM_LOGF("brk(%#" PRIx64 ") currently %#" PRIx64, addr, s->brk);
+  // the loader leaves the break past the program image, and nothing but
+  // this function moves it, so the first call sees where the heap starts
+  if (!s->brkstart) s->brkstart = s->brk;
   pagesize = FLAG_pagesize;
-  addr = ROUNDUP(addr, pagesize);
-  if (addr >= kNullSize) {
-    if (addr > m->system->brk) {
-      size = addr - m->system->brk;
-      CleanseMemory(m->system, size);
-      if (m->system->rss < GetMaxRss(m->system)) {
-        if (size / 4096 + m->system->vss < GetMaxVss(m->system)) {
-          if (ReserveVirtual(m->system, m->system->brk, addr - m->system->brk,
-                             PAGE_FILE | PAGE_RW | PAGE_U | PAGE_XD, -1, 0, 0,
-                             0) != -1) {
-            if (!m->system->brkchanged) {
-              unassert(AddFileMap(m->system, m->system->brk,
-                                  addr - m->system->brk, "[heap]", -1));
-              m->system->brkchanged = true;
-            }
-            MEM_LOGF("increased break %" PRIx64 " -> %" PRIx64, m->system->brk,
-                     addr);
-            m->system->brk = addr;
+  if (addr < s->brkstart || addr < kNullSize ||
+      (addr > s->brkstart &&
+       !IsValidAddrSize(s->brkstart,
+                        ROUNDUP(addr, pagesize) - s->brkstart))) {
+    // linux won't move the break below the start of the heap, nor past
+    // the end of the address space
+    addr = s->brk;
+  }
+  oldend = ROUNDUP(s->brk, pagesize);
+  newend = ROUNDUP(addr, pagesize);
+  if (newend == oldend) {
+    s->brk = addr;
+  } else if (newend < oldend) {
+    if (FreeVirtual(s, newend, oldend - newend) != -1) {
+      s->brk = addr;
+    }
+  } else if (!IsFullyUnmapped(s, oldend, newend - oldend + 4096)) {
+    // linux keeps a page free between the heap and the next mapping
+    LOGF("brk(%#" PRIx64 ") would come too close to a mapping", addr);
+  } else {
+    CleanseMemory(s, newend - oldend);
+    if (s->rss < GetMaxRss(s)) {
+      if ((newend - oldend) / 4096 + s->vss < GetMaxVss(s)) {
+        if (ReserveVirtual(s, oldend, newend - oldend,
+                           PAGE_FILE | PAGE_RW | PAGE_U | PAGE_XD, -1, 0, 0,
+                           0) != -1) {
+          if (!s->brkchanged) {
+            unassert(AddFileMap(s, s->brkstart, newend - s->brkstart,
+                                "[heap]", -1));
+            s->brkchanged = true;
           }
-        } else {
-          LOGF("not enough virtual memory (%lx / %#lx pages) to map size "
-               "%#" PRIx64,
-               m->system->vss, GetMaxVss(m->system), size);
+          MEM_LOGF("increased break %" PRIx64 " -> %" PRIx64, s->brk, addr);
+          s->brk = addr;
         }
       } else {
-        LOGF("ran out of resident memory (%#lx / %#lx pages)", m->system->rss,
-             GetMaxRss(m->system));
+        LOGF("not enough virtual memory (%lx / %#lx pages) to map size "
+             "%#" PRIx64,
+             s->vss, GetMaxVss(s), newend - oldend);
       }
-    } else if (addr < m->system->brk) {
-      if (FreeVirtual(m->system, addr, m->system->brk - addr) != -1) {
-        m->system->brk = addr;
-      }
+    } else {
+      LOGF("ran out of resident memory (%#lx / %#lx pages)", s->rss,
+           GetMaxRss(s));
     }
   }
-  rc = m->system->brk;
-  unassert(CheckMemoryInvariants(m->system));
-  UNLOCK(&m->system->mmap_lock);
+  rc = s->brk;
+  unassert(CheckMemoryInvariants(s));
+  UNLOCK(&s->mmap_lock);
   END_NO_PAGE_FAULTS;
   return rc;
 }
@@ -1162,6 +1262,12 @@ int GetOflags(struct Machine *m, int fildes) {
   UNLOCK(&m->system->fds.lock);
   return oflags;
 }
+
+#ifdef __EMSCRIPTEN__
+EM_JS(bool, IsProjectDescriptor, (int fd), {
+  return FS.getStream(fd)?.node?.projectPath !== undefined;
+});
+#endif
 
 static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
                        int flags, int fildes, i64 offset) {
@@ -1204,6 +1310,11 @@ static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
       errno = EACCES;
       return -1;
     }
+#ifdef __EMSCRIPTEN__
+    // The session has no mapping lifetime or msync contract. Refuse before MAP_FIXED can
+    // remove any existing map, rather than letting libc's failed mmap panic in ReserveVirtual.
+    if (IsProjectDescriptor(fildes)) return enodev();
+#endif
   }
   newautomap = -1;
   fixedmap = false;
@@ -1367,6 +1478,7 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
     LOCK(&m->system->fds.lock);
     if ((fd = GetFd(&m->system->fds, newfildes))) {
       dll_remove(&m->system->fds.list, &fd->elem);
+      BrowserPipeForget(newfildes);
       FreeFd(fd);
     }
     unassert(fd = GetFd(&m->system->fds, fildes));
@@ -1396,6 +1508,7 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
     LOCK(&m->system->fds.lock);
     if ((fd = GetFd(&m->system->fds, newfildes))) {
       dll_remove(&m->system->fds.list, &fd->elem);
+      BrowserPipeForget(newfildes);
       FreeFd(fd);
     }
     unassert(fd = GetFd(&m->system->fds, fildes));
@@ -2340,64 +2453,109 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   return rc;
 }
 
+// A read writes straight into guest pages, so the bytes it is about to
+// replace are journaled before the host reads into them, a record per guest
+// range, each of its own so that nothing merges into an earlier write. Once
+// the read is done the records are cut to the bytes it wrote, in range
+// order, and the ones it never reached go: the history then holds what the
+// read changed, and nothing when it read nothing.
+struct ReadJournal {
+  u32 count, used;
+  bool truncated;
+};
+
+static void BeginReadJournal(struct Machine *m, struct ReadJournal *journal) {
+  journal->count = m->writeoldcount;
+  journal->used = m->writeoldbytesused;
+  journal->truncated = m->writeoldtruncated;
+}
+
+static void JournalReadRange(struct Machine *m, i64 addr, u64 size) {
+  SetWriteAddrUnmerged(m, addr, MIN(size, 0xffffffffu));
+}
+
+static void EndReadJournal(struct Machine *m, struct ReadJournal *journal,
+                           i64 addr, i64 rc) {
+  u32 i;
+  u64 left;
+  bool truncated;
+  struct MachineWriteRecord *record;
+  if (rc > 0) {
+    m->writeaddr = addr;
+    m->writesize = MIN(rc, 0xffffffffu);
+  } else {
+    m->writesize = 0;
+  }
+  if (!m->recordwrites) return;
+  left = rc > 0 ? rc : 0;
+  truncated = journal->truncated;
+  for (i = journal->count; i < m->writeoldcount && left; ++i) {
+    record = &m->writeold[i];
+    record->size = MIN(record->size, left);
+    record->oldsize = MIN(record->oldsize, record->size);
+    record->truncated = record->oldsize < record->size;
+    truncated |= record->truncated;
+    left -= record->size;
+  }
+  m->writeoldcount = i;
+  if (i > journal->count) {
+    record = &m->writeold[i - 1];
+    m->writeoldbytesused = record->oldoffset + record->oldsize;
+  } else {
+    m->writeoldbytesused = journal->used;
+  }
+  // bytes read past the last range that has a record were never captured
+  m->writeoldtruncated = truncated || left;
+}
+
+// Whether `fildes` is the terminal, or -1 with EBADF when nothing is open
+// there.
+static int IsTerminalFildes(struct Machine *m, i32 fildes) {
+  int rc;
+  struct Fd *fd;
+  LOCK(&m->system->fds.lock);
+  rc = (fd = GetFd(&m->system->fds, fildes)) ? IsTerminalFd(fd) : -1;
+  UNLOCK(&m->system->fds.lock);
+  return rc;
+}
+
 static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   i64 rc;
   int oflags;
+  bool terminal;
   struct Fd *fd;
   struct Iovs iv;
+  struct ReadJournal journal;
   ssize_t (*readv_impl)(int, const struct iovec *, int);
   if (size > NUMERIC_MAX(size_t)) return eoverflow();
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
-    if (fildes == 0){
-      if(m->fakettycanhalt){
-        HaltMachine(m, kMachineFakeTTYtrap);
-      }else{
-        m->fakettycanhalt = true;
-      }
-    }
     unassert(readv_impl = fd->cb->readv);
-    oflags = fd->oflags;
+    oflags = BrowserPipeFlags(fildes, fd->oflags);
+    terminal = IsTerminalFd(fd);
   } else {
     readv_impl = 0;
     oflags = 0;
+    terminal = false;
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
   if ((oflags & O_ACCMODE) == O_WRONLY) return ebadf();
-  if (size) {
-    InitIovs(&iv);
-    if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
-      /* readv writes directly into guest pages. Capture the preimage before
-       * handing them to the host, then trim the journal to the actual read.
-       * The read takes a record of its own, so trimming touches no other. */
-      u32 oldcount = m->writeoldcount, oldused = m->writeoldbytesused;
-      bool oldtruncated = m->writeoldtruncated;
-      SetWriteAddrUnmerged(m, addr, MIN(size, 0xffffffffu));
-      RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
-      if (rc > 0) {
-        m->writeaddr = addr;
-        m->writesize = rc;
-        if (m->writeoldcount > oldcount) {
-          struct MachineWriteRecord *record = &m->writeold[oldcount];
-          record->size = rc;
-          record->oldsize = MIN(record->oldsize, rc);
-          record->truncated = record->oldsize < rc;
-          m->writeoldbytesused = oldused + record->oldsize;
-          m->writeoldtruncated = oldtruncated || record->truncated;
-        }
-      } else {
-        m->writeoldcount = oldcount;
-        m->writeoldbytesused = oldused;
-        m->writeoldtruncated = oldtruncated;
-        m->writesize = 0;
-      }
-    }
-    FreeIovs(&iv);
-  } else {
-    rc = 0;
+  if (!size) return 0;
+  // A read the terminal has nothing for halts here, before anything is set
+  // up or recorded, and starts over once the host has given it input.
+  if (terminal && !(oflags & O_NONBLOCK) && WaitForTerminalInput(m, size))
+    return eintr();
+  if (WaitForBrowserPipe(m, fildes, false, size, oflags)) return -1;
+  InitIovs(&iv);
+  if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
+    BeginReadJournal(m, &journal);
+    JournalReadRange(m, addr, size);
+    RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
+    EndReadJournal(m, &journal, addr, rc);
   }
+  FreeIovs(&iv);
   return rc;
 }
 
@@ -2412,7 +2570,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
     unassert(writev_impl = fd->cb->writev);
-    oflags = fd->oflags;
+    oflags = BrowserPipeFlags(fildes, fd->oflags);
   } else {
     writev_impl = 0;
     oflags = 0;
@@ -2421,6 +2579,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   if (!fd) return -1;
   if ((oflags & O_ACCMODE) == O_RDONLY) return ebadf();
   if (size) {
+    if (WaitForBrowserPipe(m, fildes, true, size, oflags)) return -1;
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
       RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
@@ -2458,14 +2617,22 @@ static long CheckFdAccess(struct Machine *m, i32 fildes, bool writable,
 static i64 SysPread(struct Machine *m, i32 fildes, i64 addr, u64 size,
                     u64 offset) {
   ssize_t rc;
+  int terminal;
   struct Iovs iv;
+  struct ReadJournal journal;
   if (size > NUMERIC_MAX(size_t)) return eoverflow();
+  // a terminal has no position to read at
+  if ((terminal = IsTerminalFildes(m, fildes)) == -1) return -1;
+  if (IsBrowserPipe(fildes)) return espipe();
+  if (terminal) return espipe();
   if (CheckFdAccess(m, fildes, false, EBADF) == -1) return -1;
   if (size) {
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
+      BeginReadJournal(m, &journal);
+      JournalReadRange(m, addr, size);
       RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
-      if (rc != -1) SetWriteAddr(m, addr, rc);
+      EndReadJournal(m, &journal, addr, rc);
     }
     FreeIovs(&iv);
   } else {
@@ -2477,8 +2644,12 @@ static i64 SysPread(struct Machine *m, i32 fildes, i64 addr, u64 size,
 static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
                      u64 offset) {
   ssize_t rc;
+  int terminal;
   struct Iovs iv;
   if (size > NUMERIC_MAX(size_t)) return eoverflow();
+  if ((terminal = IsTerminalFildes(m, fildes)) == -1) return -1;
+  if (IsBrowserPipe(fildes)) return espipe();
+  if (terminal) return espipe();
   if (CheckFdAccess(m, fildes, true, EBADF) == -1) return -1;
   if (size) {
     InitIovs(&iv);
@@ -2493,92 +2664,200 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
   return rc;
 }
 
-static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
-                      i64 offset, i32 flags) {
-  i64 rc;
+// How many bytes the guest's iovec array asks for in all, capped at
+// SSIZE_MAX, as Linux caps a vectored read; -1 with EFAULT for an array
+// outside memory and EINVAL for a negative length, as Linux checks them.
+static i64 GetGuestIovsSize(struct Machine *m, i64 iovaddr, u32 iovlen) {
+  u32 i;
+  u64 size, total;
+  const struct iovec_linux *iovs;
+  if (!iovlen) return 0;
+  if (!(iovs = (const struct iovec_linux *)SchlepR(
+            m, iovaddr, iovlen * sizeof(struct iovec_linux)))) {
+    return -1;
+  }
+  for (total = i = 0; i < iovlen; ++i) {
+    if ((size = Read64(iovs[i].len)) > NUMERIC_MAX(ssize_t)) return einval();
+    total = MIN(total + size, NUMERIC_MAX(ssize_t));
+  }
+  return total;
+}
+
+static void JournalGuestIovs(struct Machine *m, i64 iovaddr, u32 iovlen) {
+  u32 i;
+  const struct iovec_linux *iovs;
+  if (!m->recordwrites || !iovlen) return;
+  unassert((iovs = (const struct iovec_linux *)SchlepR(
+                m, iovaddr, iovlen * sizeof(struct iovec_linux))));
+  for (i = 0; i < iovlen; ++i) {
+    JournalReadRange(m, Read64(iovs[i].base), Read64(iovs[i].len));
+  }
+}
+
+static i64 GuestIovsBase(struct Machine *m, i64 iovaddr, u32 iovlen) {
+  const struct iovec_linux *iovs;
+  if (!iovlen) return 0;
+  if (!(iovs = (const struct iovec_linux *)SchlepR(
+            m, iovaddr, sizeof(struct iovec_linux)))) {
+    return 0;
+  }
+  return Read64(iovs[0].base);
+}
+
+static i64 Preadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+                  i64 offset) {
+  i64 rc, size;
   int oflags;
+  bool terminal;
   struct Fd *fd;
   struct Iovs iv;
+  struct ReadJournal journal;
   ssize_t (*readv_impl)(int, const struct iovec *, int);
-  if (flags) {
-    LOGF("%s flags not supported yet: %#" PRIx32, "preadv2", flags);
-    return einval();
-  }
   if (iovlen > IOV_MAX_LINUX) return einval();
+  if (offset < -1) return einval();
+  if (offset > NUMERIC_MAX(off_t)) return eoverflow();
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
     unassert(readv_impl = fd->cb->readv);
-    oflags = fd->oflags;
+    oflags = BrowserPipeFlags(fildes, fd->oflags);
+    terminal = IsTerminalFd(fd);
   } else {
     readv_impl = 0;
     oflags = 0;
+    terminal = false;
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
+  // a terminal has no position to read at
+  if ((terminal || IsBrowserPipe(fildes)) && offset != -1) return espipe();
   if ((oflags & O_ACCMODE) == O_WRONLY) return ebadf();
-  if (iovlen) {
-    InitIovs(&iv);
-    if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
-      if (iv.i) {
-        if (offset == -1) {
-          RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
-        } else if (offset < 0) {
-          return einval();
-        } else if (offset > NUMERIC_MAX(off_t)) {
-          return eoverflow();
-        } else {
-          RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
-        }
+  // nothing to read reads nothing, without waiting for the terminal
+  if ((size = GetGuestIovsSize(m, iovaddr, iovlen)) <= 0) return size;
+  // a read the terminal has nothing for halts here, as SysRead() does
+  if (terminal && !(oflags & O_NONBLOCK) && WaitForTerminalInput(m, size))
+    return eintr();
+  if (WaitForBrowserPipe(m, fildes, false, size, oflags)) return -1;
+  InitIovs(&iv);
+  if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
+    if (iv.i) {
+      BeginReadJournal(m, &journal);
+      JournalGuestIovs(m, iovaddr, iovlen);
+      if (offset == -1) {
+        RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
       } else {
-        rc = 0;
+        RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
       }
+      EndReadJournal(m, &journal, GuestIovsBase(m, iovaddr, iovlen), rc);
+    } else {
+      rc = 0;
     }
-    FreeIovs(&iv);
-  } else {
-    rc = 0;
   }
+  FreeIovs(&iv);
   return rc;
 }
 
-static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
-                       i64 offset, i32 flags) {
+// Writes at `offset`, or at the file position when it is -1. RWF_APPEND and
+// RWF_NOAPPEND choose where the bytes land as Linux does: at the end of the
+// file whatever `offset` says, or at `offset` even on an O_APPEND file.
+static i64 Pwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+                   i64 offset, i32 flags) {
   i64 rc;
   int oflags;
+  bool terminal;
+  off_t at, end;
+  struct stat st;
   struct Fd *fd;
   struct Iovs iv;
   ssize_t (*writev_impl)(int, const struct iovec *, int);
-  if (flags) {
-    LOGF("%s flags not supported yet: %#" PRIx32, "pwritev2", flags);
-    return einval();
-  }
   if (iovlen > IOV_MAX_LINUX) return einval();
+  if (offset < -1) return einval();
+  if (offset > NUMERIC_MAX(off_t)) return eoverflow();
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
     unassert(writev_impl = fd->cb->writev);
-    oflags = fd->oflags;
+    oflags = BrowserPipeFlags(fildes, fd->oflags);
+    terminal = IsTerminalFd(fd);
   } else {
     writev_impl = 0;
     oflags = 0;
+    terminal = false;
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
+  if (IsBrowserPipe(fildes) && offset != -1) return espipe();
+  if (terminal) {
+    // a terminal has no position: an offset is ESPIPE, and RWF_APPEND and
+    // RWF_NOAPPEND change nothing
+    if (offset != -1) return espipe();
+    flags &= ~(RWF_APPEND_LINUX | RWF_NOAPPEND_LINUX);
+  }
   if ((oflags & O_ACCMODE) == O_RDONLY) return ebadf();
+  i64 pipe_size = GetGuestIovsSize(m, iovaddr, iovlen);
+  if (pipe_size < 0) return pipe_size;
+  if (WaitForBrowserPipe(m, fildes, true, pipe_size, oflags)) return -1;
   if (iovlen) {
     InitIovs(&iv);
     if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
       if (iv.i) {
-        if (offset == -1) {
+        if (flags & RWF_APPEND_LINUX) {
+          if (offset == -1) {
+            // like a write to an O_APPEND file: it moves the file position
+            if ((at = VfsSeek(fildes, 0, SEEK_CUR)) != -1 &&
+                VfsSeek(fildes, 0, SEEK_END) != -1) {
+              RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
+              if (rc <= 0) {
+                int error = errno;
+                if (VfsSeek(fildes, at, SEEK_SET) == -1) {
+#ifdef __EMSCRIPTEN__
+                  DebugHistoryMarkIrreversible();
+#endif
+                  if (!rc) {
+                    rc = -1;
+                    error = errno;
+                  }
+                }
+                errno = error;
+              }
+            } else {
+              rc = -1;
+            }
+          } else if (VfsFstat(fildes, &st) != -1) {
+            RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, st.st_size));
+          } else {
+            rc = -1;
+          }
+        } else if ((flags & RWF_NOAPPEND_LINUX) && (oflags & O_APPEND)) {
+          // Suppress the shared host append flag only for this write, then
+          // restore it and the position Linux would leave. A failed write's
+          // errno must survive both cleanup calls.
+          if ((at = VfsSeek(fildes, 0, SEEK_CUR)) != -1 &&
+              VfsFcntl(fildes, F_SETFL, oflags & ~O_APPEND) != -1) {
+            int error;
+            RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i,
+                                        offset == -1 ? at : offset));
+            error = errno;
+            end = offset == -1 && rc != -1 ? at + rc : at;
+            if (VfsFcntl(fildes, F_SETFL, oflags) == -1 && rc != -1) {
+              rc = -1;
+              error = errno;
+            }
+            if (VfsSeek(fildes, end, SEEK_SET) == -1 && rc != -1) {
+              rc = -1;
+              error = errno;
+            }
+            errno = error;
+          } else {
+            rc = -1;
+          }
+        } else if (offset == -1) {
           RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
-          rc = HandleSigpipe(m, rc, 0);
-        } else if (offset < 0) {
-          return einval();
-        } else if (offset > NUMERIC_MAX(off_t)) {
-          return eoverflow();
         } else {
           RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
         }
+        rc = HandleSigpipe(
+            m, rc, flags & RWF_NOSIGNAL_LINUX ? MSG_NOSIGNAL_LINUX : 0);
       } else {
         rc = 0;
       }
@@ -2591,57 +2870,121 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
 }
 
 static i64 SysReadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
-  return SysPreadv2(m, fildes, iovaddr, iovlen, -1, 0);
+  return Preadv(m, fildes, iovaddr, iovlen, -1);
 }
 
 static i64 SysWritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen) {
-  return SysPwritev2(m, fildes, iovaddr, iovlen, -1, 0);
+  return Pwritev(m, fildes, iovaddr, iovlen, -1, 0);
 }
 
 static i64 SysPreadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                      i64 offset) {
   if (offset < 0) return einval();
-  return SysPreadv2(m, fildes, iovaddr, iovlen, offset, 0);
+  return Preadv(m, fildes, iovaddr, iovlen, offset);
 }
 
 static i64 SysPwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                       i64 offset) {
   if (offset < 0) return einval();
-  return SysPwritev2(m, fildes, iovaddr, iovlen, offset, 0);
+  return Pwritev(m, fildes, iovaddr, iovlen, offset, 0);
+}
+
+// The RWF_* flags preadv2(2) and pwritev2(2) take, as linux checks them
+// (kiocb_set_rw_flags). The ones that only tune caching or completion are
+// accepted with nothing to do: these files are memory, always in sync, and
+// never wait. The ones that need a file system feature these files lack
+// answer EOPNOTSUPP, as linux does on a file system without them.
+static int CheckRwfFlags(i32 flags) {
+  if (flags & ~(RWF_HIPRI_LINUX | RWF_DSYNC_LINUX | RWF_SYNC_LINUX |
+                RWF_NOWAIT_LINUX | RWF_APPEND_LINUX | RWF_NOAPPEND_LINUX |
+                RWF_ATOMIC_LINUX | RWF_DONTCACHE_LINUX | RWF_NOSIGNAL_LINUX)) {
+    return eopnotsupp();
+  }
+  if ((flags & RWF_APPEND_LINUX) && (flags & RWF_NOAPPEND_LINUX)) {
+    return einval();
+  }
+  if (flags & (RWF_NOWAIT_LINUX | RWF_ATOMIC_LINUX | RWF_DONTCACHE_LINUX)) {
+    return eopnotsupp();
+  }
+  return 0;
+}
+
+// The offset comes in two halves, as 32-bit kernels need it, and the flags
+// after them; on x86-64 the high half is ignored, as linux ignores it.
+static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+                      i64 offset, i64 offset_high, i32 flags) {
+  if (CheckRwfFlags(flags) == -1) return -1;
+  return Preadv(m, fildes, iovaddr, iovlen, offset);
+}
+
+static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
+                       i64 offset, i64 offset_high, i32 flags) {
+  if (CheckRwfFlags(flags) == -1) return -1;
+  return Pwritev(m, fildes, iovaddr, iovlen, offset, flags);
 }
 
 static i64 SysSendfile(struct Machine *m, i32 out_fd, i32 in_fd, i64 offsetaddr,
                        u64 count) {
   u64 toto, offset;
   ssize_t got, wrote;
-  u8 *buf, *offsetp = 0;
+  struct Fd *fd;
+  struct iovec iov;
+  u8 *buf, word[8], *offsetp = 0;
   size_t chunk, maxchunk = 16384;
+  ssize_t (*writev_impl)(int, const struct iovec *, int);
   if (CheckFdAccess(m, out_fd, true, EBADF) == -1) return -1;
   if (CheckFdAccess(m, in_fd, false, EBADF) == -1) return -1;
+  // linux splices only from a regular file or a block device, and a
+  // terminal has no position to start at
+  if (IsTerminalFildes(m, in_fd) == 1 || IsBrowserPipe(in_fd)) {
+    return offsetaddr ? espipe() : einval();
+  }
+  // the output goes through the descriptor's callbacks, so that the
+  // terminal gets it as writes
+  LOCK(&m->system->fds.lock);
+  unassert(fd = GetFd(&m->system->fds, out_fd));
+  unassert(writev_impl = fd->cb->writev);
+  int outflags = BrowserPipeFlags(out_fd, fd->oflags);
+  UNLOCK(&m->system->fds.lock);
+  if (WaitForBrowserPipe(m, out_fd, true, count ? 4097 : 0, outflags)) return -1;
   if (offsetaddr && !(offsetp = (u8 *)SchlepRW(m, offsetaddr, 8))) return -1;
   if (!(buf = (u8 *)AddToFreeList(m, malloc(maxchunk)))) return -1;
   if (offsetp) {
     offset = Read64(offsetp);
     if ((i64)offset < 0) return einval();
-    if (Read64(offsetp) + count < count ||
-        Read64(offsetp) + count > NUMERIC_MAX(off_t)) {
-      return eoverflow();
-    }
+  } else if ((i64)(offset = VfsSeek(in_fd, 0, SEEK_CUR)) == -1) {
+    return -1;
+  }
+  if (offset + count < count || offset + count > NUMERIC_MAX(off_t)) {
+    return eoverflow();
   }
   for (toto = 0; toto < count;) {
     chunk = MIN(count - toto, maxchunk);
-    if (offsetp) {
-      got = VfsPread(in_fd, buf, chunk, offset + toto);
-    } else {
-      got = VfsRead(in_fd, buf, chunk);
+    if (IsBrowserPipe(out_fd)) {
+      chunk = MIN(chunk, BrowserPipeSpace(out_fd));
+      if (!chunk) return toto ? toto : eagain();
     }
+    // Linux advances only by transferred bytes, including when a later write
+    // fails. Reading ahead must not consume the source on a rejected write.
+    got = VfsPread(in_fd, buf, chunk, offset + toto);
     if (got == -1) goto OnFailure;
-    if (offsetp) Write64(offsetp, offset + toto + got);
     if (got == 0) break;
-    while (got > 0) {
-      if ((wrote = VfsWrite(out_fd, buf, got)) == -1) goto OnFailure;
+    for (iov.iov_base = buf; got > 0;) {
+      iov.iov_len = got;
+      if ((wrote = writev_impl(out_fd, &iov, 1)) == -1) goto OnFailure;
+      if (!wrote) return toto;
+      iov.iov_base = (u8 *)iov.iov_base + wrote;
       toto += wrote;
       got -= wrote;
+      if (offsetp) {
+        Write64(word, offset + toto);
+        unassert(!CopyToUserWrite(m, offsetaddr, word, sizeof(word)));
+      } else {
+        if (VfsSeek(in_fd, offset + toto, SEEK_SET) == -1) goto OnFailure;
+#ifdef __EMSCRIPTEN__
+        DebugHistoryMarkIrreversible();
+#endif
+      }
     }
   }
   return toto;
@@ -2650,7 +2993,7 @@ OnFailure:
     LOGF("sendfile() partial failure: %s", DescribeHostErrno(errno));
     return toto;
   } else {
-    return -1;
+    return HandleSigpipe(m, -1, 0);
   }
 }
 
@@ -2774,7 +3117,9 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
   if (offset > NUMERIC_MAX(off_t)) return eoverflow();
   if (offset < -NUMERIC_MAX(off_t) - 1) return eoverflow();
   if (!(fd = GetAndLockFd(m, fildes))) return -1;
-  if (!fd->dirstream) {
+  if (IsTerminalFd(fd) || IsBrowserPipe(fildes)) {
+    rc = espipe();  // a terminal has no position
+  } else if (!fd->dirstream) {
     rc = VfsSeek(fd->fildes, offset, XlatWhence(whence));
   } else if (whence == SEEK_SET_LINUX) {
     if (!offset) {
@@ -2842,83 +3187,68 @@ static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
   struct stat st;
   struct stat_linux gst;
   if ((rc = VfsFstat(fd, &st)) != -1) {
+    BrowserPipeStat(fd, &st);
     XlatStatToLinux(&gst, &st);
     if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
   }
   return rc;
 }
 
+// The flags newfstatat(2) takes, which linux checks before anything else
+// (vfs_fstatat): AT_STATX_SYNC_TYPE only matters on network file systems.
 static int XlatFstatatFlags(int x) {
   int res = 0;
-  if (x & AT_SYMLINK_FOLLOW_LINUX) {
-    x &= ~AT_SYMLINK_FOLLOW_LINUX;  // default behavior
+  if (x & ~(AT_SYMLINK_NOFOLLOW_LINUX | AT_NO_AUTOMOUNT_LINUX |
+            AT_EMPTY_PATH_LINUX | AT_STATX_SYNC_TYPE_LINUX)) {
+    LOGF("%s() flags %d not supported", "fstatat", x);
+    return einval();
   }
   if (x & AT_SYMLINK_NOFOLLOW_LINUX) {
     res |= AT_SYMLINK_NOFOLLOW;
-    x &= ~AT_SYMLINK_NOFOLLOW_LINUX;
   }
 #ifndef DISABLE_NONPOSIX
-  if (x & AT_NO_AUTOMOUNT_LINUX) {
 #if defined(AT_NO_AUTOMOUNT) && defined(DISABLE_VFS)
+  if (x & AT_NO_AUTOMOUNT_LINUX) {
     res |= AT_NO_AUTOMOUNT;
-#endif
-    x &= ~AT_NO_AUTOMOUNT_LINUX;
   }
 #endif
-  if (x) {
-    LOGF("%s() flags %d not supported", "fstatat", x);
-    return -1;
-  }
+#endif
   return res;
 }
 
 static int SysFstatat(struct Machine *m, i32 dirfd, i64 pathaddr, i64 staddr,
                       i32 flags) {
-  int rc;
+  int rc, sysflags;
   struct stat st;
   const char *path;
   struct stat_linux gst;
+  if ((sysflags = XlatFstatatFlags(flags)) == -1) return -1;
   if (!(path = LoadStr(m, pathaddr))) return -1;
 #ifndef DISABLE_NONPOSIX
-  if (flags & AT_EMPTY_PATH_LINUX) {
-    flags &= ~AT_EMPTY_PATH_LINUX;
-    if (!*path) {
-      if (flags) {
-        LOGF("%s() flags %d not supported", "fstatat(AT_EMPTY_PATH)", flags);
-        return -1;
-      }
-      return SysFstat(m, dirfd, staddr);
-    }
+  // with AT_EMPTY_PATH an empty path names the directory descriptor itself,
+  // or the working directory for AT_FDCWD, and the other flags are moot
+  if ((flags & AT_EMPTY_PATH_LINUX) && !*path) {
+    if (dirfd != AT_FDCWD_LINUX) return SysFstat(m, dirfd, staddr);
+    path = ".";
+    sysflags = 0;
   }
 #endif
-  if ((rc = VfsStat(GetDirFildes(dirfd), path, &st, XlatFstatatFlags(flags))) !=
-      -1) {
+  if ((rc = VfsStat(GetDirFildes(dirfd), path, &st, sysflags)) != -1) {
     XlatStatToLinux(&gst, &st);
     if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
   }
   return rc;
 }
 
+// The flags fchownat(2) takes, which linux checks before anything else.
 static int XlatFchownatFlags(int x) {
   int res = 0;
-  if (x & AT_SYMLINK_FOLLOW_LINUX) {
-    x &= ~AT_SYMLINK_FOLLOW_LINUX;  // default behavior
+  if (x & ~(AT_SYMLINK_NOFOLLOW_LINUX | AT_EMPTY_PATH_LINUX)) {
+    LOGF("%s() flags %#x not supported", "fchownat", x);
+    return einval();
   }
   if (x & AT_SYMLINK_NOFOLLOW_LINUX) {
     res |= AT_SYMLINK_NOFOLLOW;
-    x &= ~AT_SYMLINK_NOFOLLOW_LINUX;
-  }
-#ifdef AT_EMPTY_PATH
-#ifndef DISABLE_NONPOSIX
-  if (x & AT_EMPTY_PATH_LINUX) {
-    res |= AT_EMPTY_PATH;
-    x &= ~AT_EMPTY_PATH_LINUX;
-  }
-#endif
-#endif
-  if (x) {
-    LOGF("%s() flags %#x not supported", "fchownat", x);
-    return -1;
   }
   return res;
 }
@@ -2929,22 +3259,19 @@ static int SysFchown(struct Machine *m, i32 fildes, u32 uid, u32 gid) {
 
 static int SysFchownat(struct Machine *m, i32 dirfd, i64 pathaddr, u32 uid,
                        u32 gid, i32 flags) {
+  int sysflags;
   const char *path;
+  if ((sysflags = XlatFchownatFlags(flags)) == -1) return -1;
   if (!(path = LoadStr(m, pathaddr))) return -1;
 #ifndef DISABLE_NONPOSIX
-  if (flags & AT_EMPTY_PATH_LINUX) {
-    flags &= AT_EMPTY_PATH_LINUX;
-    if (!*path) {
-      if (flags) {
-        LOGF("%s() flags %d not supported", "fchownat(AT_EMPTY_PATH)", flags);
-        return -1;
-      }
-      return SysFchown(m, dirfd, uid, gid);
-    }
+  // like fstatat(): an empty path names the descriptor, or the directory
+  if ((flags & AT_EMPTY_PATH_LINUX) && !*path) {
+    if (dirfd != AT_FDCWD_LINUX) return SysFchown(m, dirfd, uid, gid);
+    path = ".";
+    sysflags = 0;
   }
 #endif
-  return VfsChown(GetDirFildes(dirfd), path, uid, gid,
-                  XlatFchownatFlags(flags));
+  return VfsChown(GetDirFildes(dirfd), path, uid, gid, sysflags);
 }
 
 static int SysChown(struct Machine *m, i64 pathaddr, u32 uid, u32 gid) {
@@ -3282,7 +3609,13 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
   if (cmd == F_GETFD_LINUX) {
     rc = (fd->oflags & O_CLOEXEC) ? FD_CLOEXEC_LINUX : 0;
   } else if (cmd == F_GETFL_LINUX) {
-    rc = UnXlatOpenFlags(fd->oflags);
+    // the access mode and status flags, as linux keeps them: open() drops
+    // the creation flags, close-on-exec belongs to the descriptor, and an
+    // x86-64 kernel opens every file O_LARGEFILE
+    rc = (UnXlatOpenFlags(BrowserPipeFlags(fildes, fd->oflags)) &
+          ~(O_CREAT_LINUX | O_EXCL_LINUX | O_NOCTTY_LINUX | O_TRUNC_LINUX |
+            O_CLOEXEC_LINUX)) |
+         (IsBrowserPipe(fildes) ? 0 : O_LARGEFILE_LINUX);
   } else if (cmd == F_SETFD_LINUX) {
     if (!(arg & ~FD_CLOEXEC_LINUX)) {
       if (VfsFcntl(fd->fildes, F_SETFD, arg ? FD_CLOEXEC : 0) != -1) {
@@ -3301,6 +3634,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
     if (VfsFcntl(fd->fildes, F_SETFL, fl) != -1) {
       fd->oflags &= ~SETFL_FLAGS;
       fd->oflags |= fl;
+      BrowserPipeSetFlags(fildes, fd->oflags);
       rc = 0;
     } else {
       rc = -1;
@@ -3383,6 +3717,10 @@ static int SysReadlink(struct Machine *m, i64 path, i64 bufaddr, u64 size) {
   return SysReadlinkat(m, AT_FDCWD_LINUX, path, bufaddr, size);
 }
 
+// Makes FIFOs only. A host that cannot make them, such as Emscripten's file
+// system, would answer every call with an error, so the table leaves both
+// calls out there rather than list calls that never work.
+#ifdef HAVE_MKFIFOAT
 static int SysMknodat(struct Machine *m, i32 dirfd, i64 path, i32 mode,
                       u64 dev) {
   _Static_assert(S_IFIFO == 0010000, "");   // pipe
@@ -3404,6 +3742,7 @@ static int SysMknodat(struct Machine *m, i32 dirfd, i64 path, i32 mode,
 static int SysMknod(struct Machine *m, i64 path, i32 mode, u64 dev) {
   return SysMknodat(m, AT_FDCWD_LINUX, path, mode, dev);
 }
+#endif /* HAVE_MKFIFOAT */
 
 static int XlatPrio(int x) {
   switch (x) {
@@ -3470,25 +3809,91 @@ static int SysRmdir(struct Machine *m, i64 path) {
   return SysUnlinkat(m, AT_FDCWD_LINUX, path, AT_REMOVEDIR_LINUX);
 }
 
-static int SysRenameat2(struct Machine *m, int srcdirfd, i64 srcpath,
-                        int dstdirfd, i64 dstpathaddr, i32 flags) {
+// Swaps two names, as RENAME_EXCHANGE does, through a third name beside the
+// first: one program in one process cannot see the moment between the
+// renames, and a rename that fails puts back what the earlier ones moved.
+static int ExchangeNames(int srcdirfd, const char *srcpath, int dstdirfd,
+                         const char *dstpath) {
+  int err;
+  char *tmp;
   struct stat st;
-  i32 unsupported;
-  const char *dstpath;
-  i32 supported = RENAME_NOREPLACE_LINUX;
-  if ((unsupported = flags & ~supported)) {
-    LOGF("%s flags not supported yet: %#" PRIx32, "renameat2", unsupported);
-    return einval();
+  const char *slash;
+  size_t i, dirlen;
+  slash = strrchr(srcpath, '/');
+  dirlen = slash ? slash - srcpath + 1 : 0;
+  if (!(tmp = (char *)malloc(dirlen + 32))) return -1;
+  for (i = 0;; ++i) {
+    snprintf(tmp, dirlen + 32, "%.*s.renameat2-%zu", (int)dirlen, srcpath, i);
+    if (VfsStat(srcdirfd, tmp, &st, AT_SYMLINK_NOFOLLOW) == -1) break;
   }
-  if (!(dstpath = LoadStr(m, dstpathaddr))) return -1;
-  // TODO: check for renameat2 in configure script
-  if ((flags & RENAME_NOREPLACE_LINUX) &&
-      !VfsStat(GetDirFildes(dstdirfd), dstpath, &st, AT_SYMLINK_NOFOLLOW)) {
-    errno = EEXIST;
+  if (VfsRename(srcdirfd, srcpath, srcdirfd, tmp) == -1) {
+    err = errno;
+  } else if (VfsRename(dstdirfd, dstpath, srcdirfd, srcpath) == -1) {
+    err = errno;
+    VfsRename(srcdirfd, tmp, srcdirfd, srcpath);
+  } else if (VfsRename(srcdirfd, tmp, dstdirfd, dstpath) == -1) {
+    err = errno;
+    VfsRename(srcdirfd, srcpath, dstdirfd, dstpath);
+    VfsRename(srcdirfd, tmp, srcdirfd, srcpath);
+  } else {
+    err = 0;
+  }
+  free(tmp);
+  if (err) {
+    errno = err;
     return -1;
   }
-  return VfsRename(GetDirFildes(srcdirfd), LoadStr(m, srcpath),
-                   GetDirFildes(dstdirfd), dstpath);
+  return 0;
+}
+
+static int SysRenameat2(struct Machine *m, int srcdirfd, i64 srcpathaddr,
+                        int dstdirfd, i64 dstpathaddr, i32 flags) {
+  struct stat srcst, dstst;
+  const char *srcpath, *dstpath;
+  if (flags & ~(RENAME_NOREPLACE_LINUX | RENAME_EXCHANGE_LINUX |
+                RENAME_WHITEOUT_LINUX)) {
+    LOGF("%s flags not supported: %#" PRIx32, "renameat2", flags);
+    return einval();
+  }
+  if ((flags & RENAME_EXCHANGE_LINUX) &&
+      (flags & (RENAME_NOREPLACE_LINUX | RENAME_WHITEOUT_LINUX))) {
+    return einval();
+  }
+  if (flags & RENAME_WHITEOUT_LINUX) {
+    // whiteouts are for union file systems; linux answers EINVAL on a file
+    // system that has none, as this one has none
+    return einval();
+  }
+  if (!(srcpath = LoadStr(m, srcpathaddr)) ||
+      !(dstpath = LoadStr(m, dstpathaddr))) {
+    return -1;
+  }
+  if (!flags) {
+    return VfsRename(GetDirFildes(srcdirfd), srcpath, GetDirFildes(dstdirfd),
+                     dstpath);
+  }
+  // linux looks the source up before it decides about the target, so a
+  // missing source is ENOENT whatever the target is
+  if (VfsStat(GetDirFildes(srcdirfd), srcpath, &srcst, AT_SYMLINK_NOFOLLOW)) {
+    return -1;
+  }
+  if (flags & RENAME_NOREPLACE_LINUX) {
+    if (!VfsStat(GetDirFildes(dstdirfd), dstpath, &dstst,
+                 AT_SYMLINK_NOFOLLOW)) {
+      return eexist();
+    }
+    if (errno != ENOENT) return -1;
+    return VfsRename(GetDirFildes(srcdirfd), srcpath, GetDirFildes(dstdirfd),
+                     dstpath);
+  }
+  if (VfsStat(GetDirFildes(dstdirfd), dstpath, &dstst, AT_SYMLINK_NOFOLLOW)) {
+    return -1;
+  }
+  if (srcst.st_dev == dstst.st_dev && srcst.st_ino == dstst.st_ino) {
+    return 0;
+  }
+  return ExchangeNames(GetDirFildes(srcdirfd), srcpath, GetDirFildes(dstdirfd),
+                       dstpath);
 }
 
 static int SysRenameat(struct Machine *m, int srcdirfd, i64 srcpath,
@@ -3537,9 +3942,13 @@ static bool IsBlinkSig(struct System *s, int sig) {
 }
 
 static void ResetTimerDispositions(struct System *s) {
+#ifdef __EMSCRIPTEN__
+  GuestTimerReset();
+#else
   struct itimerval it;
   memset(&it, 0, sizeof(it));
   setitimer(ITIMER_REAL, &it, 0);
+#endif
 }
 
 static void ResetSignalDispositions(struct System *s) {
@@ -3600,6 +4009,10 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
 
 static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
                     int options, i64 opt_out_rusage_addr) {
+#ifdef __EMSCRIPTEN__
+  /* This process cannot create a child; never inspect or reap a host child. */
+  return (errno = ECHILD), -1;
+#else
   int rc;
   int wstatus;
   i32 gwstatus;
@@ -3658,6 +4071,7 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
     }
   }
   return rc;
+#endif
 }
 
 static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
@@ -3674,9 +4088,14 @@ static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
 }
 
 static bool IsSupportedResourceLimit(int resource) {
+#ifdef __EMSCRIPTEN__
+  // the host keeps no limits of its own, so blink keeps every one
+  return 0 <= resource && resource < RLIM_NLIMITS_LINUX;
+#else
   return resource == RLIMIT_AS_LINUX ||    //
          resource == RLIMIT_DATA_LINUX ||  //
          resource == RLIMIT_NOFILE_LINUX;
+#endif
 }
 
 static void GetResourceLimit_(struct Machine *m, int resource,
@@ -3686,12 +4105,29 @@ static void GetResourceLimit_(struct Machine *m, int resource,
   UNLOCK(&m->system->mmap_lock);
 }
 
+// Whether the process holds CAP_SYS_RESOURCE, which lets it raise a hard
+// limit. Where blink keeps the credentials, root holds every capability.
+static bool CanRaiseHardLimit(struct System *s) {
+#ifdef __EMSCRIPTEN__
+  return !s->uid[1];
+#else
+  return false;
+#endif
+}
+
+// Changes a limit by linux's rules (do_prlimit): the soft limit may not
+// exceed the hard one, RLIMIT_NOFILE may not exceed fs.nr_open, and only a
+// process with CAP_SYS_RESOURCE may raise a hard limit.
 static int SetResourceLimit(struct Machine *m, int resource,
                             const struct rlimit_linux *lux) {
   int rc;
+  if (Read64(lux->cur) > Read64(lux->max)) return einval();
+  if (resource == RLIMIT_NOFILE_LINUX && Read64(lux->max) > 1024 * 1024) {
+    return eperm();
+  }
   LOCK(&m->system->mmap_lock);
-  if (Read64(lux->cur) <= Read64(m->system->rlim[resource].max) &&
-      Read64(lux->max) <= Read64(m->system->rlim[resource].max)) {
+  if (Read64(lux->max) <= Read64(m->system->rlim[resource].max) ||
+      CanRaiseHardLimit(m->system)) {
     memcpy(m->system->rlim + resource, lux, sizeof(*lux));
     rc = 0;
   } else {
@@ -3702,14 +4138,15 @@ static int SetResourceLimit(struct Machine *m, int resource,
 }
 
 static int SysGetrlimit(struct Machine *m, i32 resource, i64 rlimitaddr) {
-  int rc;
+  int rc, sysresource;
   struct rlimit rlim;
   struct rlimit_linux lux;
   if (IsSupportedResourceLimit(resource)) {
     GetResourceLimit_(m, resource, &lux);
     return CopyToUserWrite(m, rlimitaddr, &lux, sizeof(lux));
   }
-  if ((rc = getrlimit(XlatResource(resource), &rlim)) != -1) {
+  if ((sysresource = XlatResource(resource)) == -1) return -1;
+  if ((rc = getrlimit(sysresource, &rlim)) != -1) {
     XlatRlimitToLinux(&lux, &rlim);
     if (CopyToUserWrite(m, rlimitaddr, &lux, sizeof(lux)) == -1) rc = -1;
   }
@@ -3734,9 +4171,31 @@ static int SysSetrlimit(struct Machine *m, i32 resource, i64 rlimitaddr) {
 
 static int SysPrlimit(struct Machine *m, i32 pid, i32 resource,
                       i64 new_rlimit_addr, i64 old_rlimit_addr) {
-  if (pid && pid != m->system->pid) {
-    return eperm();
+  struct rlimit_linux old;
+  const struct rlimit_linux *lux = 0;
+  // there is no other process to name
+  if (pid && pid != m->system->pid) return esrch();
+#ifdef __EMSCRIPTEN__
+  if (!IsSupportedResourceLimit(resource)) return einval();
+  // linux reads the new limit, then hands back the one it replaced
+  if (new_rlimit_addr &&
+      !(lux = (const struct rlimit_linux *)SchlepR(m, new_rlimit_addr,
+                                                   sizeof(*lux)))) {
+    return -1;
   }
+  GetResourceLimit_(m, resource, &old);
+  if (lux) {
+    if (SetResourceLimit(m, resource, lux) == -1) return -1;
+    // Copying the old value out can still fail after the new limit took effect.
+    DebugHistoryMarkIrreversible();
+  }
+  if (old_rlimit_addr) {
+    return CopyToUserWrite(m, old_rlimit_addr, &old, sizeof(old));
+  }
+  return 0;
+#else
+  (void)old;
+  (void)lux;
 #ifndef TINY
   if ((old_rlimit_addr &&
        !IsValidMemory(m, old_rlimit_addr, sizeof(struct rlimit_linux),
@@ -3752,13 +4211,30 @@ static int SysPrlimit(struct Machine *m, i32 pid, i32 resource,
     return -1;
   }
   return 0;
+#endif
 }
 
 static int SysSysinfo(struct Machine *m, i64 siaddr) {
   struct sysinfo_linux si;
   if (sysinfo_linux(&si) == -1) return -1;
-  CopyToUserWrite(m, siaddr, &si, sizeof(si));
-  return 0;
+#if !defined(HAVE_SYSINFO) && !defined(HAVE_SYSCTL)
+  {
+    // with no host to ask, the machine is described as blink models it:
+    // up since the boot clock started, as much memory as a program may
+    // keep resident, less what this one keeps, and one process, idle
+    u64 used;
+    struct timespec boot;
+    used = (u64)m->system->rss * 4096;
+    HostNow(CLOCK_MONOTONIC, &boot);
+    // linux rounds a partial second up (do_sysinfo)
+    Write64(si.uptime, boot.tv_sec + !!boot.tv_nsec);
+    Write64(si.totalram, kMaxResident);
+    Write64(si.freeram, kMaxResident > used ? kMaxResident - used : 0);
+    Write16(si.procs, 1);
+    Write32(si.mem_unit, 1);
+  }
+#endif
+  return CopyToUserWrite(m, siaddr, &si, sizeof(si));
 }
 
 static i64 SysGetcwd(struct Machine *m, i64 bufaddr, i64 size) {
@@ -3781,11 +4257,16 @@ static i64 SysGetcwd(struct Machine *m, i64 bufaddr, i64 size) {
   return res;
 }
 
+// Answered from the host's random source; without one, GetRandom() falls back
+// to a generator seeded from the clock, which is not what getrandom(2)
+// promises, so the call is only offered over a real source.
+#if defined(HAVE_GETRANDOM) || defined(__EMSCRIPTEN__)
 static ssize_t SysGetrandom(struct Machine *m, i64 a, size_t n, int f) {
   char *p;
   ssize_t rc;
   int besteffort, unsupported;
-  besteffort = GRND_NONBLOCK_LINUX | GRND_RANDOM_LINUX;
+  besteffort = GRND_NONBLOCK_LINUX | GRND_RANDOM_LINUX | GRND_INSECURE_LINUX;
+  if ((f & GRND_RANDOM_LINUX) && (f & GRND_INSECURE_LINUX)) return einval();
   if ((unsupported = f & ~besteffort)) {
     LOGF("%s() flags %d not supported", "getrandom", unsupported);
     return einval();
@@ -3803,6 +4284,7 @@ static ssize_t SysGetrandom(struct Machine *m, i64 a, size_t n, int f) {
   }
   return rc;
 }
+#endif /* HAVE_GETRANDOM */
 
 void OnSignal(int sig, siginfo_t *si, void *uc) {
   SIG_LOGF("OnSignal(%s)", DescribeSignal(UnXlatSignal(sig)));
@@ -3868,10 +4350,14 @@ static int SysSigaction(struct Machine *m, int sig, i64 act, i64 old,
     CopyToUserWrite(m, old, &m->system->hands[sig - 1], sizeof(hand));
   }
   if (act) {
+#ifdef __EMSCRIPTEN__
+    DebugHistoryMarkIrreversible();
+#endif
     m->system->hands[sig - 1] = hand;
     if (isignored) {
       m->signals &= ~((u64)1 << (sig - 1));
     }
+#ifndef __EMSCRIPTEN__
     if ((syssig = XlatSignal(sig)) != -1 && !IsBlinkSig(m->system, sig)) {
       sigfillset(&syshand.sa_mask);
       syshand.sa_flags = SA_SIGINFO;
@@ -3895,12 +4381,22 @@ static int SysSigaction(struct Machine *m, int sig, i64 act, i64 old,
              DescribeHostErrno(errno));
       }
     }
+#endif
   }
   UNLOCK(&m->system->sig_lock);
   return 0;
 }
 
 static int SysGetitimer(struct Machine *m, int which, i64 curvaladdr) {
+#ifdef __EMSCRIPTEN__
+  struct itimerval current;
+  struct itimerval_linux guest;
+  if (which != ITIMER_REAL_LINUX) return which == ITIMER_VIRTUAL_LINUX ||
+      which == ITIMER_PROF_LINUX ? eopnotsupp() : einval();
+  if (GuestTimerGet(&current)) return -1;
+  XlatItimervalToLinux(&guest, &current);
+  return CopyToUserWrite(m, curvaladdr, &guest, sizeof(guest));
+#else
   int rc;
   struct itimerval it;
   struct itimerval_linux git;
@@ -3909,10 +4405,38 @@ static int SysGetitimer(struct Machine *m, int which, i64 curvaladdr) {
     CopyToUserWrite(m, curvaladdr, &git, sizeof(git));
   }
   return rc;
+#endif
 }
 
 static int SysSetitimer(struct Machine *m, int which, i64 neuaddr,
                         i64 oldaddr) {
+#ifdef __EMSCRIPTEN__
+  struct itimerval next, previous;
+  struct itimerval_linux guest_old;
+  const struct itimerval_linux *guest_next = 0;
+  if (which != ITIMER_REAL_LINUX) return which == ITIMER_VIRTUAL_LINUX ||
+      which == ITIMER_PROF_LINUX ? eopnotsupp() : einval();
+  if ((neuaddr && !(guest_next = (const struct itimerval_linux *)SchlepR(
+                           m, neuaddr, sizeof(*guest_next)))) ||
+      (oldaddr && !IsValidMemory(m, oldaddr, sizeof(guest_old), PROT_WRITE)))
+    return -1;
+  if (guest_next) {
+    XlatLinuxToItimerval(&next, guest_next);
+    if (next.it_interval.tv_sec < 0 || next.it_interval.tv_usec < 0 ||
+        next.it_interval.tv_usec >= 1000000 || next.it_value.tv_sec < 0 ||
+        next.it_value.tv_usec < 0 || next.it_value.tv_usec >= 1000000 ||
+        next.it_interval.tv_sec >
+            (INT64_MAX - next.it_interval.tv_usec) / 1000000 ||
+        next.it_value.tv_sec >
+            (INT64_MAX - next.it_value.tv_usec) / 1000000) return einval();
+  }
+  GuestTimerSet(guest_next ? &next : 0, &previous);
+  if (oldaddr) {
+    XlatItimervalToLinux(&guest_old, &previous);
+    CopyToUserWrite(m, oldaddr, &guest_old, sizeof(guest_old));
+  }
+  return 0;
+#else
   int rc;
   struct itimerval_linux gold;
   struct itimerval neu, *neup, old;
@@ -3935,33 +4459,40 @@ static int SysSetitimer(struct Machine *m, int which, i64 neuaddr,
     }
   }
   return rc;
+#endif
 }
 
 static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
   struct timespec_linux gt;
   const struct timespec_linux *gtp;
   struct timespec ts, now, deadline;
-  now = GetTime();
-  if ((rem && !IsValidMemory(m, rem, sizeof(gtp), PROT_WRITE)) ||
-      !(gtp = (const struct timespec_linux *)SchlepR(m, req, sizeof(*gtp)))) {
+  now = GetMonotonic();
+  if (!(gtp = (const struct timespec_linux *)SchlepR(m, req, sizeof(*gtp)))) {
     return -1;
   }
   ts.tv_sec = Read64(gtp->sec);
   ts.tv_nsec = Read64(gtp->nsec);
   if (ts.tv_sec < 0) return einval();
   if (!(0 <= ts.tv_nsec && ts.tv_nsec < 1000000000)) return einval();
-  deadline = AddTime(now, ts);
+  deadline = GuestWaitDeadline(AddTime(now, ts));
   for (;;) {
     if (CompareTime(now, deadline) >= 0) return 0;
     ts = SubtractTime(deadline, now);
+#ifdef __EMSCRIPTEN__
+    if (GuestWaitInterrupted(m)) {
+      if (rem) { Write64(gt.sec, ts.tv_sec); Write64(gt.nsec, ts.tv_nsec); if (CopyToUserWrite(m, rem, &gt, sizeof(gt)) == -1) return -1; }
+      return eintr();
+    }
+    GuestWaitHalt(m, deadline, false);
+#endif
     if (nanosleep(&ts, 0)) {
       unassert(errno == EINTR);
       // this may run a guest signal handler before returning
-      if (CheckInterrupt(m, false)) {
+      if (GuestWaitInterrupted(m)) {
         // a signal was delivered or is about to be delivered
         if (rem) {
           // rem is only updated when -1 w/ eintr is returned
-          now = GetTime();
+          now = GetMonotonic();
           if (CompareTime(now, deadline) < 0) {
             ts = SubtractTime(deadline, now);
           } else {
@@ -3969,14 +4500,14 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
           }
           Write64(gt.sec, ts.tv_sec);
           Write64(gt.nsec, ts.tv_nsec);
-          CopyToUserWrite(m, rem, &gt, sizeof(gt));
+          if (CopyToUserWrite(m, rem, &gt, sizeof(gt)) == -1) return -1;
         }
         return -1;
       }
     }
     // sleep apis aren't nearly as fast and reliable as time apis
     // even if nanosleep() claims it slept the full time we check
-    now = GetTime();
+    now = GetMonotonic();
   }
 }
 
@@ -3986,6 +4517,13 @@ static int SysClockNanosleep(struct Machine *m, int clock, int flags,
   clock_t sysclock;
   struct timespec req, rem;
   struct timespec_linux gtimespec;
+  // linux has no timers on these clocks, so it cannot sleep on them
+  if (clock == CLOCK_MONOTONIC_RAW_LINUX ||
+      clock == CLOCK_REALTIME_COARSE_LINUX ||
+      clock == CLOCK_MONOTONIC_COARSE_LINUX ||
+      clock == CLOCK_THREAD_CPUTIME_ID_LINUX) {
+    return eopnotsupp();
+  }
   if (XlatClock(clock, &sysclock) == -1) return -1;
   if (flags & ~TIMER_ABSTIME_LINUX) return einval();
   if (CopyFromUserRead(m, &gtimespec, reqaddr, sizeof(gtimespec)) == -1) {
@@ -3993,6 +4531,19 @@ static int SysClockNanosleep(struct Machine *m, int clock, int flags,
   }
   req.tv_sec = Read64(gtimespec.sec);
   req.tv_nsec = Read64(gtimespec.nsec);
+#ifdef __EMSCRIPTEN__
+  if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1000000000) return einval();
+  struct timespec now, until;
+  HostNow(sysclock, &now);
+  until = GuestWaitDeadline(flags ? req : AddTime(now, req));
+  if (CompareTime(now, until) >= 0) return 0;
+  if (GuestWaitInterrupted(m)) {
+    if (!flags && remaddr) { rem = SubtractTime(until, now); Write64(gtimespec.sec, rem.tv_sec); Write64(gtimespec.nsec, rem.tv_nsec); if (CopyToUserWrite(m, remaddr, &gtimespec, sizeof(gtimespec))) return -1; }
+    return eintr();
+  }
+  GuestWaitClock(sysclock);
+  GuestWaitHalt(m, until, false);
+#endif
 TryAgain:
 #if defined(TIMER_ABSTIME) && !defined(__OpenBSD__)
   flags = flags & TIMER_ABSTIME_LINUX ? TIMER_ABSTIME : 0;
@@ -4020,7 +4571,7 @@ TryAgain:
   }
 #endif
   if (rc == -1 && errno == EINTR) {
-    if (CheckInterrupt(m, false)) {
+    if (GuestWaitInterrupted(m)) {
       if (!flags && remaddr) {
         Write64(gtimespec.sec, rem.tv_sec);
         Write64(gtimespec.nsec, rem.tv_nsec);
@@ -4061,7 +4612,7 @@ static int SigsuspendPolyfill(struct Machine *m, u64 mask) {
   oldmask = m->sigmask;
   m->sigmask = mask;
   nanos = 1;
-  while (!CheckInterrupt(m, false)) {
+  while (!GuestWaitInterrupted(m)) {
     if (nanos > 256) {
       if (nanos < 10 * 1000) {
 #ifdef HAVE_SCHED_YIELD
@@ -4088,7 +4639,10 @@ static int SysSigsuspend(struct Machine *m, i64 maskaddr, i64 sigsetsize) {
   if (sigsetsize != 8) return einval();
   if (CopyFromUserRead(m, word, maskaddr, 8) == -1) return -1;
 #ifdef __EMSCRIPTEN__
-  return SigsuspendPolyfill(m, Read64(word));
+  GuestWaitMask(m, Read64(word));
+  m->issigsuspend = true;
+  if (GuestWaitInterrupted(m)) return eintr();
+  GuestWaitHalt(m, GetMaxTime(), false);
 #else
   return SigsuspendActual(m, Read64(word));
 #endif
@@ -4157,7 +4711,7 @@ static int SysClockGettime(struct Machine *m, int clock, i64 ts) {
   } else if (XlatClock(clock, &sysclock) == -1) {
     return -1;
   }
-  if ((rc = clock_gettime(sysclock, &htimespec)) != -1) {
+  if ((rc = HostNow(sysclock, &htimespec)) != -1) {
     if (ts) {
       Write64(gtimespec.sec, htimespec.tv_sec);
       Write64(gtimespec.nsec, htimespec.tv_nsec);
@@ -4187,7 +4741,20 @@ static int SysClockGetres(struct Machine *m, int clock, i64 ts) {
   struct timespec htimespec;
   struct timespec_linux gtimespec;
   if (XlatClock(clock, &sysclock) == -1) return -1;
-  if ((rc = clock_getres(sysclock, &htimespec)) != -1) {
+#ifdef __EMSCRIPTEN__
+  // the resolution linux reports is its timers', not the precision of the
+  // clock it reads: a nanosecond for high resolution timers, and a tick
+  // (CONFIG_HZ=250) for the coarse clocks. Emscripten's guesses differ.
+  htimespec.tv_sec = 0;
+  htimespec.tv_nsec = clock == CLOCK_REALTIME_COARSE_LINUX ||
+                              clock == CLOCK_MONOTONIC_COARSE_LINUX
+                          ? 4000000
+                          : 1;
+  rc = 0;
+#else
+  rc = clock_getres(sysclock, &htimespec);
+#endif
+  if (rc != -1) {
     if (ts) {
       Write64(gtimespec.sec, htimespec.tv_sec);
       Write64(gtimespec.nsec, htimespec.tv_nsec);
@@ -4210,10 +4777,14 @@ static int SysGettimeofday(struct Machine *m, i64 tv, i64 tz) {
 #else
   htimezonep = 0;
 #endif
-  if ((rc = gettimeofday(&htimeval, htimezonep)) != -1) {
+  struct timespec now;
+  rc = HostNow(CLOCK_REALTIME, &now);
+  htimeval.tv_sec = now.tv_sec;
+  htimeval.tv_usec = now.tv_nsec / 1000;
+  if (rc != -1) {
     Write64(gtimeval.sec, htimeval.tv_sec);
     Write64(gtimeval.usec, htimeval.tv_usec);
-    if (CopyToUserWrite(m, tv, &gtimeval, sizeof(gtimeval)) == -1) {
+    if (tv && CopyToUserWrite(m, tv, &gtimeval, sizeof(gtimeval)) == -1) {
       return -1;
     }
     // "If tzp is not a null pointer, the behavior is unspecified."
@@ -4236,7 +4807,9 @@ static int SysGettimeofday(struct Machine *m, i64 tv, i64 tz) {
 static i64 SysTime(struct Machine *m, i64 addr) {
   u8 buf[8];
   time_t secs;
-  if ((secs = time(0)) == (time_t)-1) return -1;
+  struct timespec now;
+  if (HostNow(CLOCK_REALTIME, &now)) return -1;
+  secs = now.tv_sec;
   if (addr) {
     Write64(buf, secs);
     if (CopyToUserWrite(m, addr, buf, sizeof(buf)) == -1) return -1;
@@ -4410,12 +4983,23 @@ static int SysUtimensat(struct Machine *m, i32 fd, i64 pathaddr, i64 tvsaddr,
   }
 }
 
+// The bytes of a guest fd_set that select() reads and writes for `nfds`
+// descriptors: whole longs, as linux copies them (FDS_BYTES), and never the
+// whole fd_set, which the guest may not have allocated.
+static size_t GetFdSetBytes(int nfds) {
+  return ROUNDUP(nfds, 64) / 8;
+}
+
 static int LoadFdSet(struct Machine *m, int nfds, fd_set *fds, i64 addr) {
   u64 w;
   int fd;
   unsigned o;
   const u64 *p;
-  if ((p = (const u64 *)SchlepRW(m, addr, FD_SETSIZE_LINUX / 8))) {
+  if (!nfds) {
+    FD_ZERO(fds);
+    return 0;
+  }
+  if ((p = (const u64 *)SchlepRW(m, addr, GetFdSetBytes(nfds)))) {
     FD_ZERO(fds);
     for (fd = 0; fd < nfds; fd += 64) {
       w = p[fd >> 6];
@@ -4436,12 +5020,13 @@ static int LoadFdSet(struct Machine *m, int nfds, fd_set *fds, i64 addr) {
 static int SaveFdSet(struct Machine *m, int nfds, const fd_set *fds, i64 addr) {
   int fd;
   u8 p[FD_SETSIZE_LINUX / 8] = {0};
+  if (!nfds) return 0;
   for (fd = 0; fd < nfds; ++fd) {
     if (FD_ISSET(fd, fds)) {
       p[fd >> 3] |= 1 << (fd & 7);
     }
   }
-  return CopyToUserWrite(m, addr, p, FD_SETSIZE_LINUX / 8);
+  return CopyToUserWrite(m, addr, p, GetFdSetBytes(nfds));
 }
 
 static i32 Select(struct Machine *m,          //
@@ -4452,6 +5037,7 @@ static i32 Select(struct Machine *m,          //
                   struct timespec *timeoutp,  //
                   const u64 *sigmaskp_guest) {
   int fildes, rc;
+  bool accepts_input = false;
   i32 setsize;
   u64 oldmask_guest = 0;
   fd_set readfds, writefds, exceptfds, readyreadfds, readywritefds,
@@ -4461,7 +5047,7 @@ static i32 Select(struct Machine *m,          //
   struct Fd *fd;
   int (*poll_impl)(struct pollfd *, nfds_t, int);
   if (timeoutp) {
-    deadline = AddTime(GetTime(), *timeoutp);
+    deadline = GuestWaitDeadline(AddTime(GetMonotonic(), *timeoutp));
   }
   setsize = MIN(FD_SETSIZE, FD_SETSIZE_LINUX);
   if (nfds < 0 || nfds > setsize) {
@@ -4494,11 +5080,11 @@ static i32 Select(struct Machine *m,          //
   FD_ZERO(&readyexceptfds);
   if (sigmaskp_guest) {
     oldmask_guest = m->sigmask;
-    m->sigmask = *sigmaskp_guest;
+    GuestWaitMask(m, *sigmaskp_guest);
     SIG_LOGF("sigmask push %" PRIx64, m->sigmask);
   }
   for (;;) {
-    if (CheckInterrupt(m, false)) {
+    if (GuestWaitInterrupted(m)) {
       rc = eintr();
       break;
     }
@@ -4509,7 +5095,7 @@ static i32 Select(struct Machine *m,          //
         continue;
       }
     TryAgain:
-      if (CheckInterrupt(m, false)) {
+      if (GuestWaitInterrupted(m)) {
         rc = eintr();
         break;
       }
@@ -4522,6 +5108,7 @@ static i32 Select(struct Machine *m,          //
       }
       UNLOCK(&m->system->fds.lock);
       if (fd) {
+        if (IsTerminalFd(fd) && FD_ISSET(fildes, &readfds)) accepts_input = true;
         hfds[0].fd = fildes;
         hfds[0].events = ((FD_ISSET(fildes, &readfds) ? POLLIN : 0) |
                           (FD_ISSET(fildes, &writefds) ? POLLOUT : 0) |
@@ -4530,7 +5117,7 @@ static i32 Select(struct Machine *m,          //
           case 0:
             break;
           case 1:
-            if (FD_ISSET(fildes, &readfds) && (hfds[0].revents & POLLIN)) {
+            if (FD_ISSET(fildes, &readfds) && (hfds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
               ++rc;
               FD_SET(fildes, &readyreadfds);
               FD_CLR(fildes, &readfds);
@@ -4559,7 +5146,7 @@ static i32 Select(struct Machine *m,          //
       }
     }
   BreakLoop:
-    if (rc || (timeoutp && CompareTime(now = GetTime(), deadline) >= 0)) {
+    if (rc || (timeoutp && CompareTime(now = GetMonotonic(), deadline) >= 0)) {
       break;
     }
     if (timeoutp) {
@@ -4571,10 +5158,14 @@ static i32 Select(struct Machine *m,          //
     } else {
       wait = FromMilliseconds(kPollingMs);
     }
+#ifdef __EMSCRIPTEN__
+    GuestWaitHalt(m, timeoutp ? deadline : GetMaxTime(), accepts_input);
+#else
     nanosleep(&wait, 0);
+#endif
   }
   if (sigmaskp_guest) {
-    m->sigmask = oldmask_guest;
+    GuestWaitFinish(m);
     SIG_LOGF("sigmask pop %" PRIx64, m->sigmask);
   }
   if (rc != -1) {
@@ -4589,7 +5180,7 @@ static i32 Select(struct Machine *m,          //
   }
 #ifndef DISABLE_NONPOSIX
   if (timeoutp) {
-    now = GetTime();
+    now = GetMonotonic();
     if (CompareTime(now, deadline) < 0) {
       *timeoutp = SubtractTime(deadline, now);
     } else {
@@ -4603,7 +5194,7 @@ static i32 Select(struct Machine *m,          //
 static i32 SysSelect(struct Machine *m, i32 nfds, i64 readfds_addr,
                      i64 writefds_addr, i64 exceptfds_addr, i64 timeout_addr) {
   i32 rc;
-  struct timespec timeout, *timeoutp;
+  struct timespec timeout, timeout_was, *timeoutp;
 #ifndef DISABLE_NONPOSIX
   struct timeval_linux timeout_linux;
 #endif
@@ -4611,11 +5202,11 @@ static i32 SysSelect(struct Machine *m, i32 nfds, i64 readfds_addr,
   if (timeout_addr) {
     if ((timeoutp_linux = (const struct timeval_linux *)SchlepRW(
              m, timeout_addr, sizeof(*timeoutp_linux)))) {
-      timeout.tv_sec = Read64(timeoutp_linux->sec);
-      timeout.tv_nsec = Read64(timeoutp_linux->usec);
-      if (0 <= timeout.tv_sec &&
-          (0 <= timeout.tv_nsec && timeout.tv_nsec < 1000000)) {
-        timeout.tv_nsec *= 1000;
+      // linux carries whole seconds out of the microseconds (kern_select)
+      timeout.tv_sec = (i64)Read64(timeoutp_linux->sec) +
+                       (i64)Read64(timeoutp_linux->usec) / 1000000;
+      timeout.tv_nsec = (i64)Read64(timeoutp_linux->usec) % 1000000 * 1000;
+      if (0 <= timeout.tv_sec && 0 <= timeout.tv_nsec) {
         timeoutp = &timeout;
       } else {
         return einval();
@@ -4627,12 +5218,15 @@ static i32 SysSelect(struct Machine *m, i32 nfds, i64 readfds_addr,
     timeoutp = 0;
     memset(&timeout, 0, sizeof(timeout));
   }
+  timeout_was = timeout;
   rc =
       Select(m, nfds, readfds_addr, writefds_addr, exceptfds_addr, timeoutp, 0);
 #ifndef DISABLE_NONPOSIX
-  if (timeout_addr) {
+  // linux leaves the time not slept in the timeval, rounded down to a
+  // microsecond, unless the timeout was zero (poll_select_finish)
+  if (timeout_addr && (timeout_was.tv_sec || timeout_was.tv_nsec)) {
     Write64(timeout_linux.sec, timeout.tv_sec);
-    Write64(timeout_linux.usec, (timeout.tv_nsec + 999) / 1000);
+    Write64(timeout_linux.usec, timeout.tv_nsec / 1000);
     CopyToUserWrite(m, timeout_addr, &timeout_linux, sizeof(timeout_linux));
   }
 #endif
@@ -4646,7 +5240,7 @@ static i32 SysPselect(struct Machine *m, i32 nfds, i64 readfds_addr,
   u64 sigmask, *sigmaskp;
   const struct sigset_linux *sm;
   const struct pselect6_linux *ps;
-  struct timespec timeout, *timeoutp;
+  struct timespec timeout, timeout_was, *timeoutp;
 #ifndef DISABLE_NONPOSIX
   struct timespec_linux timeout_linux;
 #endif
@@ -4657,6 +5251,7 @@ static i32 SysPselect(struct Machine *m, i32 nfds, i64 readfds_addr,
     timeoutp = 0;
     memset(&timeout, 0, sizeof(timeout));
   }
+  timeout_was = timeout;
   if (pselect6_addr) {
     if ((ps = (const struct pselect6_linux *)SchlepR(m, pselect6_addr,
                                                      sizeof(*ps)))) {
@@ -4684,7 +5279,8 @@ static i32 SysPselect(struct Machine *m, i32 nfds, i64 readfds_addr,
   rc = Select(m, nfds, readfds_addr, writefds_addr, exceptfds_addr, timeoutp,
               sigmaskp);
 #ifndef DISABLE_NONPOSIX
-  if (timeout_addr) {
+  // like select(), unless the timeout was zero
+  if (timeout_addr && (timeout_was.tv_sec || timeout_was.tv_nsec)) {
     Write64(timeout_linux.sec, timeout.tv_sec);
     Write64(timeout_linux.nsec, timeout.tv_nsec);
     CopyToUserWrite(m, timeout_addr, &timeout_linux, sizeof(timeout_linux));
@@ -4699,6 +5295,7 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
   u64 gfdssize;
   struct Fd *fd;
   int fildes, rc, ev;
+  bool accepts_input = false;
   struct pollfd hfds[1];
   struct pollfd_linux *gfds;
   struct timespec now, wait, remain;
@@ -4707,15 +5304,16 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
       gfdssize <= 0x7ffff000) {
     if ((gfds = (struct pollfd_linux *)AddToFreeList(m, malloc(gfdssize)))) {
       rc = 0;
-      CopyFromUserRead(m, gfds, fdsaddr, gfdssize);
+      if (CopyFromUserRead(m, gfds, fdsaddr, gfdssize) == -1) return -1;
       for (;;) {
         for (i = 0; i < nfds; ++i) {
         TryAgain:
-          if (CheckInterrupt(m, false)) {
+          if (GuestWaitInterrupted(m)) {
             rc = eintr();
             break;
           }
           fildes = Read32(gfds[i].fd);
+          if (fildes < 0) { Write16(gfds[i].revents, 0); continue; }
           LOCK(&m->system->fds.lock);
           if ((fd = GetFd(&m->system->fds, fildes))) {
             unassert(fd->cb);
@@ -4727,6 +5325,7 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
           if (fd) {
             hfds[0].fd = fildes;
             ev = Read16(gfds[i].events);
+            if (IsTerminalFd(fd) && (ev & POLLIN_LINUX)) accepts_input = true;
             hfds[0].events = (((ev & POLLIN_LINUX) ? POLLIN : 0) |
                               ((ev & POLLOUT_LINUX) ? POLLOUT : 0) |
                               ((ev & POLLPRI_LINUX) ? POLLPRI : 0));
@@ -4742,7 +5341,7 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
                 if (hfds[0].revents & POLLOUT) ev |= POLLOUT_LINUX;
                 if (hfds[0].revents & POLLERR) ev |= POLLERR_LINUX;
                 if (hfds[0].revents & POLLHUP) ev |= POLLHUP_LINUX;
-                if (hfds[0].revents & POLLNVAL) ev |= POLLERR_LINUX;
+                if (hfds[0].revents & POLLNVAL) ev |= POLLNVAL_LINUX;
                 if (!ev) ev |= POLLERR_LINUX;
                 Write16(gfds[i].revents, ev);
                 break;
@@ -4757,10 +5356,11 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
                 break;
             }
           } else {
+            ++rc;
             Write16(gfds[i].revents, POLLNVAL_LINUX);
           }
         }
-        if (rc || CompareTime((now = GetTime()), deadline) >= 0) {
+        if (rc || CompareTime((now = GetMonotonic()), deadline) >= 0) {
           break;
         }
         wait = FromMilliseconds(kPollingMs);
@@ -4768,7 +5368,12 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
         if (CompareTime(remain, wait) < 0) {
           wait = remain;
         }
+#ifdef __EMSCRIPTEN__
+        if (GuestWaitCancelled()) return eintr();
+        GuestWaitHalt(m, deadline, accepts_input);
+#else
         nanosleep(&wait, 0);
+#endif
       }
       if (rc != -1) {
         CopyToUserWrite(m, fdsaddr, gfds, nfds * sizeof(*gfds));
@@ -4787,9 +5392,9 @@ static int SysPoll(struct Machine *m, i64 fdsaddr, u64 nfds, i32 timeout_ms) {
   if (timeout_ms < 0) {
     deadline = GetMaxTime();
   } else {
-    deadline = AddTime(GetTime(), FromMilliseconds(timeout_ms));
+    deadline = AddTime(GetMonotonic(), FromMilliseconds(timeout_ms));
   }
-  return Poll(m, fdsaddr, nfds, deadline);
+  return Poll(m, fdsaddr, nfds, GuestWaitDeadline(deadline));
 }
 
 static int SysPpoll(struct Machine *m, i64 fdsaddr, u64 nfds, i64 timeoutaddr,
@@ -4804,18 +5409,18 @@ static int SysPpoll(struct Machine *m, i64 fdsaddr, u64 nfds, i64 timeoutaddr,
     if ((sm = (const struct sigset_linux *)SchlepR(m, sigmaskaddr,
                                                    sizeof(*sm)))) {
       oldmask = m->sigmask;
-      m->sigmask = Read64(sm->sigmask);
+      GuestWaitMask(m, Read64(sm->sigmask));
       SIG_LOGF("sigmask push %" PRIx64, m->sigmask);
     } else {
       return -1;
     }
   }
-  if (!CheckInterrupt(m, false)) {
+  if (!GuestWaitInterrupted(m)) {
     if (timeoutaddr) {
-      if (LoadTimespecRW(m, timeoutaddr, &timeout) == -1) return -1;
-      deadline = AddTime(GetTime(), timeout);
+      if (LoadTimespecRW(m, timeoutaddr, &timeout) == -1) { GuestWaitFinish(m); return -1; }
+      deadline = GuestWaitDeadline(AddTime(GetMonotonic(), timeout));
       rc = Poll(m, fdsaddr, nfds, deadline);
-      now = GetTime();
+      now = GetMonotonic();
       if (CompareTime(now, deadline) >= 0) {
         remain = FromMilliseconds(0);
       } else {
@@ -4828,10 +5433,10 @@ static int SysPpoll(struct Machine *m, i64 fdsaddr, u64 nfds, i64 timeoutaddr,
       rc = Poll(m, fdsaddr, nfds, GetMaxTime());
     }
   } else {
-    rc = -1;
+    rc = eintr();
   }
   if (sigmaskaddr) {
-    m->sigmask = oldmask;
+    GuestWaitFinish(m);
     SIG_LOGF("sigmask pop %" PRIx64, m->sigmask);
   }
   return rc;
@@ -4867,6 +5472,9 @@ static int SysSigprocmask(struct Machine *m, int how, i64 setaddr,
     }
   }
   if (setaddr) {
+#ifdef __EMSCRIPTEN__
+    DebugHistoryMarkIrreversible();
+#endif
     set = Read64(neu);
     if (how == SIG_BLOCK_LINUX) {
       m->sigmask |= set;
@@ -4877,17 +5485,26 @@ static int SysSigprocmask(struct Machine *m, int how, i64 setaddr,
     } else {
       __builtin_unreachable();
     }
+    m->sigmask &= ~((u64)1 << (SIGKILL_LINUX - 1) |
+                    (u64)1 << (SIGSTOP_LINUX - 1));
+#ifndef __EMSCRIPTEN__
     XlatLinuxToSigset(&ss, m->sigmask & ((u64)1 << (SIGTSTP_LINUX - 1) |
                                          (u64)1 << (SIGTTIN_LINUX - 1) |
                                          (u64)1 << (SIGTTOU_LINUX - 1)));
     sigprocmask(SIG_BLOCK, &ss, 0);
+#endif
   }
   Put64(m->ax, 0);
+#ifdef __EMSCRIPTEN__
+  if ((sig = ConsumeSignal(m, &delivered, 0)))
+    TerminateSignal(m, sig, m->signal_codes[sig - 1]);
+#else
   do {
     if ((sig = ConsumeSignal(m, &delivered, 0))) {
       TerminateSignal(m, sig, 0);
     }
   } while (delivered && DeliverSignalRecursively(m, delivered));
+#endif
   return 0;
 }
 
@@ -4898,7 +5515,16 @@ static int SysSigpending(struct Machine *m, i64 setaddr) {
 }
 
 static int SysKill(struct Machine *m, int pid, int sig) {
+#ifdef __EMSCRIPTEN__
+  if (sig < 0 || sig > 64) return einval();
+  if (pid == -1) return esrch(); /* Linux excludes the caller. */
+  if (pid != m->system->pid && pid != 0 &&
+      !(pid < -1 && pid != INT_MIN && -pid == getpgid(0))) return esrch();
+  if (sig) EnqueueSignalWithCode(m, sig, SI_USER_LINUX);
+  return 0;
+#else
   return kill(pid, sig ? XlatSignal(sig) : 0);
+#endif
 }
 
 static bool IsValidThreadId(struct System *s, int tid) {
@@ -4907,6 +5533,12 @@ static bool IsValidThreadId(struct System *s, int tid) {
 }
 
 static int SysTkill(struct Machine *m, int tid, int sig) {
+#ifdef __EMSCRIPTEN__
+  if (tid <= 0 || sig < 0 || sig > 64) return einval();
+  if (tid != m->tid) return esrch();
+  if (sig) EnqueueSignalWithCode(m, sig, SI_TKILL_LINUX);
+  return 0;
+#else
 #if defined(HAVE_FORK) || defined(HAVE_THREADS)
   bool found;
   int rc, err;
@@ -4986,10 +5618,16 @@ static int SysTkill(struct Machine *m, int tid, int sig) {
 #else
   return SysKill(m, tid, sig);
 #endif /* HAVE_THREADS */
+#endif
 }
 
 static int SysTgkill(struct Machine *m, int pid, int tid, int sig) {
   if (pid < 1 || tid < 1) return einval();
+#ifdef __EMSCRIPTEN__
+  if (pid != m->system->pid || tid != m->tid) return esrch();
+  if (sig < 0 || sig > 64) return einval();
+  return SysTkill(m, tid, sig);
+#else
   if (pid != m->system->pid) return eperm();
 #ifdef HAVE_THREADS
   return SysTkill(m, tid, sig);
@@ -4997,10 +5635,15 @@ static int SysTgkill(struct Machine *m, int pid, int tid, int sig) {
   if (tid != pid) return esrch();
   return SysKill(m, tid, sig);
 #endif
+#endif
 }
 
 static int SysPause(struct Machine *m) {
   int rc;
+#ifdef __EMSCRIPTEN__
+  if (GuestWaitInterrupted(m)) return eintr();
+  GuestWaitHalt(m, GetMaxTime(), false);
+#endif
   NORESTART(rc, pause());
   return rc;
 }
@@ -5024,6 +5667,8 @@ static int SysGettid(struct Machine *m) {
 static int SysGetppid(struct Machine *m) {
   return getppid();
 }
+
+#ifndef __EMSCRIPTEN__
 
 static int SysGetuid(struct Machine *m) {
   return getuid();
@@ -5210,6 +5855,211 @@ static i32 SysGetresgid(struct Machine *m,  //
   return 0;
 }
 
+static int SysSetuid(struct Machine *m, int uid) {
+  return setuid(uid);
+}
+
+static int SysSetgid(struct Machine *m, int gid) {
+  return setgid(gid);
+}
+
+#else /* __EMSCRIPTEN__ */
+
+// Emscripten's libc has no users: every id it reports is 0 and every
+// set*id() call fails with EPERM. Blink keeps the process's credentials
+// itself instead, starting as the root the host reports, and changes them
+// by the rules linux applies in kernel/sys.c and kernel/groups.c. Nothing
+// here changes capabilities but the ids, so the process holds CAP_SETUID,
+// CAP_SETGID and the rest exactly while its effective user id is 0, which
+// is how linux's capability rules work out for a process that started as
+// root (cap_emulate_setxuid); the file system uid always follows the
+// effective one, as it does unless setfsuid() is called.
+
+static bool IsPrivileged(struct System *s) {
+  return !s->uid[1];
+}
+
+// Replaces the user or group ids (real, effective, saved) with `ids`, and
+// does what commit_creds() does when an effective id changes: the process
+// is no longer dumpable, and forgets the signal its parent's death sends.
+static void CommitCredentials(struct System *s, const u32 ids[3],
+                              bool group) {
+  u32 *old = group ? s->gid : s->uid;
+  if (ids[1] != old[1]) {
+    s->undumpable = true;
+    s->pdeathsig = 0;
+  }
+  memcpy(old, ids, sizeof(u32) * 3);
+}
+
+static bool IsOneOf(u32 id, const u32 ids[3]) {
+  return id == ids[0] || id == ids[1] || id == ids[2];
+}
+
+// setuid(2) and setgid(2): privileged, all three ids change; otherwise only
+// the effective one, and only to the real or saved id.
+static int SetId(struct System *s, u32 id, bool group) {
+  u32 ids[3];
+  if (id == (u32)-1) return einval();
+  memcpy(ids, group ? s->gid : s->uid, sizeof(ids));
+  if (IsPrivileged(s)) {
+    ids[0] = ids[1] = ids[2] = id;
+  } else if (id == ids[0] || id == ids[2]) {
+    ids[1] = id;
+  } else {
+    return eperm();
+  }
+  CommitCredentials(s, ids, group);
+  return 0;
+}
+
+// setreuid(2) and setregid(2): -1 leaves an id as it is; unprivileged, the
+// real id may become the effective one, and the effective id any of the
+// three. The saved id follows the effective id whenever the real id is set
+// or the effective id moves away from the real one.
+static int SetReId(struct System *s, u32 real, u32 effective, bool group) {
+  u32 old[3], ids[3];
+  memcpy(old, group ? s->gid : s->uid, sizeof(old));
+  memcpy(ids, old, sizeof(ids));
+  if (real != (u32)-1) {
+    if (real != old[0] && real != old[1] && !IsPrivileged(s)) return eperm();
+    ids[0] = real;
+  }
+  if (effective != (u32)-1) {
+    if (!IsOneOf(effective, old) && !IsPrivileged(s)) return eperm();
+    ids[1] = effective;
+  }
+  if (real != (u32)-1 || (effective != (u32)-1 && effective != old[0])) {
+    ids[2] = ids[1];
+  }
+  CommitCredentials(s, ids, group);
+  return 0;
+}
+
+// setresuid(2) and setresgid(2): -1 leaves an id as it is; unprivileged,
+// each id may only become one of the three the process has.
+static int SetResId(struct System *s, u32 real, u32 effective, u32 saved,
+                    bool group) {
+  u32 old[3], ids[3];
+  memcpy(old, group ? s->gid : s->uid, sizeof(old));
+  memcpy(ids, old, sizeof(ids));
+  if (((real != (u32)-1 && !IsOneOf(real, old)) ||
+       (effective != (u32)-1 && !IsOneOf(effective, old)) ||
+       (saved != (u32)-1 && !IsOneOf(saved, old))) &&
+      !IsPrivileged(s)) {
+    return eperm();
+  }
+  if (real != (u32)-1) ids[0] = real;
+  if (effective != (u32)-1) ids[1] = effective;
+  if (saved != (u32)-1) ids[2] = saved;
+  CommitCredentials(s, ids, group);
+  return 0;
+}
+
+static int GetResId(struct Machine *m, const u32 ids[3], i64 realaddr,
+                    i64 effectiveaddr, i64 savedaddr) {
+  u8 word[4];
+  Write32(word, ids[0]);
+  if (CopyToUserWrite(m, realaddr, word, 4) == -1) return -1;
+  Write32(word, ids[1]);
+  if (CopyToUserWrite(m, effectiveaddr, word, 4) == -1) return -1;
+  Write32(word, ids[2]);
+  return CopyToUserWrite(m, savedaddr, word, 4);
+}
+
+// The ids are unsigned, so they are returned as such rather than as an
+// int whose sign extension would turn an id above 2**31 into an error.
+static i64 SysGetuid(struct Machine *m) {
+  return m->system->uid[0];
+}
+
+static i64 SysGetgid(struct Machine *m) {
+  return m->system->gid[0];
+}
+
+static i64 SysGeteuid(struct Machine *m) {
+  return m->system->uid[1];
+}
+
+static i64 SysGetegid(struct Machine *m) {
+  return m->system->gid[1];
+}
+
+static int SysSetuid(struct Machine *m, u32 uid) {
+  return SetId(m->system, uid, false);
+}
+
+static int SysSetgid(struct Machine *m, u32 gid) {
+  return SetId(m->system, gid, true);
+}
+
+static int SysSetreuid(struct Machine *m, u32 real, u32 effective) {
+  return SetReId(m->system, real, effective, false);
+}
+
+static int SysSetregid(struct Machine *m, u32 real, u32 effective) {
+  return SetReId(m->system, real, effective, true);
+}
+
+static i32 SysSetresuid(struct Machine *m, u32 real, u32 effective,
+                        u32 saved) {
+  return SetResId(m->system, real, effective, saved, false);
+}
+
+static i32 SysSetresgid(struct Machine *m, u32 real, u32 effective,
+                        u32 saved) {
+  return SetResId(m->system, real, effective, saved, true);
+}
+
+static i32 SysGetresuid(struct Machine *m, i64 realaddr, i64 effectiveaddr,
+                        i64 savedaddr) {
+  return GetResId(m, m->system->uid, realaddr, effectiveaddr, savedaddr);
+}
+
+static i32 SysGetresgid(struct Machine *m, i64 realaddr, i64 effectiveaddr,
+                        i64 savedaddr) {
+  return GetResId(m, m->system->gid, realaddr, effectiveaddr, savedaddr);
+}
+
+// getgroups(2): a size of 0 asks how many groups there are; any other size
+// must hold them all.
+static i32 SysGetgroups(struct Machine *m, i32 size, i64 addr) {
+  u8 *words;
+  u32 i, n = m->system->ngroups;
+  if (size < 0) return einval();
+  if (!size || !n) return n;
+  if ((u32)size < n) return einval();
+  if (!(words = (u8 *)AddToFreeList(m, malloc(n * 4)))) return -1;
+  for (i = 0; i < n; ++i) Write32(words + i * 4, m->system->groups[i]);
+  if (CopyToUserWrite(m, addr, words, n * 4) == -1) return -1;
+  return n;
+}
+
+static int CompareGroups(const void *a, const void *b) {
+  u32 x = *(const u32 *)a, y = *(const u32 *)b;
+  return x < y ? -1 : x > y;
+}
+
+// setgroups(2) needs CAP_SETGID, and keeps the list sorted, as linux does.
+static i32 SysSetgroups(struct Machine *m, i32 size, i64 addr) {
+  u32 i, *groups;
+  const u8 *words = 0;
+  if (!IsPrivileged(m->system)) return eperm();
+  if ((u32)size > NGROUPS_MAX_LINUX) return einval();
+  if (size && !(words = (const u8 *)SchlepR(m, addr, (size_t)size * 4))) {
+    return -1;
+  }
+  if (!(groups = (u32 *)malloc(MAX(size, 1) * sizeof(*groups)))) return -1;
+  for (i = 0; i < (u32)size; ++i) groups[i] = Read32(words + i * 4);
+  qsort(groups, size, sizeof(*groups), CompareGroups);
+  free(m->system->groups);
+  m->system->groups = groups;
+  m->system->ngroups = size;
+  return 0;
+}
+
+#endif /* __EMSCRIPTEN__ */
+
 static int SysSchedYield(struct Machine *m) {
 #ifdef HAVE_SCHED_YIELD
   return sched_yield();
@@ -5222,14 +6072,6 @@ static int SysUmask(struct Machine *m, int mask) {
   return umask(mask);
 }
 
-static int SysSetuid(struct Machine *m, int uid) {
-  return setuid(uid);
-}
-
-static int SysSetgid(struct Machine *m, int gid) {
-  return setgid(gid);
-}
-
 static int SysGetpgid(struct Machine *m, int pid) {
   return getpgid(pid);
 }
@@ -5239,7 +6081,11 @@ static int SysGetpgrp(struct Machine *m) {
 }
 
 static int SysAlarm(struct Machine *m, unsigned seconds) {
+#ifdef __EMSCRIPTEN__
+  return GuestTimerAlarm(seconds);
+#else
   return alarm(seconds);
+#endif
 }
 
 static int SysSetpgid(struct Machine *m, int pid, int gid) {
@@ -5474,9 +6320,159 @@ static int SysEpollWait(struct Machine *m, i32 epfd, i64 eventsaddr,
 
 #endif /* HAVE_EPOLL_PWAIT1 */
 
+DESCRIBE_SYSCALL(2, 0x0E4, "clock_gettime")
+
+extern const struct SyscallDescription __start_blink_syscalls[];
+extern const struct SyscallDescription __stop_blink_syscalls[];
+
+int CountSyscalls(void) {
+  return __stop_blink_syscalls - __start_blink_syscalls;
+}
+
+// The calls OpSyscall() answers, in no particular order.
+const struct SyscallDescription *GetSyscalls(void) {
+  return __start_blink_syscalls;
+}
+
+/* Native history captures CPU and memory, but not open descriptions, streams, virtual mappings,
+ * process credentials or filesystem metadata. Keep their successful effects as visible history
+ * rows which Undo refuses to cross. Queries and failed no-effect calls stay reversible. */
+#ifdef __EMSCRIPTEN__
+static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result,
+                                        i64 arg1, i64 arg2, i64 arg3,
+                                        i64 arg4, i64 oldbrk) {
+  if (result == -1) return;
+  switch (call & 0xfff) {
+    case 0x000: /* read: advances an open description or takes pipe bytes */
+    case 0x013: /* readv */
+    case 0x001: /* write, except the deferred terminal transcript */
+    case 0x014: /* writev */
+      if (result > 0 && !IsTerminalFildes(m, arg1))
+        DebugHistoryMarkIrreversible();
+      break;
+    case 0x011: /* pread64: a regular File does not move its offset */
+    case 0x127: /* preadv */
+      break;
+    case 0x147: /* preadv2 with offset -1 advances the open description */
+      if (result > 0 && arg4 == -1 && !IsTerminalFildes(m, arg1))
+        DebugHistoryMarkIrreversible();
+      break;
+    case 0x012: /* pwrite64 */
+    case 0x128: /* pwritev */
+    case 0x148: /* pwritev2 */
+    case 0x0D9: /* getdents64: moves the directory cursor */
+      if (result > 0) DebugHistoryMarkIrreversible();
+      break;
+    case 0x028: /* sendfile: an explicit input offset and terminal output change memory only */
+      if (result > 0 && (!arg3 || !IsTerminalFildes(m, arg1)))
+        DebugHistoryMarkIrreversible();
+      break;
+    case 0x09E: /* arch_prctl: segment bases and CPUID trapping are outside register history */
+      if (arg1 == ARCH_SET_FS_LINUX || arg1 == ARCH_SET_GS_LINUX ||
+          arg1 == ARCH_SET_CPUID_LINUX) DebugHistoryMarkIrreversible();
+      break;
+    case 0x00C: /* brk: a query or refused change returns the old break */
+      if (m->system->brk != oldbrk) DebugHistoryMarkIrreversible();
+      break;
+    case 0x010: /* ioctl: only mutating terminal/descriptor operations */
+      switch (arg2) {
+        case TIOCSWINSZ_LINUX: case TCSETS_LINUX: case TCSETSW_LINUX:
+        case TCSETSF_LINUX: case TIOCSPGRP_LINUX: case FIONBIO_LINUX:
+        case FIOCLEX_LINUX: case FIONCLEX_LINUX:
+          DebugHistoryMarkIrreversible();
+      }
+      break;
+    case 0x048: /* fcntl: getter commands leave flags alone */
+      if (arg2 == F_DUPFD_LINUX || arg2 == F_DUPFD_CLOEXEC_LINUX ||
+          arg2 == F_SETFD_LINUX || arg2 == F_SETFL_LINUX ||
+          arg2 == F_SETLK_LINUX || arg2 == F_SETLKW_LINUX ||
+          arg2 == F_SETOWN_LINUX || arg2 == F_SETOWN_EX_LINUX)
+        DebugHistoryMarkIrreversible();
+      break;
+    case 0x09D: /* prctl */
+      if (arg1 == PR_SET_TSC_LINUX || arg1 == PR_SET_NAME_LINUX ||
+          arg1 == PR_SET_PDEATHSIG_LINUX || arg1 == PR_SET_DUMPABLE_LINUX ||
+          arg1 == PR_SET_NO_NEW_PRIVS_LINUX)
+        DebugHistoryMarkIrreversible();
+      break;
+    case 0x00F: /* rt_sigreturn is handled in signal.c */
+      break;
+    case 0x021: /* dup2(fd, fd) is a validated no-op */
+      if (arg1 != arg2) DebugHistoryMarkIrreversible();
+      break;
+    case 0x008: /* lseek(fd, 0, SEEK_CUR) only asks for the offset */
+      if (arg2 || arg3 != SEEK_CUR_LINUX) DebugHistoryMarkIrreversible();
+      break;
+    case 0x12E: /* prlimit64 with no new limit is a query */
+      if (arg3) DebugHistoryMarkIrreversible();
+      break;
+    case 0x002: /* open */
+    case 0x003: /* close */
+    case 0x009: /* mmap */
+    case 0x00A: /* mprotect */
+    case 0x00B: /* munmap */
+    case 0x019: /* mremap */
+    case 0x01A: /* msync */
+    case 0x020: /* dup */
+    case 0x04C: /* truncate */
+    case 0x04D: /* ftruncate */
+    case 0x050: /* chdir */
+    case 0x051: /* fchdir */
+    case 0x052: /* rename */
+    case 0x053: /* mkdir */
+    case 0x054: /* rmdir */
+    case 0x055: /* creat */
+    case 0x056: /* link */
+    case 0x057: /* unlink */
+    case 0x058: /* symlink */
+    case 0x05A: /* chmod */
+    case 0x05B: /* fchmod */
+    case 0x05C: /* chown */
+    case 0x05D: /* fchown */
+    case 0x05E: /* lchown */
+    case 0x05F: /* umask */
+    case 0x06D: /* setpgid */
+    case 0x069: /* setuid */
+    case 0x06A: /* setgid */
+    case 0x070: /* setsid */
+    case 0x071: /* setreuid */
+    case 0x072: /* setregid */
+    case 0x074: /* setgroups */
+    case 0x075: /* setresuid */
+    case 0x077: /* setresgid */
+    case 0x084: /* utime */
+    case 0x0A0: /* setrlimit */
+    case 0x0DA: /* set_tid_address */
+    case 0x0EB: /* utimes */
+    case 0x101: /* openat */
+    case 0x102: /* mkdirat */
+    case 0x104: /* fchownat */
+    case 0x105: /* futimesat */
+    case 0x107: /* unlinkat */
+    case 0x108: /* renameat */
+    case 0x109: /* linkat */
+    case 0x10A: /* symlinkat */
+    case 0x10C: /* fchmodat */
+    case 0x111: /* set_robust_list */
+    case 0x118: /* utimensat */
+    case 0x124: /* dup3 */
+    case 0x13C: /* renameat2 */
+    case 0x1B4: /* close_range */
+    case 0x016: /* pipe */
+    case 0x125: /* pipe2 */
+      DebugHistoryMarkIrreversible();
+      break;
+    case 0x083: /* sigaltstack with no new stack is a query */
+      if (arg1) DebugHistoryMarkIrreversible();
+      break;
+  }
+}
+#endif
+
 void OpSyscall(P) {
   size_t mark;
-  u64 ax, di, si, dx, r0, r8, r9;
+  u64 ax, call, di, si, dx, r0, r8, r9;
+  i64 oldbrk;
   unassert(!m->nofault);
   // SYSCALL saves the next RIP and the architectural RFLAGS word, before
   // any syscall (including the clock_gettime fast path) can change state.
@@ -5517,12 +6513,14 @@ void OpSyscall(P) {
   mark = m->freelist.n;
   m->interrupted = false;
   ax = Get64(m->ax);
+  call = ax;
   di = Get64(m->di);
   si = Get64(m->si);
   dx = Get64(m->dx);
   r0 = Get64(m->r10);
   r8 = Get64(m->r8);
   r9 = Get64(m->r9);
+  oldbrk = m->system->brk;
   switch (ax & 0xfff) {
     SYSCALL(3, 0x000, "read", SysRead, STRACE_READ);
     SYSCALL(3, 0x001, "write", SysWrite, STRACE_WRITE);
@@ -5534,8 +6532,8 @@ void OpSyscall(P) {
     SYSCALL(3, 0x007, "poll", SysPoll, STRACE_3);
     SYSCALL(3, 0x008, "lseek", SysLseek, STRACE_LSEEK);
     SYSCALL(6, 0x009, "mmap", SysMmap, STRACE_MMAP);
-    SYSCALL(4, 0x011, "pread", SysPread, STRACE_PREAD);
-    SYSCALL(4, 0x012, "pwrite", SysPwrite, STRACE_PWRITE);
+    SYSCALL(4, 0x011, "pread64", SysPread, STRACE_PREAD);
+    SYSCALL(4, 0x012, "pwrite64", SysPwrite, STRACE_PWRITE);
     SYSCALL(5, 0x017, "select", SysSelect, STRACE_SELECT);
     SYSCALL(5, 0x019, "mremap", SysMremap, STRACE_5);
     SYSCALL(6, 0x10E, "pselect6", SysPselect, STRACE_6);
@@ -5610,13 +6608,15 @@ void OpSyscall(P) {
     SYSCALL(2, 0x072, "setregid", SysSetregid, STRACE_SETREGID);
     SYSCALL(2, 0x082, "rt_sigsuspend", SysSigsuspend, STRACE_SIGSUSPEND);
     SYSCALL(2, 0x083, "sigaltstack", SysSigaltstack, STRACE_2);
+#ifdef HAVE_MKFIFOAT
     SYSCALL(3, 0x085, "mknod", SysMknod, STRACE_3);
+#endif
     SYSCALL(2, 0x09E, "arch_prctl", SysArchPrctl, STRACE_2);
     SYSCALL(2, 0x0A0, "setrlimit", SysSetrlimit, STRACE_SETRLIMIT);
     SYSCALL(0, 0x0A2, "sync", SysSync, STRACE_SYNC);
-    SYSCALL(3, 0x0D9, "getdents", SysGetdents, STRACE_3);
+    SYSCALL(3, 0x0D9, "getdents64", SysGetdents, STRACE_3);
     SYSCALL(1, 0x0DA, "set_tid_address", SysSetTidAddress, STRACE_1);
-    SYSCALL(4, 0x0DD, "fadvise", SysFadvise, STRACE_4);
+    SYSCALL(4, 0x0DD, "fadvise64", SysFadvise, STRACE_4);
 #ifdef HAVE_CLOCK_SETTIME
     SYSCALL(2, 0x0E3, "clock_settime", SysClockSettime, STRACE_2);
 #endif
@@ -5628,7 +6628,7 @@ void OpSyscall(P) {
     SYSCALL(4, 0x118, "utimensat", SysUtimensat, STRACE_UTIMENSAT);
     SYSCALL(4, 0x101, "openat", SysOpenat, STRACE_OPENAT);
     SYSCALL(3, 0x102, "mkdirat", SysMkdirat, STRACE_MKDIRAT);
-    SYSCALL(4, 0x106, "fstatat", SysFstatat, STRACE_FSTATAT);
+    SYSCALL(4, 0x106, "newfstatat", SysFstatat, STRACE_FSTATAT);
     SYSCALL(3, 0x107, "unlinkat", SysUnlinkat, STRACE_UNLINKAT);
     SYSCALL(4, 0x108, "renameat", SysRenameat, STRACE_RENAMEAT);
     SYSCALL(5, 0x109, "linkat", SysLinkat, STRACE_LINKAT);
@@ -5664,8 +6664,18 @@ void OpSyscall(P) {
     SYSCALL(4, 0x03D, "wait4", SysWait4, STRACE_WAIT4);
     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
 #endif /* HAVE_FORK */
+#ifdef __EMSCRIPTEN__
+    SYSCALL(4, 0x03D, "wait4", SysWait4, STRACE_WAIT4);
+    SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
+    SYSCALL(2, 0x0C8, "tkill", SysTkill, STRACE_TKILL);
+    SYSCALL(3, 0x0EA, "tgkill", SysTgkill, STRACE_3);
+#endif
 #ifdef HAVE_THREADS
     SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
+#endif
+#ifdef __EMSCRIPTEN__
+    SYSCALL(1, 0x016, "pipe", SysPipe, STRACE_PIPE);
+    SYSCALL(2, 0x125, "pipe2", SysPipe2, STRACE_PIPE2);
 #endif
 #if defined(HAVE_FORK) || defined(HAVE_THREADS)
     SYSCALL(1, 0x016, "pipe", SysPipe, STRACE_PIPE);
@@ -5681,21 +6691,21 @@ void OpSyscall(P) {
     SYSCALL(3, 0x112, "get_robust_list", SysGetRobustList, STRACE_3);
     SYSCALL(2, 0x08C, "getpriority", SysGetpriority, STRACE_2);
     SYSCALL(3, 0x08D, "setpriority", SysSetpriority, STRACE_3);
-    SYSCALL(2, 0x08E, "sched_set_param", SysSchedSetparam, STRACE_2);
-    SYSCALL(2, 0x08F, "sched_get_param", SysSchedGetparam, STRACE_2);
-    SYSCALL(3, 0x090, "sched_set_scheduler", SysSchedSetscheduler, STRACE_3);
-    SYSCALL(1, 0x091, "sched_get_scheduler", SysSchedGetscheduler, STRACE_1);
+    SYSCALL(2, 0x08E, "sched_setparam", SysSchedSetparam, STRACE_2);
+    SYSCALL(2, 0x08F, "sched_getparam", SysSchedGetparam, STRACE_2);
+    SYSCALL(3, 0x090, "sched_setscheduler", SysSchedSetscheduler, STRACE_3);
+    SYSCALL(1, 0x091, "sched_getscheduler", SysSchedGetscheduler, STRACE_1);
     SYSCALL(1, 0x092, "sched_get_priority_max", SysSchedGetPriorityMax,
             STRACE_1);
     SYSCALL(1, 0x093, "sched_get_priority_min", SysSchedGetPriorityMin,
             STRACE_1);
 #ifndef DISABLE_NONPOSIX
-    SYSCALL(3, 0x0CB, "sched_set_affinity", SysSchedSetaffinity, STRACE_3);
+    SYSCALL(3, 0x0CB, "sched_setaffinity", SysSchedSetaffinity, STRACE_3);
 #endif
 #endif /* defined(HAVE_FORK) || defined(HAVE_THREADS) */
 #ifndef DISABLE_NONPOSIX
     SYSCALL(4, 0x028, "sendfile", SysSendfile, STRACE_4);
-    SYSCALL(3, 0x0CC, "sched_get_affinity", SysSchedGetaffinity, STRACE_3);
+    SYSCALL(3, 0x0CC, "sched_getaffinity", SysSchedGetaffinity, STRACE_3);
     SYSCALL(1, 0x00C, "brk", SysBrk, STRACE_1);
     SYSCALL(1, 0x063, "sysinfo", SysSysinfo, STRACE_1);
     SYSCALL(2, 0x074, "setgroups", SysSetgroups, STRACE_2);
@@ -5711,15 +6721,19 @@ void OpSyscall(P) {
     SYSCALL(5, 0x0A5, "mount", SysMount, STRACE_MOUNT);
 #endif
     SYSCALL(3, 0x124, "dup3", SysDup3, STRACE_DUP3);
+#ifdef HAVE_MKFIFOAT
     SYSCALL(4, 0x103, "mknodat", SysMknodat, STRACE_4);
+#endif
     SYSCALL(4, 0x127, "preadv", SysPreadv, STRACE_PREADV);
     SYSCALL(4, 0x128, "pwritev", SysPwritev, STRACE_PWRITEV);
-    SYSCALL(4, 0x12E, "prlimit", SysPrlimit, STRACE_PRLIMIT);
+    SYSCALL(4, 0x12E, "prlimit64", SysPrlimit, STRACE_PRLIMIT);
     SYSCALL(5, 0x10F, "ppoll", SysPpoll, STRACE_5);
     SYSCALL(5, 0x13C, "renameat2", SysRenameat2, STRACE_RENAMEAT2);
+#if defined(HAVE_GETRANDOM) || defined(__EMSCRIPTEN__)
     SYSCALL(3, 0x13E, "getrandom", SysGetrandom, STRACE_GETRANDOM);
-    SYSCALL(5, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
-    SYSCALL(5, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
+#endif
+    SYSCALL(6, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
+    SYSCALL(6, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
@@ -5730,12 +6744,15 @@ void OpSyscall(P) {
     SYSCALL(6, 0x1B9, "epoll_pwait2", SysEpollPwait2, STRACE_6);
 #endif /* HAVE_EPOLL_PWAIT1 */
 #endif /* DISABLE_NONPOSIX */
+    DESCRIBE_SYSCALL(1, 0x03C, "exit")
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
       SysExit(m, di);
+    DESCRIBE_SYSCALL(1, 0x0E7, "exit_group")
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
       SysExitGroup(m, di);
+    DESCRIBE_SYSCALL(0, 0x00F, "rt_sigreturn")
     case 0x00F:
       SigRestore(m);
       m->interrupted = true;  // preevnt ax clobber
@@ -5749,6 +6766,7 @@ void OpSyscall(P) {
       if (!m->system->iscosmo) goto DefaultCase;
       ax = enosys();
       break;
+    DESCRIBE_SYSCALL(1, 0x0C9, "time")
     case 0x0C9:
       // time() is also noisy in some environments.
       ax = SysTime(m, di);
@@ -5760,6 +6778,9 @@ void OpSyscall(P) {
       break;
   }
   if (!m->interrupted) {
+#ifdef __EMSCRIPTEN__
+    MarkUnjournaledSyscallEffect(m, call, ax, di, si, dx, r0, oldbrk);
+#endif
     Put64(m->ax, ax != -1 ? ax : -(XlatErrno(errno) & 0xfff));
   }
   unassert(--m->sysdepth >= 0);
@@ -5767,4 +6788,5 @@ void OpSyscall(P) {
   unassert(!m->pagelocks.i || m->sysdepth);
   CollectGarbage(m, mark);
   m->insyscall = false;
+  GuestWaitFinish(m);
 }

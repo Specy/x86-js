@@ -20,7 +20,8 @@ import type { X86CompileResult, X86Project } from '../../src/types'
 export const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../fixtures/gcc-intel-v1')
 
 export type Outcome =
-    | { readonly kind: 'exit'; readonly value: number }
+    /** `output` is what the program writes to standard output; without one it writes nothing. */
+    | { readonly kind: 'exit'; readonly value: number; readonly output?: string }
     | { readonly kind: 'link-failure'; readonly symbols: readonly string[] }
     | { readonly kind: 'translation-error'; readonly code: TranslationDiagnosticCode }
 
@@ -43,6 +44,8 @@ export type RecordedRuns = {
         readonly signal?: string
         readonly error?: string
         readonly timedOut?: boolean
+        /** What it wrote to standard output, as UTF-8; recorded since the inline-assembly cases. */
+        readonly stdout?: string
     }
 }
 
@@ -222,7 +225,9 @@ export function errors(build: X86CompileResult): string {
 
 /** The executable the last successful build linked. */
 export function linkedProgram(emulator: X86Emulator): Uint8Array {
-    return Uint8Array.from(emulator.module.FS.readFile('/program') as Uint8Array)
+    const program = emulator.getExecutable()
+    if (!program) throw new Error('nothing was linked')
+    return program
 }
 
 /** `length` bytes of a linked executable at `address`, from the allocated section holding them. */
@@ -252,14 +257,35 @@ export async function runInBlink(emulator: X86Emulator, limit = RUN_LIMIT): Prom
     return stop.exitCode
 }
 
+/**
+ * {@link runInBlink}, also returning what the program wrote to standard output as UTF-8: all of
+ * it, since the runtime writes nothing of its own there.
+ */
+export async function runInBlinkWithOutput(
+    emulator: X86Emulator,
+    limit = RUN_LIMIT,
+): Promise<{ readonly value: number; readonly output: string }> {
+    const bytes: number[] = []
+    const stop = emulator.on('stdout', (chunk) => void bytes.push(...chunk))
+    try {
+        const value = await runInBlink(emulator, limit)
+        return { value, output: new TextDecoder().decode(Uint8Array.from(bytes)) }
+    } finally {
+        stop()
+    }
+}
+
 /** Native runs need an x86-64 Linux host; elsewhere they are skipped, visibly. */
 export const NATIVE = process.platform === 'linux' && process.arch === 'x64'
 const NATIVE_TIMEOUT_MS = 10_000
 
 let nativeScratch: string | null = null
 
-/** Runs an executable on the host and returns its exit status, which is the exit value's low byte. */
-export function runNatively(program: Uint8Array, name: string): number {
+/**
+ * Runs an executable on the host and returns its exit status, which is the exit value's low byte,
+ * and what it wrote to standard output, as UTF-8.
+ */
+export function runNatively(program: Uint8Array, name: string): { readonly status: number; readonly output: string } {
     nativeScratch ??= mkdtempSync(join(tmpdir(), 'compiler-output-'))
     const path = join(nativeScratch, `${name.replace(/[^\w.-]/g, '_')}.elf`)
     writeFileSync(path, program)
@@ -268,7 +294,7 @@ export function runNatively(program: Uint8Array, name: string): number {
         const run = spawnSync(path, [], { timeout: NATIVE_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'] })
         if (run.error) throw run.error
         if (run.status === null) throw new Error(`the program was killed by ${run.signal}`)
-        return run.status
+        return { status: run.status, output: run.stdout.toString('utf8') }
     } finally {
         rmSync(path, { force: true })
     }

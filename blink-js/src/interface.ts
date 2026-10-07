@@ -78,7 +78,11 @@ export type PokeWrite =
       }
 
 export type ExecutionStep = {
+    /** Opaque native identity; never convert to a JavaScript number. */
+    serial: string
     kind: ExecutionStepKind
+    /** Whether Undo can cross this row. Earlier rows remain visible behind a false value. */
+    undoable: boolean
     mutations: MutationOperation[]
     pc: number
     old_ccr: {
@@ -161,14 +165,12 @@ export type MutationOperation =
           value: string
       }
 
-
 export type EmulatorDecoration = {
     type: 'below-line'
     note?: string
     belowLine: number
     md: string
 }
-
 
 export type CompilationError = {
     type: 'raw'
@@ -180,6 +182,7 @@ export enum EmulatorStatus {
     Running = 1,
     WaitingForInput = 2,
     NotReady = 3,
+    Waiting = 4
 }
 
 export type Instruction = {
@@ -201,70 +204,67 @@ export type EmulatorConfig<R extends string> = {
 export abstract class BaseEmulator<
     T,
     R extends string,
-    CompileResult = { ok: true } | { ok: false, errors: CompilationError[], report: string },
+    CompileResult = { ok: true } | { ok: false; errors: CompilationError[]; report: string }
 > {
-
     protected _registerNames: R[]
     protected _systemSize: RegisterSize
     protected _endianness: 'little' | 'big'
 
     constructor(options: EmulatorConfig<R>) {
-        this._registerNames = options.registerNames;
-        this._systemSize = options.systemSize;
-        this._endianness = options.endianness ?? 'little';
+        this._registerNames = options.registerNames
+        this._systemSize = options.systemSize
+        this._endianness = options.endianness ?? 'little'
     }
 
     getSystemSize(): RegisterSize {
-        return this._systemSize;
+        return this._systemSize
     }
 
     getEndianness(): 'little' | 'big' {
-        return this._endianness;
+        return this._endianness
     }
-
-
 
     getRegisterNames(): R[] {
-        return this._registerNames;
+        return this._registerNames
     }
 
-    abstract initialize(undoSize: number): void;
+    abstract initialize(undoSize: number): void
 
-    abstract getCompiledCode(): { decorations: EmulatorDecoration[], code: string }
+    abstract getCompiledCode(): { decorations: EmulatorDecoration[]; code: string }
 
-    abstract dispose(): void;
+    abstract dispose(): void
 
-    abstract stringifyError(error: unknown): string;
+    abstract stringifyError(error: unknown): string
 
-    abstract compile(code: string): Promise<CompileResult>;
+    abstract compile(code: string): Promise<CompileResult>
 
-    abstract checkCode(code: string): Promise<MonacoError[]>;
+    abstract checkCode(code: string): Promise<MonacoError[]>
 
-    abstract undo(): void;
+    abstract undo(): void
 
-    abstract canUndo(): boolean;
+    abstract canUndo(): boolean
 
     abstract step(): Promise<{ terminated: boolean }>
 
-    abstract getStatus(): EmulatorStatus;
+    abstract getStatus(): EmulatorStatus
 
-    abstract writeMemoryBytes(address: bigint, data: Uint8Array): void;
+    abstract writeMemoryBytes(address: bigint, data: Uint8Array): void
 
-    abstract readMemoryBytes(address: bigint, length: bigint): Uint8Array;
+    abstract readMemoryBytes(address: bigint, length: bigint): Uint8Array
 
-    abstract getNextInstruction(): Instruction | null;
+    abstract getNextInstruction(): Instruction | null
 
     abstract getUndoHistory(max: number): ExecutionStep[]
 
-    abstract getPc(): bigint;
+    abstract getPc(): bigint
 
-    abstract getSp(): bigint;
+    abstract getSp(): bigint
 
-    abstract getFlags(): {name: string, value: number, prev?: number}[];
+    abstract getFlags(): { name: string; value: number; prev?: number }[]
 
-    abstract getCallStack(): StackFrame[];
+    abstract getCallStack(): StackFrame[]
 
-    abstract getInstructionAt(address: bigint): Instruction | null;
+    abstract getInstructionAt(address: bigint): Instruction | null
 
     abstract getRegisterValues(): bigint[]
 
@@ -272,13 +272,13 @@ export abstract class BaseEmulator<
 
     abstract getRegisterValue(register: R, size?: RegisterSize): bigint
 
-    abstract setRegisterValue(register: R, value: bigint, size?: RegisterSize): void;
+    abstract setRegisterValue(register: R, value: bigint, size?: RegisterSize): void
 
     abstract hasTerminated(): boolean
 
     abstract run(
         limit?: number,
         breakpoints?: Array<number | { path: string; line: number }>,
-        options?: { skipBreakpointAtPc?: boolean },
-    ): Promise<EmulatorStatus>;
+        options?: { skipBreakpointAtPc?: boolean }
+    ): Promise<EmulatorStatus>
 }

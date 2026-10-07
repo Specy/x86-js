@@ -1,6 +1,6 @@
 {
   "profile": "gcc-intel-v1",
-  "description": "The corpus for the x86 compiler-output translator's milestone 0: every program, what it exercises and its intended outcome. scripts/capture-gcc-fixtures.mjs compiles each program with Compiler Explorer at each level into cases/<program>-O<level>.json.gz, and builds the x87 matrix into x87/<form>.json.gz. Every program is compiled as `sourcePaths[language]` with the flag groups below at each of `optimizations`, unless the program narrows its own `optimizations`, replaces a flag (`flags.replace`) or adds some (`flags.add`). Headers are sent at the request's root; `files` are NASM Files beside the source in the Project. An `exit` value is the full value Blink reports; the native status is its low byte. `outcomes` overrides `outcome` for one level. A program meant to fail translation may name a `referenceOutcome`, the outcome its GNU as reference must still reach, built at capture time to show the program itself works as written; `note` explains an outcome. `x87Matrix` lists the hand-written x87 forms.",
+  "description": "The corpus for the x86 compiler-output translator's milestone 0: every program, what it exercises and its intended outcome. scripts/capture-gcc-fixtures.mjs compiles each program with Compiler Explorer at each level into cases/<program>-O<level>.json.gz, and builds the x87 matrix into x87/<form>.json.gz. Every program is compiled as `sourcePaths[language]` with the flag groups below at each of `optimizations`, unless the program narrows its own `optimizations`, replaces a flag (`flags.replace`) or adds some (`flags.add`). Headers are sent at the request's root; `files` are NASM Files beside the source in the Project. An `exit` value is the full value Blink reports; the native status is its low byte. An `exit` outcome's `output`, when present, is what the program writes to standard output, in Blink and natively; without one it writes nothing. `outcomes` overrides `outcome` for one level. A program meant to fail translation may name a `referenceOutcome`, the outcome its GNU as reference must still reach, built at capture time to show the program itself works as written; `note` explains an outcome. `x87Matrix` lists the hand-written x87 forms.",
   "compilerExplorer": {
     "endpoint": "https://godbolt.org/api/compiler/<compiler>/compile",
     "compilers": {
@@ -393,13 +393,13 @@
     {
       "name": "inlineasm",
       "language": "c",
-      "exercises": "Inline assembly between `#APP` and `#NO_APP` (gate 4)",
+      "exercises": "Inline assembly between `#APP` and `#NO_APP` (gate 4): an `add` whose `+r` operand GCC substitutes as a register before the translator reads it",
       "source": "int main(void) {\n    int value = 40;\n    __asm__ volatile(\"add %0, 2\" : \"+r\"(value));\n    return value;\n}\n",
       "headers": {},
       "files": {},
       "outcome": {
-        "kind": "translation-error",
-        "code": "inline-assembly"
+        "kind": "exit",
+        "value": 42
       }
     },
     {
@@ -594,6 +594,110 @@
         "kind": "exit",
         "value": 142
       }
+    },
+    {
+      "name": "simwrite",
+      "language": "c",
+      "exercises": "System calls through inline assembly, as the Environment library's `<sim.h>` makes them: `static inline` wrappers whose register-bound operands GCC substitutes around a `syscall`, inlined, as a local function (called directly at -O0 and -Os, through a volatile pointer at every level) and a `noreturn` exit; a negative errno comes back raw",
+      "source": "#include <sim.h>\n\nstatic const char greeting[] = \"Hello from sim.h\\n\";\n\nint main(void) {\n    long (*volatile writer)(long, const void *, long) = sim_write;\n    long written = sim_write(1, greeting, sizeof greeting - 1);\n    long again = writer(1, \"and again\\n\", 10);\n    long refused = sim_write(99, greeting, 1);\n    sim_exit(written + again + (refused == -9 ? 0 : 100));\n}\n",
+      "headers": {
+        "sysroot/include/sim.h": "#ifndef SIM_H\n#define SIM_H\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n/** Writes count bytes from buf to the descriptor fd; returns the count written or a negative errno. */\nstatic inline long sim_write(long fd, const void *buf, long count) {\n    register long rax __asm__(\"rax\") = 1;\n    register long rdi __asm__(\"rdi\") = fd;\n    register const void *rsi __asm__(\"rsi\") = buf;\n    register long rdx __asm__(\"rdx\") = count;\n    __asm__ volatile(\"syscall\" : \"+r\"(rax) : \"r\"(rdi), \"r\"(rsi), \"r\"(rdx) : \"rcx\", \"r11\", \"memory\");\n    return rax;\n}\n\n/** Ends the calling thread with a status. */\n__attribute__((noreturn)) static inline void sim_exit(long status) {\n    register long rax __asm__(\"rax\") = 60;\n    register long rdi __asm__(\"rdi\") = status;\n    __asm__ volatile(\"syscall\" : : \"r\"(rax), \"r\"(rdi) : \"rcx\", \"r11\", \"memory\");\n    __builtin_unreachable();\n}\n\n/** Ends every thread of the process with a status. */\n__attribute__((noreturn)) static inline void sim_exit_group(long status) {\n    register long rax __asm__(\"rax\") = 231;\n    register long rdi __asm__(\"rdi\") = status;\n    __asm__ volatile(\"syscall\" : : \"r\"(rax), \"r\"(rdi) : \"rcx\", \"r11\", \"memory\");\n    __builtin_unreachable();\n}\n\n#ifdef __cplusplus\n}\n#endif\n#endif\n"
+      },
+      "files": {},
+      "flags": {
+        "add": [
+          "-nostdinc",
+          "-isystem sysroot/include"
+        ]
+      },
+      "outcome": {
+        "kind": "exit",
+        "value": 27,
+        "output": "Hello from sim.h\nand again\n"
+      }
+    },
+    {
+      "name": "cppsimwrite",
+      "language": "cpp",
+      "exercises": "`simwrite`'s `<sim.h>` from C++, under `extern \"C\"`: `sim_write` from an inline member function (in that function's COMDAT group at -O0) and the `noreturn` `sim_exit_group`",
+      "source": "#include <sim.h>\n\nstruct Greeter {\n    const char *text;\n    long length;\n    long greet() const { return sim_write(1, text, length); }\n};\n\nstatic const char hello[] = \"Hello from C++\\n\";\n\nint main() {\n    Greeter greeter{hello, sizeof hello - 1};\n    long total = greeter.greet() + greeter.greet();\n    sim_exit_group(total);\n}\n",
+      "headers": {
+        "sysroot/include/sim.h": "#ifndef SIM_H\n#define SIM_H\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n/** Writes count bytes from buf to the descriptor fd; returns the count written or a negative errno. */\nstatic inline long sim_write(long fd, const void *buf, long count) {\n    register long rax __asm__(\"rax\") = 1;\n    register long rdi __asm__(\"rdi\") = fd;\n    register const void *rsi __asm__(\"rsi\") = buf;\n    register long rdx __asm__(\"rdx\") = count;\n    __asm__ volatile(\"syscall\" : \"+r\"(rax) : \"r\"(rdi), \"r\"(rsi), \"r\"(rdx) : \"rcx\", \"r11\", \"memory\");\n    return rax;\n}\n\n/** Ends the calling thread with a status. */\n__attribute__((noreturn)) static inline void sim_exit(long status) {\n    register long rax __asm__(\"rax\") = 60;\n    register long rdi __asm__(\"rdi\") = status;\n    __asm__ volatile(\"syscall\" : : \"r\"(rax), \"r\"(rdi) : \"rcx\", \"r11\", \"memory\");\n    __builtin_unreachable();\n}\n\n/** Ends every thread of the process with a status. */\n__attribute__((noreturn)) static inline void sim_exit_group(long status) {\n    register long rax __asm__(\"rax\") = 231;\n    register long rdi __asm__(\"rdi\") = status;\n    __asm__ volatile(\"syscall\" : : \"r\"(rax), \"r\"(rdi) : \"rcx\", \"r11\", \"memory\");\n    __builtin_unreachable();\n}\n\n#ifdef __cplusplus\n}\n#endif\n#endif\n"
+      },
+      "files": {},
+      "flags": {
+        "add": [
+          "-nostdinc",
+          "-isystem sysroot/include",
+          "-nostdinc++"
+        ]
+      },
+      "outcome": {
+        "kind": "exit",
+        "value": 30,
+        "output": "Hello from C++\nHello from C++\n"
+      }
+    },
+    {
+      "name": "cppinlineasm",
+      "language": "cpp",
+      "exercises": "A user's `asm(\"nop\")`, and a two-line `asm volatile` with a `memory` clobber in a loop, which GCC unrolls into one `#APP` block holding two statements",
+      "source": "int counter = 3;\n\nint main() {\n    asm(\"nop\");\n    for (int i = 0; i < 2; i++) {\n        asm volatile(\"nop\\n\\tnop\" ::: \"memory\");\n        counter += i;\n    }\n    return counter;\n}\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 4
+      }
+    },
+    {
+      "name": "toplevelasm",
+      "language": "c",
+      "exercises": "A file-scope `__asm__` defining a global function: an `#APP` block outside any function, with no line markers, a section directive and a label at column 0",
+      "source": "__asm__(\".text\\n.globl asm_triple\\nasm_triple:\\n\\tlea eax, [rdi+rdi*2]\\n\\tret\");\nint asm_triple(int value);\nint seed = 14;\nint main(void) { return asm_triple(seed); }\n",
+      "headers": {},
+      "files": {},
+      "outcome": {
+        "kind": "exit",
+        "value": 42
+      }
+    },
+    {
+      "name": "inlineasmatt",
+      "language": "c",
+      "exercises": "Inline assembly written in AT&T syntax, which GCC passes through under -masm=intel, substituting its own operand in Intel syntax",
+      "source": "int main(void) {\n    int value = 1;\n    __asm__ volatile(\"movl $41, %%eax\\n\\taddl %%eax, %0\" : \"+r\"(value) : : \"eax\");\n    return value;\n}\n",
+      "headers": {},
+      "files": {},
+      "optimizations": [
+        "0",
+        "2"
+      ],
+      "outcome": {
+        "kind": "translation-error",
+        "code": "inline-assembly"
+      }
+    },
+    {
+      "name": "inlineasmrept",
+      "language": "c",
+      "exercises": "Inline assembly with a directive outside the rules, `.rept` and its `.endr`",
+      "source": "int main(void) {\n    __asm__ volatile(\".rept 3\\n\\tnop\\n\\t.endr\");\n    return 7;\n}\n",
+      "headers": {},
+      "files": {},
+      "optimizations": [
+        "0",
+        "2"
+      ],
+      "outcome": {
+        "kind": "translation-error",
+        "code": "inline-assembly"
+      },
+      "referenceOutcome": {
+        "kind": "exit",
+        "value": 7
+      },
+      "note": "The template is GNU as that GCC compiles and GNU as runs, which the reference shows; `.rept` is outside the directives the translator reads, so the block is rejected at its `.rept` and `.endr` lines."
     }
   ],
   "x87Matrix": {

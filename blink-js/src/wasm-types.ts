@@ -1,16 +1,67 @@
 import type { X86RegisterName } from './types'
 
+/** A node of Emscripten's file system, as `lookupPath` returns it. */
+export type EmscriptenFSNode = {
+    /** The type and permission bits. */
+    mode: number
+    /** A device's number. */
+    rdev?: number
+    /** The file system the node belongs to, whose `root` is the directory it is mounted as. */
+    mount?: { root: EmscriptenFSNode }
+    [key: string]: unknown
+}
+
 export type EmscriptenFS = {
-    init(stdin: () => number | null, stdout: (charCode: number) => void, stderr: (charCode: number) => void): void
+    ErrnoError: new (errno: number) => Error
+    FSNode: new (parent: unknown, name: string, mode: number, rdev: number) => EmscriptenFSNode
+    createNode(parent: unknown, name: string, mode: number, rdev: number): EmscriptenFSNode
+    destroyNode(node: EmscriptenFSNode): void
+    closeStream(fd: number): void
+    mount(
+        type: { mount(mount: unknown): EmscriptenFSNode },
+        opts: object,
+        path: string
+    ): EmscriptenFSNode
+    unmount(path: string): void
+    init(
+        stdin: () => number | null,
+        stdout: (byte: number) => void,
+        stderr: (byte: number) => void
+    ): void
     writeFile(path: string, data: string | Uint8Array): void
-    open(path: string, flags: string): unknown
-    write(stream: unknown, data: Uint8Array, offset: number, length: number, position: number): void
+    open(path: string, flags: string | number): unknown
+    write(
+        stream: unknown,
+        data: Uint8Array,
+        offset: number,
+        length: number,
+        position?: number
+    ): number
     close(stream: unknown): void
+    read(
+        stream: unknown,
+        data: Uint8Array,
+        offset: number,
+        length: number,
+        position?: number
+    ): number
     chmod(path: string, mode: number): void
     readFile(path: string, options?: { encoding?: 'binary' | 'utf8' }): Uint8Array | string
+    mkdir(path: string, mode?: number): void
     mkdirTree(path: string): void
+    mkdev(path: string, mode: number, dev: number): void
+    symlink(target: string, path: string): void
+    readlink(path: string): string
+    readdir(path: string): string[]
+    rmdir(path: string): void
     unlink(path: string): void
     chdir(path: string): void
+    cwd(): string
+    lookupPath(
+        path: string,
+        options?: { follow?: boolean; follow_mount?: boolean }
+    ): { path: string; node: EmscriptenFSNode }
+    isMountpoint(node: EmscriptenFSNode): boolean
 }
 
 export type BlinkenlibModuleOptions = {
@@ -18,7 +69,7 @@ export type BlinkenlibModuleOptions = {
     preRun?: (module: BlinkenlibModule) => void
     instantiateWasm?: (
         imports: WebAssembly.Imports,
-        receiveInstance: (instance: WebAssembly.Instance, module?: WebAssembly.Module) => void,
+        receiveInstance: (instance: WebAssembly.Instance, module?: WebAssembly.Module) => void
     ) => void
 }
 
@@ -31,12 +82,10 @@ export type RegisterSnapshot = {
 }
 
 export type MemoryReadResult =
-    | { ok: true; bytes: number[] }
-    | { ok: false; error: string; readBytes: number }
+    { ok: true; bytes: number[] } | { ok: false; error: string; readBytes: number }
 
 export type MemoryWriteResult =
-    | { ok: true; writtenBytes: number }
-    | { ok: false; error: string; writtenBytes: number }
+    { ok: true; writtenBytes: number } | { ok: false; error: string; writtenBytes: number }
 
 export type NativeRunStopKind = 'none' | 'breakpoint' | 'limit'
 
@@ -94,6 +143,19 @@ export type DisassemblySnapshot = {
 }
 
 export type BlinkenlibModule = {
+    blinkHostNow?: (clock: number) => number
+    blinkHostRandom?: (pointer: number, length: number) => void
+    blinkHostError?: unknown
+    _blinkenlib_instructions_executed(): bigint
+    _blinkenlib_active_instruction(): bigint
+    _blinkenlib_wait_pending(): boolean
+    _blinkenlib_wait_input(): boolean
+    _blinkenlib_wait_clock(): number
+    _blinkenlib_wait_deadline(): bigint
+    _blinkenlib_timer_deadline(): bigint
+    _blinkenlib_wait_cancel(): void
+    _blinkenlib_abandon_execution(): void
+    _blinkenlib_clear_execution(): void
     FS: EmscriptenFS
     callMain(args: string[]): void
     addFunction(fn: (...args: never[]) => void, signature: string): number
@@ -119,6 +181,7 @@ export type BlinkenlibModule = {
     _blinkenlib_history_count?(): number
     _blinkenlib_history_entry?(offset: number): number
     _blinkenlib_history_can_undo?(): boolean
+    _blinkenlib_history_mark_irreversible?(): void
     _blinkenlib_history_undo?(): number
     _blinkenlib_history_stack_depth?(): number
     _blinkenlib_history_frame?(index: number): number
@@ -154,11 +217,26 @@ export type BlinkenlibModule = {
     blinkenlibWriteMemoryBytes(address: bigint, bytes: Uint8Array | number[]): MemoryWriteResult
     blinkenlibGetDisassembly(): DisassemblySnapshot
     blinkenlibSetEmulationArgs(progname: string, argc: string, argv: string): void
+    /** How many bytes the read waiting for input asked for. */
     blinkenlibGetInputMaxBytes(): bigint
+    /** Appends bytes to the terminal's input. */
+    blinkenlibProvideInput(bytes: Uint8Array): void
+    /** Appends an End of input token, which ends one read with 0 bytes. */
+    blinkenlibProvideEndOfInput(): void
+    /** Discards the terminal's input, bytes and End of input alike. */
+    blinkenlibClearInput(): void
     blinkenlibSetRunControls(limit: bigint, breakpointAddresses: string[]): void
     blinkenlibGetRunControls(): NativeRunControls
     blinkenlibGetRunStop(): NativeRunStop
     blinkenlibGetLastStepInfo(): NativeStepInfo
     blinkenlibGetInstructionAt(address: bigint): NativeInstruction | null
     blinkenlibResolveSymbol(address: bigint): NativeSymbol | null
+    /** The system calls the dispatcher was compiled with, in no particular order. */
+    blinkenlibGetSyscalls(): NativeSyscall[]
+}
+
+export type NativeSyscall = {
+    number: number
+    name: string
+    arity: number
 }

@@ -1,57 +1,26 @@
 {
   "profile": "gcc-intel-v1",
-  "capturedAt": "2026-10-04T19:11:46.718Z",
+  "capturedAt": "2026-10-05T21:03:50.109Z",
   "package": {
     "name": "@specy/x86",
-    "version": "2.8.0"
+    "version": "4.0.0"
   },
   "submodule": {
     "path": "emulators/x86",
-    "revision": "47f6796b9c4a5ba2d08c8a90caf0ecc5ca80e636",
+    "revision": "f9bc7aa0ad64a55203dc89f9cb22524d76eaa564",
     "dirty": true,
     "changes": [
-      " M README.md",
-      " M blink-js/README.md",
-      " M blink-js/package.json",
-      " M blink-js/src/elf-symbols.ts",
-      " M blink-js/src/wasm/blinkenlib.wasm",
-      " M blink-js/tests/dist-smoke.mjs",
-      " M blink-js/tsdown.config.ts",
-      " M libblink/blink/fpu.c",
-      "?? blink-js/scripts/capture-gcc-fixtures.mjs",
-      "?? blink-js/scripts/generate-nasm-reserved-names.mjs",
-      "?? blink-js/src/compiler-output/analyze.ts",
-      "?? blink-js/src/compiler-output/diagnostics.ts",
-      "?? blink-js/src/compiler-output/emit.ts",
-      "?? blink-js/src/compiler-output/index.ts",
-      "?? blink-js/src/compiler-output/instructions.ts",
-      "?? blink-js/src/compiler-output/lexer.ts",
-      "?? blink-js/src/compiler-output/locations.ts",
-      "?? blink-js/src/compiler-output/names.ts",
-      "?? blink-js/src/compiler-output/nasm-instruction-set.ts",
-      "?? blink-js/src/compiler-output/nasm-reserved.ts",
-      "?? blink-js/src/compiler-output/operands.ts",
-      "?? blink-js/src/compiler-output/profile.ts",
-      "?? blink-js/src/compiler-output/sections.ts",
-      "?? blink-js/src/compiler-output/translate.ts",
-      "?? blink-js/src/compiler-output/types.ts",
-      "?? blink-js/tests/compiler-output/assemble.test.ts",
-      "?? blink-js/tests/compiler-output/corpus.test.ts",
-      "?? blink-js/tests/compiler-output/gcc-layout.ts",
-      "?? blink-js/tests/compiler-output/gnu-comparison.ts",
-      "?? blink-js/tests/compiler-output/gnu-reference.test.ts",
-      "?? blink-js/tests/compiler-output/helpers.ts",
-      "?? blink-js/tests/compiler-output/locations.test.ts",
-      "?? blink-js/tests/compiler-output/symbols.test.ts",
-      "?? blink-js/tests/compiler-output/translate.test.ts",
-      "?? blink-js/tests/compiler-output/x87-matrix.test.ts",
-      "?? blink-js/tests/elf-symbol-table.test.ts",
-      "?? blink-js/tests/x87-register-forms.test.ts"
+      " M blink-js/scripts/capture-gcc-fixtures.mjs",
+      " M blink-js/src/compiler-output/analyze.ts",
+      " M blink-js/src/compiler-output/diagnostics.ts",
+      " M blink-js/src/compiler-output/instructions.ts",
+      " M blink-js/src/compiler-output/lexer.ts",
+      " M blink-js/src/compiler-output/types.ts"
     ]
   },
   "sha256": {
-    "scripts/capture-gcc-fixtures.mjs": "c3071ac9898f0582c4d8f44686e8d74cc5131a0d68c1961947c45adb8a7c5e2f",
-    "dist/index.mjs": "ccc06b0f7a15484591e47498901deb1f812cc5d4ced5d258ed907596ca7083e6",
+    "scripts/capture-gcc-fixtures.mjs": "718f54e9ddf05088d41960d6ce9c22a96fe9bad2c3df1d95bfb2bbabdcd2fb78",
+    "dist/index.mjs": "866ddaafd079c1b652a47b2fddf80465af589a3988dba96a226504ae31211773",
     "dist/wasm/blinkenlib.js": "a4527ad8c0ec3a40ba9cd74462512155e984eab0fd703ffd3bfb6bc6479b00eb",
     "dist/assets/assemblers/gnu-as.2.43.50.elf": "908b557e21e8000596abe12828d929cf82dd9abcc3ee840dbaf9c503d8e32534",
     "dist/assets/assemblers/gnu-ld.2.43.50.elf": "8548fc86b738be62619889560995a127a9be6026ed4d6b21fe525c184d322206"
@@ -91,15 +60,15 @@
     "arch": "x64",
     "nativeRuns": true
   },
-  "cases": 187,
+  "cases": 211,
   "x87Forms": 36,
-  "totalBytes": 1252012,
+  "totalBytes": 1369970,
   "files": {
     "inventory.json": {
-      "bytes": 147799
+      "bytes": 161400
     },
     "manifest.json": {
-      "bytes": 60838
+      "bytes": 68305
     },
     "cases/aligned-O0.json.gz": {
       "bytes": 3243,
@@ -305,6 +274,26 @@
       "bytes": 3157,
       "uncompressedBytes": 21344
     },
+    "cases/cppinlineasm-O0.json.gz": {
+      "bytes": 3488,
+      "uncompressedBytes": 26564
+    },
+    "cases/cppinlineasm-O1.json.gz": {
+      "bytes": 3133,
+      "uncompressedBytes": 24796
+    },
+    "cases/cppinlineasm-O2.json.gz": {
+      "bytes": 3272,
+      "uncompressedBytes": 25882
+    },
+    "cases/cppinlineasm-O3.json.gz": {
+      "bytes": 3274,
+      "uncompressedBytes": 25882
+    },
+    "cases/cppinlineasm-Os.json.gz": {
+      "bytes": 3255,
+      "uncompressedBytes": 25808
+    },
     "cases/cpplocalstatic-O0.json.gz": {
       "bytes": 5058,
       "uncompressedBytes": 42864
@@ -324,6 +313,26 @@
     "cases/cpplocalstatic-Os.json.gz": {
       "bytes": 4123,
       "uncompressedBytes": 34648
+    },
+    "cases/cppsimwrite-O0.json.gz": {
+      "bytes": 5513,
+      "uncompressedBytes": 42695
+    },
+    "cases/cppsimwrite-O1.json.gz": {
+      "bytes": 4302,
+      "uncompressedBytes": 34681
+    },
+    "cases/cppsimwrite-O2.json.gz": {
+      "bytes": 4448,
+      "uncompressedBytes": 35767
+    },
+    "cases/cppsimwrite-O3.json.gz": {
+      "bytes": 4449,
+      "uncompressedBytes": 35767
+    },
+    "cases/cppsimwrite-Os.json.gz": {
+      "bytes": 4433,
+      "uncompressedBytes": 35699
     },
     "cases/cppunique-O0.json.gz": {
       "bytes": 6758,
@@ -514,24 +523,40 @@
       "uncompressedBytes": 11141
     },
     "cases/inlineasm-O0.json.gz": {
-      "bytes": 1392,
-      "uncompressedBytes": 7819
+      "bytes": 2806,
+      "uncompressedBytes": 17172
     },
     "cases/inlineasm-O1.json.gz": {
-      "bytes": 1277,
-      "uncompressedBytes": 6943
+      "bytes": 2614,
+      "uncompressedBytes": 15960
     },
     "cases/inlineasm-O2.json.gz": {
-      "bytes": 1358,
-      "uncompressedBytes": 7761
+      "bytes": 2779,
+      "uncompressedBytes": 17104
     },
     "cases/inlineasm-O3.json.gz": {
-      "bytes": 1360,
-      "uncompressedBytes": 7761
+      "bytes": 2780,
+      "uncompressedBytes": 17104
     },
     "cases/inlineasm-Os.json.gz": {
-      "bytes": 1350,
-      "uncompressedBytes": 7717
+      "bytes": 2762,
+      "uncompressedBytes": 17036
+    },
+    "cases/inlineasmatt-O0.json.gz": {
+      "bytes": 1472,
+      "uncompressedBytes": 8112
+    },
+    "cases/inlineasmatt-O2.json.gz": {
+      "bytes": 1440,
+      "uncompressedBytes": 8054
+    },
+    "cases/inlineasmrept-O0.json.gz": {
+      "bytes": 2814,
+      "uncompressedBytes": 16915
+    },
+    "cases/inlineasmrept-O2.json.gz": {
+      "bytes": 2866,
+      "uncompressedBytes": 17405
     },
     "cases/int128-O0.json.gz": {
       "bytes": 2152,
@@ -721,6 +746,26 @@
       "bytes": 1466,
       "uncompressedBytes": 9776
     },
+    "cases/simwrite-O0.json.gz": {
+      "bytes": 5249,
+      "uncompressedBytes": 38144
+    },
+    "cases/simwrite-O1.json.gz": {
+      "bytes": 4991,
+      "uncompressedBytes": 37280
+    },
+    "cases/simwrite-O2.json.gz": {
+      "bytes": 5473,
+      "uncompressedBytes": 41724
+    },
+    "cases/simwrite-O3.json.gz": {
+      "bytes": 5474,
+      "uncompressedBytes": 41724
+    },
+    "cases/simwrite-Os.json.gz": {
+      "bytes": 4962,
+      "uncompressedBytes": 36094
+    },
     "cases/statics-O0.json.gz": {
       "bytes": 5632,
       "uncompressedBytes": 41193
@@ -788,6 +833,26 @@
     "cases/tls-Os.json.gz": {
       "bytes": 1554,
       "uncompressedBytes": 10201
+    },
+    "cases/toplevelasm-O0.json.gz": {
+      "bytes": 3128,
+      "uncompressedBytes": 25534
+    },
+    "cases/toplevelasm-O1.json.gz": {
+      "bytes": 3070,
+      "uncompressedBytes": 25179
+    },
+    "cases/toplevelasm-O2.json.gz": {
+      "bytes": 3130,
+      "uncompressedBytes": 25657
+    },
+    "cases/toplevelasm-O3.json.gz": {
+      "bytes": 3133,
+      "uncompressedBytes": 25657
+    },
+    "cases/toplevelasm-Os.json.gz": {
+      "bytes": 3117,
+      "uncompressedBytes": 25589
     },
     "cases/varargs-O0.json.gz": {
       "bytes": 5006,

@@ -67,7 +67,8 @@ function linkedFiles(): string[] {
 }
 
 function linkedSymbols(): string[] {
-    const program = Uint8Array.from(emulator.module.FS.readFile('/program') as Uint8Array)
+    const program = emulator.getExecutable()
+    if (!program) throw new Error('nothing was linked')
     return readElfSymbolTable(program).symbols.map((symbol) => symbol.name)
 }
 

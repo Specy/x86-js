@@ -682,7 +682,8 @@ class Stepper {
     /**
      * GNU as pads code to a `.p2align` or `.align` with NOPs that have no line of their own: a NOP
      * before the next instruction with a line, where that instruction follows an alignment
-     * directive in the input with only labels and directives between them.
+     * directive in the input with only labels, directives and comments (`#NO_APP`, which GCC
+     * writes after an `asm` statement's alignment) between them.
      */
     private isAlignmentPadding(pc: bigint): boolean {
         if (!/^nop\b/.test(disassembly(this.emulator.getInstructionAt(pc)?.code))) return false
@@ -692,7 +693,7 @@ class Stepper {
         for (let index = line - 1; index >= 0; index -= 1) {
             const text = this.input[index]!.trim()
             if (/^\.(?:p2align|align)\b/.test(text)) return true
-            if (!(text === '' || text.startsWith('.') || text.endsWith(':'))) return false
+            if (!(text === '' || text.startsWith('.') || text.startsWith('#') || text.endsWith(':'))) return false
         }
         return false
     }
@@ -834,6 +835,9 @@ function compareFpu(
 
 const PAGE_SIZE = 0x1000n
 
+/** `syscall` is `0F 05`. */
+const SYSCALL_LENGTH = 2n
+
 /**
  * `length` bytes of a program's memory at `address`, page by page. Blink maps the whole pages of a
  * file-backed segment only when the program first touches them, and until then reads them as not
@@ -863,13 +867,15 @@ function memory(emulator: X86Emulator, image: ProgramImage, address: bigint, len
  * Steps both builds from the start, side by side. They must run the same input lines in the same
  * order, and after each one hold the same flags, general registers, SSE registers and x87 state:
  * equal values, or, where the two layouts make them differ, addresses naming the same input line or
- * symbol plus offset. The instruction pointer is compared as the input line each runs next. Flags
- * are equal too, except PF and AF after an instruction whose result is an address: its first
- * operand's register differs between the builds but names the same place, so the result's low bits
- * differ with the layout. Such a difference carries over while neither build's flag changes, never
- * past an instruction that computes the flag afresh, and nowhere else is one accepted. Once both
- * have exited, every data symbol must hold the same bytes in both, read as the data comparison
- * reads the executables. Throws at the first difference, saying where.
+ * symbol plus offset. The instruction pointer is compared as the input line each runs next, and rcx
+ * after a `syscall` as the address after it in each build: after an exit, that is whatever each
+ * layout put next, which names no place the two share. Flags are equal too, except PF and AF after
+ * an instruction whose result is an address: its first operand's register differs between the
+ * builds but names the same place, so the result's low bits differ with the layout. Such a
+ * difference carries over while neither build's flag changes, never past an instruction that
+ * computes the flag afresh, and nowhere else is one accepted. Once both have exited, every data
+ * symbol must hold the same bytes in both, read as the data comparison reads the executables.
+ * Throws at the first difference, saying where.
  */
 export async function compareTraces(
     comparison: Comparison,
@@ -904,6 +910,9 @@ export async function compareTraces(
                     `reference runs ${show(right)}; the lines before: ${recent.join(', ')}`,
             )
         }
+        const { mnemonic, first } = instructionShape(input[left]!)
+        const leftPc = translated.emulator.getPc()
+        const rightPc = reference.emulator.getPc()
         await translated.step()
         await reference.step()
         instructions += 1
@@ -915,8 +924,19 @@ export async function compareTraces(
         const rightRegisters = reference.registers()
         /** Registers whose values differ between the builds but name the same place: addresses. */
         const addressed = new Set<string>()
+        if (mnemonic === 'syscall') {
+            // `syscall` leaves the address after itself in rcx, which an exit's leaves pointing at
+            // whatever each layout put next, so each build's rcx is checked against its own.
+            const returnTo = (pc: bigint) => pc + SYSCALL_LENGTH
+            if (leftRegisters.rcx !== returnTo(leftPc) || rightRegisters.rcx !== returnTo(rightPc)) {
+                differences.push(
+                    `rcx is 0x${leftRegisters.rcx.toString(16)} and 0x${rightRegisters.rcx.toString(16)}, ` +
+                        `not the addresses after the two syscalls`,
+                )
+            }
+        }
         for (const register of Object.keys(leftRegisters) as (keyof typeof leftRegisters)[]) {
-            if (register === 'rip') continue
+            if (register === 'rip' || (register === 'rcx' && mnemonic === 'syscall')) continue
             const value = leftRegisters[register]
             const expected = rightRegisters[register]
             if (value === expected) continue
@@ -929,7 +949,6 @@ export async function compareTraces(
                 )
             }
         }
-        const { mnemonic, first } = instructionShape(input[left]!)
         const fromAddress = first !== null && addressed.has(first)
         const rightFlags = reference.flags()
         translated.flags().forEach((flag, index) => {

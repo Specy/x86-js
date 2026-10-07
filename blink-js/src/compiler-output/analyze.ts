@@ -152,6 +152,13 @@ const UNSUPPORTED_DIRECTIVES: ReadonlyMap<string, string> = new Map([
     ['.att_syntax', 'AT&T syntax'],
 ])
 
+/**
+ * The line markers GCC frames each `asm` statement's text with inside an `#APP` block: the source
+ * line and file it was written at (`# 13 "src/main.c" 1`, the file name unescaped), then a return
+ * to the file before it (`# 0 "" 2`). `.loc` already gives the same place.
+ */
+const LINE_MARKER = /^# (?:[1-9][0-9]* ".*" 1|0 "" 2)$/
+
 type Section =
     | { readonly kind: 'kept'; readonly family: SectionFamily }
     | { readonly kind: 'dropped' }
@@ -186,7 +193,14 @@ export function analyze(
     const idents: { line: number; text: string | null; column: number }[] = []
 
     let section: Section = { kind: 'kept', family: '.text' }
-    let appBlock = false
+    /**
+     * Between `#APP` and `#NO_APP`: inline assembly, the text of `asm` statements with GCC's
+     * operands substituted in, among GCC's own `.loc`, `.cfi_*` and alignment directives. Each line
+     * is read by the rules for GCC's output, plus `syscall` and minus memory operands without a
+     * size, so it must be an instruction or directive GCC itself could have written. A file-scope
+     * `asm` opens a block that GCC may never close, which changes nothing about the lines after it.
+     */
+    let inlineAssembly = false
 
     /**
      * Plan note 8: code alignment waits to learn what it aligns, the next position in code. A label
@@ -671,7 +685,7 @@ export function analyze(
             diagnostics.error('unsupported-section', line, `instruction in ${where}, outside code`, body.column)
             return
         }
-        const result = translateInstruction(body)
+        const result = translateInstruction(body, { inlineAssembly })
         if ('problems' in result) {
             for (const problem of result.problems) {
                 if (problem.register) {
@@ -708,7 +722,7 @@ export function analyze(
                 diagnostics.error(
                     'unsupported-symbol',
                     line,
-                    `numeric label \`${statement.name.text}:\` has no translation`,
+                    `numeric label \`${statement.name.text}:\` has no translation${inlineAssembly ? '; name the label instead, made unique with `%=`' : ''}`,
                     statement.name.column,
                 )
                 return
@@ -745,13 +759,34 @@ export function analyze(
         }
     }
 
-    input.forEach((text, line) => {
-        lineLocations[line] = locations.current
-        if (appBlock) {
-            const lexed = lexLine(text)
-            if (lexed.kind === 'comment' && lexed.text.text === '#NO_APP') appBlock = false
+    /**
+     * `#APP` and `#NO_APP` open and close inline assembly, inside which the line markers are GCC's
+     * own. Any other comment is an error: GCC's output has none under -fno-verbose-asm, and inline
+     * assembly is read without them, as one instruction or directive per line.
+     */
+    const onComment = (comment: Token, line: number) => {
+        if (!inlineAssembly && comment.text === '#APP') {
+            inlineAssembly = true
             return
         }
+        if (inlineAssembly && comment.text === '#NO_APP') {
+            inlineAssembly = false
+            return
+        }
+        if (inlineAssembly && LINE_MARKER.test(comment.text)) return
+        diagnostics.error(
+            'unsupported-directive',
+            line,
+            inlineAssembly
+                ? 'a comment has no translation; remove it from the `asm` statement'
+                : `comment \`${comment.text}\` has no translation; the profile compiles with -fno-verbose-asm`,
+            comment.column,
+        )
+    }
+
+    input.forEach((text, line) => {
+        lineLocations[line] = locations.current
+        if (inlineAssembly) diagnostics.markInlineAssembly(line, text)
         const unreadable = unreadableCharacter(text)
         if (unreadable) {
             const codePoint = `U+${unreadable.codePoint.toString(16).toUpperCase().padStart(4, '0')}`
@@ -766,29 +801,16 @@ export function analyze(
         const lexed = lexLine(text)
         if (lexed.kind === 'blank') return
         if (lexed.kind === 'comment') {
-            if (lexed.text.text === '#APP') {
-                appBlock = true
-                diagnostics.error(
-                    'inline-assembly',
-                    line,
-                    'inline assembly (`#APP` to `#NO_APP`) has no translation in version 1',
-                    lexed.text.column,
-                )
-                return
-            }
-            diagnostics.error(
-                'unsupported-directive',
-                line,
-                `comment \`${lexed.text.text}\` has no translation; the profile compiles with -fno-verbose-asm`,
-                lexed.text.column,
-            )
+            onComment(lexed.text, line)
             return
         }
         if (lexed.trailingComment !== null) {
             diagnostics.error(
                 'unsupported-directive',
                 line,
-                'a comment after a statement has no translation; the profile compiles with -fno-verbose-asm',
+                inlineAssembly
+                    ? 'a comment after a statement has no translation; remove it from the `asm` statement'
+                    : 'a comment after a statement has no translation; the profile compiles with -fno-verbose-asm',
                 lexed.trailingComment,
             )
         }
@@ -797,7 +819,9 @@ export function analyze(
             diagnostics.error(
                 'unsupported-directive',
                 line,
-                'several statements on one line have no translation',
+                inlineAssembly
+                    ? 'several statements on one line have no translation; put each on a line of its own'
+                    : 'several statements on one line have no translation',
                 lexed.separators[0] ?? (second ? statementColumn(second) : undefined),
             )
         }

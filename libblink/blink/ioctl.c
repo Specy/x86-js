@@ -32,12 +32,16 @@
 #include "blink/endian.h"
 #include "blink/errno.h"
 #include "blink/fds.h"
+#include "blink/limits.h"
 #include "blink/linux.h"
 #include "blink/log.h"
 #include "blink/machine.h"
 #include "blink/macros.h"
 #include "blink/ndelay.h"
 #include "blink/syscall.h"
+#include "blink/terminal.h"
+#include "blink/debughistory.h"
+#include "blink/browserpipe.h"
 #include "blink/thread.h"
 #include "blink/types.h"
 #include "blink/vfs.h"
@@ -200,18 +204,36 @@ static int IoctlSiocgifaddr(struct Machine *m, int systemfd, i64 ifreq_addr,
 
 #endif /* HAVE_SIOCGIFCONF */
 
-static int IoctlFionbio(struct Machine *m, int fildes) {
-  int oflags;
-  if ((oflags = GetOflags(m, fildes)) == -1) return -1;
-  return VfsFcntl(fildes, F_SETFL, (oflags & SETFL_FLAGS) | O_NDELAY);
+// FIONBIO turns O_NONBLOCK on or off as the int at `addr` says, and the
+// two FIO*CLEX set and clear close-on-exec, as fcntl() would: in the flags
+// blink keeps for the descriptor, which fcntl() reports, as well as in the
+// host's.
+static int IoctlFionbio(struct Machine *m, int fildes, i64 addr) {
+  int rc, oflags;
+  u8 word[4];
+  struct Fd *fd;
+  if (CopyFromUserRead(m, word, addr, sizeof(word)) == -1) return -1;
+  if (!(fd = GetAndLockFd(m, fildes))) return -1;
+  oflags = fd->oflags & ~O_NDELAY;
+  if (Read32(word)) oflags |= O_NDELAY;
+  if ((rc = VfsFcntl(fildes, F_SETFL, oflags & SETFL_FLAGS)) != -1) {
+    fd->oflags = oflags;
+    BrowserPipeSetFlags(fildes, oflags);
+  }
+  UnlockFd(fd);
+  return rc;
 }
 
-static int IoctlFioclex(struct Machine *m, int fildes) {
-  return VfsFcntl(fildes, F_SETFD, FD_CLOEXEC);
-}
-
-static int IoctlFionclex(struct Machine *m, int fildes) {
-  return VfsFcntl(fildes, F_SETFD, 0);
+static int IoctlFioclex(struct Machine *m, int fildes, bool cloexec) {
+  int rc;
+  struct Fd *fd;
+  if (!(fd = GetAndLockFd(m, fildes))) return -1;
+  if ((rc = VfsFcntl(fildes, F_SETFD, cloexec ? FD_CLOEXEC : 0)) != -1) {
+    fd->oflags &= ~O_CLOEXEC;
+    if (cloexec) fd->oflags |= O_CLOEXEC;
+  }
+  UnlockFd(fd);
+  return rc;
 }
 
 static int IoctlTcsbrk(struct Machine *m, int fildes, int drain) {
@@ -298,7 +320,54 @@ static int IoctlTiocsti(struct Machine *m, int fildes, i64 addr) {
 }
 #endif
 
+// The requests of a terminal's own that it answers itself, as a Linux
+// pseudo-terminal would, rather than passing them to the host descriptor
+// that only holds its number. The process is alone in its session and its
+// process group, both of which the terminal leads it in; output never
+// queues; input is what the host has given and no read has taken.
+static int IoctlTerminal(struct Machine *m, u64 request, i64 addr) {
+  u8 *p;
+  int arg;
+  switch (request) {
+    case TIOCGPGRP_LINUX:
+    case TIOCGSID_LINUX:
+      if (!(p = (u8 *)SchlepW(m, addr, 4))) return -1;
+      Write32(p, request == TIOCGSID_LINUX ? getsid(0) : getpgid(0));
+      return 0;
+    case TIOCSPGRP_LINUX:
+      if (!(p = (u8 *)SchlepR(m, addr, 4))) return -1;
+      if ((arg = Read32(p)) < 0) return einval();
+      return arg == getpgid(0) ? 0 : esrch();
+    case FIONREAD_LINUX:
+    case TIOCOUTQ_LINUX:
+      if (!(p = (u8 *)SchlepW(m, addr, 4))) return -1;
+      Write32(p, request == FIONREAD_LINUX
+                     ? MIN(CountTerminalInput(), NUMERIC_MAX(i32))
+                     : 0);
+      return 0;
+    case TCFLSH_LINUX:
+      if (addr == TCIFLUSH_LINUX || addr == TCIOFLUSH_LINUX) {
+        // what the host gave and no read took is discarded; see
+        // TakeTerminalInput() about undo
+        if (HasTerminalInput()) {
+          DebugHistoryMarkIrreversible();
+          ClearTerminalInput();
+        }
+      } else if (addr != TCOFLUSH_LINUX) {
+        return einval();
+      }
+      return 0;
+    case TCSBRK_LINUX:
+      return 0;  // drains at once, and a break is nothing to a program
+    case TCXONC_LINUX:
+      return addr >= 0 && addr <= 3 ? 0 : einval();
+    default:
+      return enotty();
+  }
+}
+
 int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
+  bool terminal;
   struct Fd *fd;
   int (*tcgetattr_impl)(int, struct termios *);
   int (*tcsetattr_impl)(int, int, const struct termios *);
@@ -311,14 +380,39 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
     unassert(tcsetattr_impl = fd->cb->tcsetattr);
     unassert(tcgetwinsize_impl = fd->cb->tcgetwinsize);
     unassert(tcsetwinsize_impl = fd->cb->tcsetwinsize);
+    terminal = IsTerminalFd(fd);
   } else {
     tcsetattr_impl = 0;
     tcgetattr_impl = 0;
     tcgetwinsize_impl = 0;
     tcsetwinsize_impl = 0;
+    terminal = false;
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
+  if (IsBrowserPipe(fildes) && request == FIONREAD_LINUX) {
+    u8 word[4]; Write32(word, BrowserPipeCount(fildes));
+    return CopyToUserWrite(m, addr, word, sizeof(word));
+  }
+  if (terminal) {
+    switch (request) {
+      case TIOCGWINSZ_LINUX:
+      case TIOCSWINSZ_LINUX:
+      case TCGETS_LINUX:
+      case TCSETS_LINUX:
+      case TCSETSW_LINUX:
+      case TCSETSF_LINUX:
+        break;  // through its callbacks, below
+#ifndef DISABLE_NONPOSIX
+      case FIONBIO_LINUX:
+      case FIOCLEX_LINUX:
+      case FIONCLEX_LINUX:
+        break;  // the descriptor's, whatever it refers to
+#endif
+      default:
+        return IoctlTerminal(m, request, addr);
+    }
+  }
   switch (request) {
     case TIOCGWINSZ_LINUX:
       return IoctlTiocgwinsz(m, fildes, addr, tcgetwinsize_impl);
@@ -338,11 +432,11 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       return IoctlTiocspgrp(m, fildes, addr);
 #ifndef DISABLE_NONPOSIX
     case FIONBIO_LINUX:
-      return IoctlFionbio(m, fildes);
+      return IoctlFionbio(m, fildes, addr);
     case FIOCLEX_LINUX:
-      return IoctlFioclex(m, fildes);
+      return IoctlFioclex(m, fildes, true);
     case FIONCLEX_LINUX:
-      return IoctlFionclex(m, fildes);
+      return IoctlFioclex(m, fildes, false);
 #endif
     case TCSBRK_LINUX:
       return IoctlTcsbrk(m, fildes, addr);

@@ -4,17 +4,18 @@
 #include <time.h>
 
 #include "blink/assert.h"
+#include "blink/environment.h"
 #include "blink/limits.h"
 
 static inline struct timespec GetTime(void) {
   struct timespec ts;
-  unassert(!clock_gettime(CLOCK_REALTIME, &ts));
+  unassert(!HostNow(CLOCK_REALTIME, &ts));
   return ts;
 }
 
 static inline struct timespec GetMonotonic(void) {
   struct timespec ts;
-  unassert(!clock_gettime(CLOCK_MONOTONIC, &ts));
+  unassert(!HostNow(CLOCK_MONOTONIC, &ts));
   return ts;
 }
 

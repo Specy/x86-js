@@ -9,8 +9,8 @@ import { createX86Emulator } from '@specy/x86'
 
 const emulator = await createX86Emulator({
   callbacks: {
-    stdout: (charCode) => process.stdout.write(String.fromCharCode(charCode)),
-    stderr: (charCode) => process.stderr.write(String.fromCharCode(charCode)),
+    stdout: (bytes) => process.stdout.write(bytes),
+    stderr: (bytes) => process.stderr.write(bytes),
   },
 })
 
@@ -155,38 +155,62 @@ Very large or truncated memory writes may not be reversible. In that case `canUn
 ### Events
 
 ```ts
-emulator.on('stateChange', (state) => { /* ... */ })
-emulator.on('stdout',      (charCode) => { /* ... */ })
-emulator.on('stderr',      (charCode) => { /* ... */ })
-emulator.on('signal',      (signal)   => { /* ... */ })
-emulator.on('inputRequest', ()        => { /* ... */ })
+emulator.on('stateChange',  ({ state, oldState }) => { /* ... */ })
+emulator.on('stdout',       (bytes) => { /* one write's bytes, a Uint8Array */ })
+emulator.on('stderr',       (bytes) => { /* ... */ })
+emulator.on('signal',       ({ signal, code }) => { /* ... */ })
+emulator.on('inputRequest', ({ maxBytes }) => { /* answer with provideInput() */ })
 ```
 
-Callbacks passed to `createX86Emulator()` and handlers registered with `on()` may return either `void` or `Promise<void>`. Async callbacks are observed but not awaited by the emulator, so UI work can be scheduled without blocking execution. `stdin` remains synchronous because it is called directly by Emscripten's filesystem; for non-blocking UI input, listen for `inputRequest` and call `provideInput()` when the user submits text.
+Callbacks passed to `createX86Emulator()` and handlers registered with `on()` may return either `void` or `Promise<void>`. Async callbacks are observed but not awaited by the emulator, so UI work can be scheduled without blocking execution.
+
+### Standard streams and runs
+
+Descriptors 0 to 2 are a terminal, which `isatty()` recognises. Each write reaches the `stdout` or `stderr` callback as one call with its bytes. A read takes what `provideInput(bytes)` or `provideInput(END_OF_INPUT)` gave, as a read of a Linux terminal does, and waits, with an `inputRequest`, only when nothing is left. Every start of a program is a new process on a new file system, in an empty working directory, `/project`, and the toolchain's files are never there. The package README's [Standard streams](blink-js/README.md#standard-streams) and [Each run starts afresh](blink-js/README.md#each-run-starts-afresh) say exactly how.
 
 ## Compiling C and C++
 
-The package has a second entry point, `@specy/x86/compiler-output`, that translates GCC 14.2's `-masm=intel` x86-64 output into NASM source this emulator builds like any other File, with the source location of every instruction. It is a bundle of its own with no WebAssembly in it, so a consumer that only translates never loads the emulator. The package README, [blink-js/README.md](blink-js/README.md#compiling-c-and-c), documents it: the `gcc-intel-v1` profile and the compiler flags it requires, the result and its diagnostics, what is rejected, and an example start unit, since the translator writes no startup code. `npm run test:dist` checks that the built subpath loads and translates with `WebAssembly` stubbed out, runs translated programs with that start unit, and fails if the root module's export names change.
+The package has a second entry point, `@specy/x86/compiler-output`, that translates GCC 14.2's `-masm=intel` x86-64 output into NASM source this emulator builds like any other File, with the source location of every instruction. It is a bundle of its own with no WebAssembly in it, so a consumer that only translates never loads the emulator. The package README, [blink-js/README.md](blink-js/README.md#compiling-c-and-c), documents it: the `gcc-intel-v1` profile and the compiler flags it requires, the result and its diagnostics, the inline assembly it reads, what is rejected, and an example start unit, since the translator writes no startup code. `npm run test:dist` checks that the built subpath loads and translates with `WebAssembly` stubbed out, runs translated programs with that start unit, and fails if the root module's export names change.
 
 ## Building from Source
 
-Prerequisites: [Emscripten](https://emscripten.org/docs/getting_started/downloads.html), `make`. The build script must run inside WSL (or a Linux shell) because it invokes `emmake`.
+Prerequisites: [Emscripten](https://emscripten.org/docs/getting_started/downloads.html) (the committed module was built with emsdk 6.0.9), `make`. The build script must run inside WSL (or a Linux shell) because it invokes `emmake`.
 
-**1. Configure libblink** (once per checkout; `libblink/config.h` is generated and not committed)
+**1. The build configuration** is committed: `libblink/config.h` says which of blink's features and host facilities the build uses, and `libblink/config.mk` holds the compiler and its flags. Blink's `./configure` is not used, because it decides by compiling and running probe programs on the build machine, and a WebAssembly target can run none of them: every probe failed, and every `HAVE_*` came out off by accident. Nothing in the two files depends on the build machine, and the version string blink reports through `uname(2)` is fixed rather than stamped with the date and the commit count, so the same sources and the same emsdk build the same bytes. Change a switch by editing `config.h`, keeping its flat `#define` / `// #define` form, which the editor's documentation generator reads.
 
-```sh
-./init_blink.sh
-```
+The features, `DISABLE_*`:
 
-This runs `libblink`'s `./configure` under Emscripten with `--disable-all --enable-x87`. The x87 exception matters: with it off, `struct MachineFpu` has no stack at all and every x87 instruction raises SIGILL, so `getFpuState()` would report nothing and the x87 tests would fail.
+| Switch | Why |
+| --- | --- |
+| `DISABLE_JIT` | WebAssembly cannot generate native code to run. |
+| `DISABLE_X87` off | The x87 stack is a register file the emulator exposes; with it off `struct MachineFpu` has no stack and every x87 instruction raises SIGILL. |
+| `DISABLE_THREADS` | A program runs as one thread: `clone`, `futex` and the calls that only make sense with a second process or thread (`fork`, `wait4`, `kill`, `pipe`) are left out until they are emulated within the one process. |
+| `DISABLE_SOCKETS` | A browser page has no sockets. |
+| `DISABLE_OVERLAYS`, `DISABLE_VFS` | The program sees Emscripten's file system as it is: no `chroot`, no `mount`. |
+| `DISABLE_NONPOSIX` off | Linux's own calls and flags, beyond POSIX, are compiled in (`brk`, `dup3`, `prlimit64`, `close_range`, `preadv2`, `renameat2`, `sendfile`, `sysinfo`, the `*res*id` calls, `prctl`, the clock ids beyond POSIX's), each checked against Linux as described in [the package README](blink-js/README.md#system-calls). |
+| `DISABLE_ANCILLARY` | Control messages ride on sockets, which are off. |
+| `DISABLE_DISASSEMBLER`, `DISABLE_BACKTRACE`, `DISABLE_STRACE` | Crash reports and system call traces print to the host's stderr, which nothing reads in a browser; the debugger has its own disassembly. |
+| `DISABLE_METAL`, `DISABLE_BCD`, `DISABLE_ROM` | Real mode, ring 0, BCD arithmetic and the BIOS ROM, which a 64-bit Linux program never reaches. |
+| `DISABLE_MMX`, `DISABLE_BMI2` | Kept from the earlier configuration: MMX and BMI2 instructions raise SIGILL, and `cpuid` does not report them, as on a processor without them. |
+
+The host facilities, `HAVE_*`, turned on where Emscripten provides them faithfully:
+
+| Switch | Why |
+| --- | --- |
+| `HAVE_SYNC` | Emscripten's `sync()` succeeds, as Linux's always does; without it blink answered ENOSYS. |
+| `HAVE_PREADV` | Emscripten's `preadv` and `pwritev` read and write at an offset as Linux does, including with no vectors at all, which blink's own fallback refused. |
+| `HAVE_STRUCT_TIMEZONE` | `gettimeofday` fills in a timezone it is given, as Linux does, where blink otherwise answered EOPNOTSUPP. |
+
+The others stay off. Emscripten lacks what `HAVE_FORK`, `HAVE_WAIT4`, `HAVE_SYSCTL`, `HAVE_SYSINFO`, `HAVE_SCHED_GETAFFINITY`, `HAVE_MKFIFO`, `HAVE_MKFIFOAT`, `HAVE_FEXECVE`, `HAVE_CLOCK_SETTIME`, `HAVE_EPOLL_PWAIT1`, `HAVE_EPOLL_PWAIT2`, `HAVE_F_GETOWN_EX`, `HAVE_SYS_MOUNT_H`, `HAVE_LIBUNWIND`, `HAVE_KERN_ARND` and `HAVE_RTLGENRANDOM` name, so blink uses its own answer (it describes the machine for `sysinfo` and `sched_getaffinity` itself) or leaves the call out: `mknod` and `mknodat` (Emscripten makes no FIFOs) and `clock_settime` (there is no clock to set). The socket and thread facilities (`HAVE_SA_LEN`, `HAVE_SENDTO_ZERO`, `HAVE_SIOCGIFCONF`, `HAVE_SOCKATMARK`, `HAVE_SCM_CREDENTIALS`, `HAVE_PTHREAD_PROCESS_SHARED`, `HAVE_PTHREAD_SETCANCELSTATE`) serve features that are off. Emscripten reports every user and group id as 0 and refuses every `set*id()`, so `HAVE_SETREUID`, `HAVE_SETRESUID` and `HAVE_SETGROUPS` stay off and blink keeps the process's credentials itself. The random sources (`HAVE_GETRANDOM`, `HAVE_GETENTROPY`, `HAVE_DEV_URANDOM`, `HAVE_SYS_GETRANDOM`, `HAVE_SYS_GETENTROPY`) stay off until the Core takes its randomness from the host: blink seeds its own generator from the clock meanwhile, and `getrandom` is left out of the call table. `HAVE_DUP3` is off because blink's `dup3` over `dup2` gives the same results; `HAVE_MEMCCPY`, `HAVE_STRCHRNUL`, `HAVE_VASPRINTF`, `HAVE_REALPATH`, `HAVE_WCWIDTH`, `HAVE_SEEKDIR`, `HAVE_FDATASYNC`, `HAVE_SCHED_H`, `HAVE_SCHED_YIELD`, `HAVE_GETDOMAINNAME`, `HAVE_MAP_ANONYMOUS` and `HAVE_MAP_SHARED` keep blink's own implementations, as the module was built before. `HAVE_INT128` is decided by the compiler, not here.
 
 **2. Compile the wasm artifacts**
 
 ```sh
-./compile_blink.sh
+source /path/to/emsdk/emsdk_env.sh
+./compile_blink.sh   # or: npm --prefix blink-js run build:wasm
 ```
 
-This builds `libblink` with Emscripten and copies `blinkenlib.wasm` and `blinkenlib.js` into `blink-js/src/wasm/`.
+This builds `libblink` from nothing with Emscripten, copies `blinkenlib.wasm` and `blinkenlib.js` into `blink-js/src/wasm/`, and prints their sizes and SHA-256 hashes, which another build of the same sources with the same emsdk reproduces. CI never rebuilds the wasm, so the committed module is what ships.
 
 **2b. Compile NASM to wasm** (optional; only when changing NASM versions)
 

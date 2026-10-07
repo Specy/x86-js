@@ -98,14 +98,37 @@ const X87_SINGLE = new Set(['fld', 'fst', 'fstp', 'fxch', 'fcom', 'fcomp', 'fuco
 /** The instruction set the profile allows, for messages. */
 const ALLOWED_SET = 'the x86-64 baseline, x87, SSE, SSE2 and SSE3'
 
+/**
+ * What inline assembly may use besides that set, with its forms: `syscall`, the instruction a Linux
+ * program makes its system calls with, which Blink runs as Linux does. GCC's own output never has
+ * it, so only an `#APP` block may.
+ */
+const INLINE_ASSEMBLY_INSTRUCTIONS: ReadonlyMap<string, string> = new Map([['syscall', '_']])
+
+/** Where inline assembly's own rules apply, the message's addition to {@link ALLOWED_SET}. */
+const INLINE_ALLOWED_SET = `${ALLOWED_SET}, and \`syscall\` in inline assembly`
+
+/** What an AT&T-syntax diagnostic adds: why, and what to write instead. */
+const INTEL_SYNTAX =
+    'the profile compiles with -masm=intel, so inline assembly is written in Intel syntax (`mov eax, 1`, not `movl $1, %eax`)'
+
 /** A first word and the rest of the statement after the whitespace that ends it. */
 const WORDS = /^(\S+)(?:\s+([\s\S]*))?$/
+
+export type InstructionOptions = {
+    /**
+     * The statement is inline assembly, between `#APP` and `#NO_APP`: `syscall` is allowed, every
+     * memory operand but `lea`'s must have a size, as GCC writes them, and AT&T syntax is named.
+     */
+    readonly inlineAssembly?: boolean
+}
 
 /**
  * Reads an instruction statement and translates it: GCC's operands into NASM's, a count for
  * one-operand shifts, the x87 register forms NASM accepts, and the instruction-set check.
  */
-export function translateInstruction(body: Token): InstructionResult {
+export function translateInstruction(body: Token, options: InstructionOptions = {}): InstructionResult {
+    const inline = options.inlineAssembly === true
     const words = WORDS.exec(body.text)
     if (!words) {
         return problem(
@@ -148,6 +171,11 @@ export function translateInstruction(body: Token): InstructionResult {
     }
 
     const name = mnemonic.text.toLowerCase()
+    const pieces = splitCommas({ text: rest, column: restColumn })
+    if (inline) {
+        const att = attSyntax(body, mnemonic, name, pieces)
+        if (att) return problem('unsupported-instruction', `${att.message}; ${INTEL_SYNTAX}`, att.column)
+    }
     if (!/^[a-z][a-z0-9]*$/.test(name)) {
         return problem(
             'unsupported-instruction',
@@ -161,12 +189,26 @@ export function translateInstruction(body: Token): InstructionResult {
 
     const parsed: Operand[] = []
     const problems: OperandProblem[] = []
-    for (const piece of splitCommas({ text: rest, column: restColumn })) {
+    for (const piece of pieces) {
         const result = parseOperand(piece)
         if ('problem' in result) problems.push(result.problem)
         else parsed.push(result.operand)
     }
     if (problems.length) return { problems }
+
+    if (inline && name !== 'lea') {
+        // NASM assumes a size for some operands GNU as calls ambiguous, and for `pop [rdi]` it
+        // assumes another one, so inline assembly writes every size, as GCC does outside `lea`.
+        const unsized = parsed.findIndex((operand) => operand.kind === 'memory' && operand.size === null)
+        if (unsized >= 0) {
+            const { text, column } = pieces[unsized]!
+            return problem(
+                'unsupported-operand',
+                `memory operand \`${text}\` has no size, which NASM and GNU as do not read alike; name its size as GCC does, such as \`DWORD PTR ${text}\``,
+                column,
+            )
+        }
+    }
 
     for (const operand of parsed) {
         if (operand.kind === 'target' && !BRANCHES.has(name)) {
@@ -192,7 +234,8 @@ export function translateInstruction(body: Token): InstructionResult {
 
     const kinds = operands.map(operandKind)
     const [allowed, rejected] = entry
-    if (allowed && allowed.split('|').some((form) => formMatches(form, kinds))) {
+    const admitted = inline ? INLINE_ASSEMBLY_INSTRUCTIONS.get(name) : undefined
+    if ([allowed, admitted].some((list) => list && list.split('|').some((form) => formMatches(form, kinds)))) {
         return { instruction: { prefix, mnemonic: mnemonic.text, operands } }
     }
     const forms = rejected ? rejected.split('|').map((form) => form.split('=') as [string, string]) : []
@@ -203,13 +246,47 @@ export function translateInstruction(body: Token): InstructionResult {
     // APX re-encodes many legacy instructions; the legacy form's reason is the one that explains.
     const legacy = all.filter((reason) => !reason.includes('APX'))
     const reasons = legacy.length ? legacy : all
-    const which = allowed ? ' in this form' : ''
+    const which = allowed || admitted ? ' in this form' : ''
     const why = reasons.length ? reasons.join(' or ') : 'has no form with these operands'
     return problem(
         'unsupported-instruction',
-        `\`${mnemonic.text}\`${which} ${why}; the profile allows ${ALLOWED_SET}`,
+        `\`${mnemonic.text}\`${which} ${why}; the profile allows ${inline ? INLINE_ALLOWED_SET : ALLOWED_SET}`,
         mnemonic.column,
     )
+}
+
+/** AT&T's operand-size suffixes, which GNU as reads on a mnemonic and NASM never does. */
+const ATT_SUFFIXES = new Set(['b', 'w', 'l', 'q'])
+
+/**
+ * The first sign that an instruction of inline assembly is in AT&T syntax, which GCC passes through
+ * unchanged, or null: a `%` before a register, which no Intel operand has; a `$` before an
+ * immediate; or a mnemonic NASM lacks that is one of its own with an AT&T size suffix (`movl`).
+ */
+function attSyntax(
+    body: Token,
+    mnemonic: Token,
+    name: string,
+    operands: readonly Token[],
+): { readonly message: string; readonly column: number } | null {
+    const percent = body.text.indexOf('%')
+    if (percent >= 0) {
+        const sign = /^%[A-Za-z0-9_.$]*/.exec(body.text.slice(percent))![0]
+        return { message: `\`${sign}\` is AT&T syntax`, column: body.column + percent }
+    }
+    const immediate = operands.find((operand) => operand.text.startsWith('$'))
+    if (immediate) return { message: `\`${immediate.text}\` is an AT&T immediate`, column: immediate.column }
+    const suffixed =
+        !NASM_INSTRUCTION_SET.has(name) &&
+        ATT_SUFFIXES.has(name.slice(-1)) &&
+        NASM_INSTRUCTION_SET.has(name.slice(0, -1))
+    if (suffixed) {
+        return {
+            message: `\`${mnemonic.text}\` is \`${name.slice(0, -1)}\` with an AT&T size suffix`,
+            column: mnemonic.column,
+        }
+    }
+    return null
 }
 
 /** Whether operand kinds fit a form of the instruction-set table, such as `g,gm` or `_`. */

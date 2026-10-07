@@ -1,6 +1,8 @@
 export * from './assemblers'
 export * from './blink-runtime'
 export * from './callbacks'
+export { X86_WORKING_DIRECTORY } from './file-system'
+export type { X86ProjectFileSystem } from './project-file-system'
 export * from './fpu-state'
 export * from './interface'
 export * from './project'

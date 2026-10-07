@@ -34,6 +34,7 @@
 #include "blink/thread.h"
 #include "blink/vfs.h"
 #include "blink/xlat.h"
+#include "blink/browserpipe.h"
 
 int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
   int rc;
@@ -51,7 +52,10 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
     return efault();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
-#ifdef HAVE_PIPE2
+#ifdef __EMSCRIPTEN__
+  oflags = XlatOpenFlags(flags);
+  if ((rc = BrowserPipe(fds, oflags)) != -1) {
+#elif defined(HAVE_PIPE2)
   if ((rc = VfsPipe2(fds, (oflags = XlatOpenFlags(flags)))) != -1) {
 #else
   if (flags) LOCK(&m->system->exec_lock);
@@ -69,13 +73,17 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
     }
 #endif
     if (fds[0] >= lim || fds[1] >= lim) {
-      close(fds[0]);
-      close(fds[1]);
+      kFdCbBrowserPipe.close(fds[0]);
+      kFdCbBrowserPipe.close(fds[1]);
       rc = emfile();
     } else {
       LOCK(&m->system->fds.lock);
-      unassert(AddFd(&m->system->fds, fds[0], O_RDONLY | oflags));
-      unassert(AddFd(&m->system->fds, fds[1], O_WRONLY | oflags));
+      struct Fd *r, *w;
+      unassert(r = AddFd(&m->system->fds, fds[0], O_RDONLY | oflags));
+      unassert(w = AddFd(&m->system->fds, fds[1], O_WRONLY | oflags));
+#ifdef __EMSCRIPTEN__
+      r->cb = w->cb = &kFdCbBrowserPipe;
+#endif
       UNLOCK(&m->system->fds.lock);
       Write32(fds_linux[0], fds[0]);
       Write32(fds_linux[1], fds[1]);
@@ -85,7 +93,7 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
   } else {
     rc = -1;
   }
-#ifndef HAVE_PIPE2
+#if !defined(HAVE_PIPE2) && !defined(__EMSCRIPTEN__)
   if (flags) UNLOCK(&m->system->exec_lock);
 #endif
   return rc;

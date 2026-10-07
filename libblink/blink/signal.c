@@ -36,6 +36,8 @@
 #include "blink/thread.h"
 #include "blink/util.h"
 #include "blink/xlat.h"
+#include "blink/environment.h"
+#include "blink/debughistory.h"
 
 struct SignalFrame {
   u8 ret[8];
@@ -65,6 +67,11 @@ bool IsSignalSerious(int sig) {
 void DeliverSignal(struct Machine *m, int sig, int code) {
   u64 sp;
   struct SignalFrame sf;
+#ifdef __EMSCRIPTEN__
+  /* Signal-frame memory and the mask are outside the current history packet.
+   * Keep the triggering step visible but make it an Undo boundary. */
+  DebugHistoryMarkIrreversible();
+#endif
   if (IsMakingPath(g_machine)) AbandonPath(g_machine);
   memset(&sf, 0, sizeof(sf));
   // capture the current state of the machine
@@ -173,8 +180,22 @@ void DeliverSignal(struct Machine *m, int sig, int code) {
   m->flags &= ~(DF | RF | 1 << FLAGS_TF);
 }
 
+/* The browser cannot suspend a native read on Blink's C stack. When Linux
+ * would restart it, rt_sigreturn re-enters the guest syscall instruction. */
+void RestartSignalSyscall(struct Machine *m, u64 number, u64 pc) {
+  u8 word[8];
+  u64 frame = Read64(m->sp);
+  Write64(word, number);
+  CopyToUserWrite(m, frame + offsetof(struct SignalFrame, uc.rax), word, 8);
+  Write64(word, pc);
+  CopyToUserWrite(m, frame + offsetof(struct SignalFrame, uc.rip), word, 8);
+}
+
 void SigRestore(struct Machine *m) {
   struct SignalFrame sf;
+#ifdef __EMSCRIPTEN__
+  DebugHistoryMarkIrreversible();
+#endif
   // when the guest returns from the signal handler, it'll call a
   // pointer to the sa_restorer trampoline which is assumed to be
   //
@@ -244,7 +265,7 @@ static int ConsumeSignalImpl(struct Machine *m, int *delivered, bool *restart) {
     if (handler == SIG_DFL_LINUX) {
       if (IsSignalIgnoredByDefault(sig)) {
         SYS_LOGF("ignoring %s", DescribeSignal(sig));
-        return 0;
+        continue;
       } else {
         SIG_LOGF("default action is to terminate upon signal %s",
                  DescribeSignal(sig));
@@ -252,7 +273,7 @@ static int ConsumeSignalImpl(struct Machine *m, int *delivered, bool *restart) {
       }
     } else if (handler == SIG_IGN_LINUX) {
       SYS_LOGF("explicitly ignoring %s", DescribeSignal(sig));
-      return 0;
+      continue;
     }
     if (delivered) {
       *delivered = sig;
@@ -260,7 +281,12 @@ static int ConsumeSignalImpl(struct Machine *m, int *delivered, bool *restart) {
     if (restart) {
       *restart = !!(Read64(m->system->hands[sig - 1].flags) & SA_RESTART_LINUX);
     }
-    DeliverSignal(m, sig, SI_KERNEL_LINUX);
+#ifdef __EMSCRIPTEN__
+    /* pselect/ppoll/sigsuspend use a temporary mask to select the signal;
+     * the saved ucontext must contain the ordinary mask. */
+    GuestWaitRestoreMask(m);
+#endif
+    DeliverSignal(m, sig, m->signal_codes[sig - 1]);
     return 0;
   }
   return 0;
@@ -276,7 +302,17 @@ int ConsumeSignal(struct Machine *m, int *delivered, bool *restart) {
 }
 
 void EnqueueSignal(struct Machine *m, int sig) {
+  EnqueueSignalWithCode(m, sig, SI_KERNEL_LINUX);
+}
+
+void EnqueueSignalWithCode(struct Machine *m, int sig, int code) {
   if (m && (1 <= sig && sig <= 64)) {
+#ifdef __EMSCRIPTEN__
+    DebugHistoryMarkIrreversible();
+#endif
+    /* A standard signal already pending keeps its first siginfo. */
+    if (!(m->signals & ((u64)1 << (sig - 1))))
+      m->signal_codes[sig - 1] = code;
     m->signals |= 1ul << (sig - 1);
     if ((m->signals & ~m->sigmask)) {
       atomic_store_explicit(&m->attention, true, memory_order_release);
@@ -295,7 +331,7 @@ void CheckForSignals(struct Machine *m) {
 #endif
   } else if (m->signals & ~m->sigmask) {
     if ((sig = ConsumeSignal(m, 0, 0))) {
-      TerminateSignal(m, sig, 0);
+      TerminateSignal(m, sig, m->signal_codes[sig - 1]);
     }
   } else {
     atomic_store_explicit(&m->attention, false, memory_order_relaxed);

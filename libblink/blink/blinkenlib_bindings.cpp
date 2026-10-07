@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include "blink/blinkenlib.h"
@@ -281,6 +282,36 @@ void SetEmulationArgs(const std::string &progname, const std::string &argc,
   blinkenlib_set_program_args(progname.c_str(), argc.c_str(), argv.c_str());
 }
 
+// Appends a Uint8Array to the terminal's input, copied with one
+// TypedArray.prototype.set into a view over a buffer of the same length.
+void ProvideInput(val bytes) {
+  uint32_t length = bytes["length"].as<uint32_t>();
+  if (!length) return;
+  std::vector<uint8_t> buffer(length);
+  val(emscripten::typed_memory_view(static_cast<size_t>(length),
+                                    buffer.data()))
+      .call<void>("set", bytes);
+  blinkenlib_provide_input(buffer.data(), length);
+}
+
+// The system calls the dispatcher answers, as {number, name, arity}.
+val GetSyscalls() {
+  val result = val::array();
+  uint32_t number = 0;
+  uint32_t arity = 0;
+  const char *name = nullptr;
+  uint32_t count = blinkenlib_get_syscall_count();
+  for (uint32_t index = 0; index < count; ++index) {
+    if (!blinkenlib_get_syscall(index, &number, &arity, &name)) break;
+    val syscall = val::object();
+    syscall.set("number", number);
+    syscall.set("name", std::string(name));
+    syscall.set("arity", arity);
+    result.set(index, syscall);
+  }
+  return result;
+}
+
 }  // namespace
 
 EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
@@ -301,6 +332,11 @@ EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
   emscripten::function("blinkenlibGetInstructionAt", &GetInstructionAt);
   emscripten::function("blinkenlibResolveSymbol", &ResolveSymbol);
   emscripten::function("blinkenlibSetEmulationArgs", &SetEmulationArgs);
+  emscripten::function("blinkenlibGetSyscalls", &GetSyscalls);
   emscripten::function("blinkenlibGetInputMaxBytes",
                        &blinkenlib_get_input_max_bytes);
+  emscripten::function("blinkenlibProvideInput", &ProvideInput);
+  emscripten::function("blinkenlibProvideEndOfInput",
+                       &blinkenlib_provide_end_of_input);
+  emscripten::function("blinkenlibClearInput", &blinkenlib_clear_input);
 }

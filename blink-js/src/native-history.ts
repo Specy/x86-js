@@ -22,7 +22,7 @@ export class NativeHistory {
      * hollows its oldest entries to their header once it holds too many bytes, and a hollowed
      * entry keeps its serial, so a row decoded before has to be decoded again.
      */
-    private cache = new Map<bigint, { length: number; step: ExecutionStep }>()
+    private cache = new Map<bigint, { length: number; undoable: boolean; step: ExecutionStep }>()
     /**
      * Whether what the ring holds can be undone. Off, the ring records all the same, which keeps
      * the call stack it tracks right, but nothing recorded then can ever be undone.
@@ -45,20 +45,22 @@ export class NativeHistory {
         const version = module._blinkenlib_history_version?.()
         if (version === undefined) {
             throw new Error(
-                'This blinkenlib.wasm records no undo history: @specy/x86 needs a build with debughistory.c',
+                'This blinkenlib.wasm records no undo history: @specy/x86 needs a build with debughistory.c'
             )
         }
         if (version !== PACKET_VERSION) {
             throw new Error(
-                `This blinkenlib.wasm records undo history version ${version}, and @specy/x86 reads version ${PACKET_VERSION}`,
+                `This blinkenlib.wasm records undo history version ${version}, and @specy/x86 reads version ${PACKET_VERSION}`
             )
         }
         if (!module._blinkenlib_run_slice) {
-            throw new Error('This blinkenlib.wasm cannot run in bounded slices: it has no _blinkenlib_run_slice')
+            throw new Error(
+                'This blinkenlib.wasm cannot run in bounded slices: it has no _blinkenlib_run_slice'
+            )
         }
         if (typeof module.wasmExports?.blinkenlib_history_recorded !== 'function') {
             throw new Error(
-                'This blinkenlib.wasm does not count the entries it records: it has no blinkenlib_history_recorded',
+                'This blinkenlib.wasm does not count the entries it records: it has no blinkenlib_history_recorded'
             )
         }
     }
@@ -94,7 +96,7 @@ export class NativeHistory {
     }
 
     /**
-     * How many entries the wasm has recorded since it loaded: the last serial it handed out.
+     * How many entries the wasm has recorded since it loaded, independently of dynamic identities.
      * Undo, hollowing, a full ring and the undo floor never take it back, and nothing is recorded
      * while the capacity is 0.
      */
@@ -147,13 +149,26 @@ export class NativeHistory {
         return this.canReachNewest() && Boolean(this.runtime.module._blinkenlib_history_can_undo!())
     }
 
+    /** Preflight an entire grouped Undo without changing CPU or peripheral state. */
+    canUndoSteps(count: number): boolean {
+        if (!Number.isSafeInteger(count) || count < 0)
+            throw new RangeError('Invalid Undo step count')
+        if (count === 0) return true
+        if (count > this.depth()) return false
+        for (let offset = 0; offset < count; offset++) {
+            const pointer = this.runtime.module._blinkenlib_history_entry!(offset)
+            if (!pointer || !this.view(pointer, 24).getUint32(20, true)) return false
+        }
+        return true
+    }
+
     undo(): boolean {
         // An entry undo may not reach is left alone exactly as an empty history leaves nothing.
         if (!this.canReachNewest()) return false
         const result = this.runtime.module._blinkenlib_history_undo!()
         if (result < 0)
             throw new Error(
-                'The latest x86 step cannot be undone because its memory writes were too large to capture or are no longer mapped'
+                'The latest x86 step cannot be undone: it changed input, a File, process state, or memory that history cannot restore'
             )
         return result > 0
     }
@@ -205,16 +220,23 @@ export class NativeHistory {
 
     newestFirst(max: number): ExecutionStep[] {
         const count = Math.min(max, this.depth())
-        const nextCache = new Map<bigint, { length: number; step: ExecutionStep }>()
+        const nextCache = new Map<
+            bigint,
+            { length: number; undoable: boolean; step: ExecutionStep }
+        >()
         const steps: ExecutionStep[] = []
         for (let index = 0; index < count; index++) {
             const pointer = this.runtime.module._blinkenlib_history_entry!(index)
             const header = this.view(pointer, 88)
             const serial = header.getBigUint64(8, true)
             const length = header.getUint32(4, true)
+            const undoable = Boolean(header.getUint32(20, true))
             const cached = this.cache.get(serial)
-            const step = cached?.length === length ? cached.step : this.decode(pointer, length)
-            nextCache.set(serial, { length, step })
+            const step =
+                cached?.length === length && cached.undoable === undoable
+                    ? cached.step
+                    : this.decode(pointer, length)
+            nextCache.set(serial, { length, undoable, step })
             steps.push(step)
         }
         // Only cache the displayed rows, not another copy of the entire ring.
@@ -224,7 +246,8 @@ export class NativeHistory {
 
     private decode(pointer: number, length: number): ExecutionStep {
         const view = this.view(pointer, length)
-        if (view.getUint32(0, true) !== PACKET_VERSION) throw new Error('Unsupported x86 history packet')
+        if (view.getUint32(0, true) !== PACKET_VERSION)
+            throw new Error('Unsupported x86 history packet')
         const poke = Boolean(view.getUint32(16, true))
         const pcBefore = view.getBigUint64(24, true)
         const pcAfter = view.getBigUint64(32, true)
@@ -285,7 +308,9 @@ export class NativeHistory {
         const pc = poke ? pcAfter : pcBefore
         const location = this.runtime.getSourceLocationForAddress(pc)
         return {
+            serial: view.getBigUint64(8, true).toString(),
             kind: poke ? 'poke' : 'instruction',
+            undoable: Boolean(view.getUint32(20, true)),
             mutations,
             pc: toHistoryPc(pc),
             old_ccr: { bits: view.getUint32(40, true) },

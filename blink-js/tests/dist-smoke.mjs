@@ -23,7 +23,9 @@ const dist = new URL('../dist/index.mjs', import.meta.url)
 const compilerOutputDist = new URL('../dist/compiler-output.mjs', import.meta.url)
 for (const bundle of [dist, compilerOutputDist]) {
     if (!existsSync(fileURLToPath(bundle))) {
-        console.error(`dist/${bundle.pathname.split('/').pop()} is missing - run \`npm run build\` first.`)
+        console.error(
+            `dist/${bundle.pathname.split('/').pop()} is missing - run \`npm run build\` first.`
+        )
         process.exit(1)
     }
 }
@@ -39,7 +41,11 @@ for (const bundle of [dist, compilerOutputDist]) {
 // reading its profile and translating must not touch it. Nothing has imported
 // the root bundle yet, so no module the two bundles could share has already
 // been evaluated with the real WebAssembly.
-assert.equal(import.meta.resolve('@specy/x86/compiler-output'), compilerOutputDist.href, 'the exports map resolves the subpath to its own bundle')
+assert.equal(
+    import.meta.resolve('@specy/x86/compiler-output'),
+    compilerOutputDist.href,
+    'the exports map resolves the subpath to its own bundle'
+)
 assert.equal(import.meta.resolve('@specy/x86'), dist.href, 'and the root to the emulator')
 
 // The stub only notices WebAssembly being used, and the root bundle instantiates
@@ -48,7 +54,11 @@ assert.equal(import.meta.resolve('@specy/x86'), dist.href, 'and the root to the 
 // below records every module it resolves.
 const compilerOutputSource = readFileSync(compilerOutputDist, 'utf8')
 for (const marker of ['AGFzbQ', '.wasm', 'blinkenlib', 'nasm.mjs']) {
-    assert.equal(compilerOutputSource.includes(marker), false, `the subpath bundle carries no wasm, and ${marker} is not in it`)
+    assert.equal(
+        compilerOutputSource.includes(marker),
+        false,
+        `the subpath bundle carries no wasm, and ${marker} is not in it`
+    )
 }
 const resolvedModules = []
 
@@ -129,7 +139,7 @@ const CTOR_O2 = [
     '\t.text',
     '.Letext0:',
     '\t.ident\t"GCC: (Compiler-Explorer-Build-gcc--binutils-2.42) 14.2.0"',
-    '\t.section\t.note.GNU-stack,"",@progbits',
+    '\t.section\t.note.GNU-stack,"",@progbits'
 ]
 
 // One case of the corpus itself, when this runs from the repository: the
@@ -150,30 +160,44 @@ const forbiddenWebAssembly = new Proxy(
                 const use = typeof key === 'string' ? `${trap} ${key}` : String(trap)
                 webAssemblyUses.push(use)
                 throw new Error(`the compiler-output subpath used WebAssembly (${use})`)
-            },
+            }
         }
     )
 )
 
 let ctor
 let fixture = null
-Object.defineProperty(globalThis, 'WebAssembly', { ...realWebAssembly, value: forbiddenWebAssembly })
+Object.defineProperty(globalThis, 'WebAssembly', {
+    ...realWebAssembly,
+    value: forbiddenWebAssembly
+})
 const moduleHooks = registerHooks({
     resolve(specifier, context, nextResolve) {
         const resolved = nextResolve(specifier, context)
         resolvedModules.push(resolved.url)
         return resolved
-    },
+    }
 })
 try {
     assert.equal(globalThis.WebAssembly, forbiddenWebAssembly, 'the stub is in place')
     const compilerOutput = await import('@specy/x86/compiler-output')
-    assert.deepEqual(resolvedModules, [compilerOutputDist.href], 'importing the subpath loads its bundle and nothing else')
+    assert.deepEqual(
+        resolvedModules,
+        [compilerOutputDist.href],
+        'importing the subpath loads its bundle and nothing else'
+    )
     const { GCC_INTEL_V1, translateCompilerOutput } = compilerOutput
-    assert.deepEqual(Object.keys(compilerOutput), ['GCC_INTEL_V1', 'translateCompilerOutput'], 'the subpath exports the translator and its profile')
+    assert.deepEqual(
+        Object.keys(compilerOutput),
+        ['GCC_INTEL_V1', 'translateCompilerOutput'],
+        'the subpath exports the translator and its profile'
+    )
     assert.equal(GCC_INTEL_V1.id, 'gcc-intel-v1')
     assert.ok(GCC_INTEL_V1.flags.translation.includes('-masm=intel'))
-    assert.ok(Object.isFrozen(GCC_INTEL_V1.flags.translation), 'a consumer cannot change the profile')
+    assert.ok(
+        Object.isFrozen(GCC_INTEL_V1.flags.translation),
+        'a consumer cannot change the profile'
+    )
     assert.throws(
         () => translateCompilerOutput(CTOR_O2, { profile: 'gcc-intel-v0' }),
         /Unknown compiler-output translation profile/,
@@ -181,37 +205,107 @@ try {
     )
 
     ctor = translateCompilerOutput(CTOR_O2, { profile: GCC_INTEL_V1.id })
-    assert.equal(ctor.ok, true, `the C++ program should translate: ${JSON.stringify(ctor.diagnostics)}`)
+    assert.equal(
+        ctor.ok,
+        true,
+        `the C++ program should translate: ${JSON.stringify(ctor.diagnostics)}`
+    )
     assert.deepEqual(ctor.diagnostics, [], 'its .ident names GCC 14.2, so not even a warning')
-    assert.equal(ctor.text, ctor.lines.map((line) => `${line.text}\n`).join(''), 'the text is its lines, in order')
-    assert.deepEqual(ctor.lines[0], { text: '    default rel', inputLine: null, synthesized: true, location: null }, 'the header comes from no input line')
+    assert.equal(
+        ctor.text,
+        ctor.lines.map((line) => `${line.text}\n`).join(''),
+        'the text is its lines, in order'
+    )
+    assert.deepEqual(
+        ctor.lines[0],
+        { text: '    default rel', inputLine: null, synthesized: true, location: null },
+        'the header comes from no input line'
+    )
     assert.deepEqual(
         ctor.lines.find((line) => line.inputLine === 15),
-        { text: '    mov eax, dword [rel config]', inputLine: 15, synthesized: false, location: { file: 'src/main.cpp', line: 5, column: 35 } },
+        {
+            text: '    mov eax, dword [rel config]',
+            inputLine: 15,
+            synthesized: false,
+            location: { file: 'src/main.cpp', line: 5, column: 35 }
+        },
         'an instruction keeps the line it came from and the .loc in effect there'
     )
-    assert.equal(ctor.lines.find((line) => line.inputLine === 54)?.text, '    dq _GLOBAL__sub_I_seven', 'the constructor stays in .init_array')
+    assert.equal(
+        ctor.lines.find((line) => line.inputLine === 54)?.text,
+        '    dq _GLOBAL__sub_I_seven',
+        'the constructor stays in .init_array'
+    )
     assert.deepEqual(ctor.symbols, {
         defined: [
             { name: 'main', nasmName: 'main', binding: 'global' },
             { name: 'config', nasmName: 'config', binding: 'global' },
-            { name: 'seven', nasmName: 'seven', binding: 'global' },
+            { name: 'seven', nasmName: 'seven', binding: 'global' }
         ],
         common: [],
         external: [],
-        constructors: [{ name: '_GLOBAL__sub_I_seven', nasmName: '_GLOBAL__sub_I_seven' }],
+        constructors: [{ name: '_GLOBAL__sub_I_seven', nasmName: '_GLOBAL__sub_I_seven' }]
     })
-    assert.equal(translateCompilerOutput(CTOR_O2, { profile: 'gcc-intel-v1' }).text, ctor.text, 'translating twice gives the same text')
+    assert.equal(
+        translateCompilerOutput(CTOR_O2, { profile: 'gcc-intel-v1' }).text,
+        ctor.text,
+        'translating twice gives the same text'
+    )
 
-    // Inline assembly is refused, at its own line and with the location in
-    // effect there, and an error leaves no output at all.
-    const withInlineAssembly = [...CTOR_O2.slice(0, 16), '#APP', '# 5 "src/main.cpp" 1', '\tnop', '# 0 "" 2', '#NO_APP', ...CTOR_O2.slice(16)]
-    const refused = translateCompilerOutput(withInlineAssembly, { profile: 'gcc-intel-v1' })
-    assert.equal(refused.ok, false, 'inline assembly does not translate')
+    // Inline assembly translates where its lines are what GCC itself writes,
+    // `syscall` included, each at the location of its asm statement; any
+    // other line is refused at that line, and an error leaves no output.
+    const withInlineAssembly = (...template) => [
+        ...CTOR_O2.slice(0, 16),
+        '#APP',
+        '# 5 "src/main.cpp" 1',
+        ...template,
+        '# 0 "" 2',
+        '#NO_APP',
+        ...CTOR_O2.slice(16)
+    ]
+    const statement = { file: 'src/main.cpp', line: 5, column: 35 }
+    const accepted = translateCompilerOutput(withInlineAssembly('\tnop', '\tsyscall'), {
+        profile: 'gcc-intel-v1'
+    })
+    assert.equal(
+        accepted.ok,
+        true,
+        `inline assembly GCC could have written translates: ${JSON.stringify(accepted.diagnostics)}`
+    )
+    assert.deepEqual(
+        accepted.lines.filter((line) => line.inputLine === 18 || line.inputLine === 19),
+        [
+            { text: '    nop', inputLine: 18, synthesized: false, location: statement },
+            { text: '    syscall', inputLine: 19, synthesized: false, location: statement }
+        ],
+        'each line of the template keeps its input line and the location of its asm statement'
+    )
+    const refused = translateCompilerOutput(withInlineAssembly('\t.rept 2', '\tnop', '\t.endr'), {
+        profile: 'gcc-intel-v1'
+    })
+    assert.equal(
+        refused.ok,
+        false,
+        'inline assembly with a directive outside the rules does not translate'
+    )
     assert.equal('text' in refused, false, 'an error means no output')
     assert.deepEqual(
-        refused.diagnostics.map(({ severity, code, inputLine, location }) => ({ severity, code, inputLine, location })),
-        [{ severity: 'error', code: 'inline-assembly', inputLine: 16, location: { file: 'src/main.cpp', line: 5, column: 35 } }]
+        refused.diagnostics.map(({ severity, code, inputLine, location }) => ({
+            severity,
+            code,
+            inputLine,
+            location
+        })),
+        [
+            { severity: 'error', code: 'inline-assembly', inputLine: 18, location: statement },
+            { severity: 'error', code: 'inline-assembly', inputLine: 20, location: statement }
+        ]
+    )
+    assert.match(
+        refused.diagnostics[0].message,
+        /^inline assembly `\.rept 2`: /,
+        'the message quotes the line it is about'
     )
 
     if (existsSync(fileURLToPath(FIXTURE_CASE))) {
@@ -221,16 +315,25 @@ try {
             { profile: 'gcc-intel-v1' }
         )
         assert.equal(stored.outcome.kind, 'exit', 'the fixture case is meant to run')
-        assert.equal(translation.ok, true, `the fixture case should translate: ${JSON.stringify(translation.diagnostics)}`)
+        assert.equal(
+            translation.ok,
+            true,
+            `the fixture case should translate: ${JSON.stringify(translation.diagnostics)}`
+        )
         assert.deepEqual(translation.diagnostics, [])
-        assert.ok(translation.symbols.defined.some((symbol) => symbol.name === 'main'), 'it defines main')
+        assert.ok(
+            translation.symbols.defined.some((symbol) => symbol.name === 'main'),
+            'it defines main'
+        )
         assert.ok(
             translation.lines.some((line) => line.location?.file === '/app/values.h'),
             'an instruction from the inline function in values.h is located there'
         )
         fixture = { name: stored.case, exitCode: stored.outcome.value, translation }
     } else {
-        console.log(`skip - ${fileURLToPath(FIXTURE_CASE)} is not here, so only the inline program is translated`)
+        console.log(
+            `skip - ${fileURLToPath(FIXTURE_CASE)} is not here, so only the inline program is translated`
+        )
     }
 } finally {
     moduleHooks.deregister()
@@ -243,34 +346,85 @@ assert.deepEqual(resolvedModules, [compilerOutputDist.href], 'translating loaded
 // The root export
 // ---------------------------------------------------------------------------
 
-// Every name the root module exported in 2.8.0, recorded from that build. The
-// subpath is an addition, so the root must export exactly these: change this
-// list only in the commit that changes the root surface on purpose.
+// Every name the root module exported in 2.8.0, recorded from that build, and
+// the ones 5.0.0 adds. The subpath is an addition, so the root must export
+// exactly these: change these lists only in the commit that changes the root
+// surface on purpose.
 const ROOT_EXPORTS_2_8_0 = [
-    'BaseEmulator', 'BlinkRuntime', 'BlinkState', 'DEFAULT_ASSEMBLER_ID', 'EmulatorStatus', 'RegisterSize',
-    'X86Emulator', 'X86_FPU_STATE_CW_OFFSET', 'X86_FPU_STATE_DP_OFFSET', 'X86_FPU_STATE_IP_OFFSET',
-    'X86_FPU_STATE_MXCSR_OFFSET', 'X86_FPU_STATE_OP_OFFSET', 'X86_FPU_STATE_SIZE', 'X86_FPU_STATE_ST_OFFSET',
-    'X86_FPU_STATE_SW_OFFSET', 'X86_FPU_STATE_TW_OFFSET', 'X86_FPU_STATE_XMM_OFFSET', 'X86_PROJECT_ROOT',
-    'X86_REGISTER_NAMES', 'X86_SSE_REGISTERS', 'X86_X87_REGISTERS', 'assemblers', 'createX86Emulator',
-    'decodeFpuState', 'defaultResourceUrl', 'emptyFpuStateBlock', 'encodeFpuState', 'fasmDiagnostics',
-    'fpuStateBlocksEqual', 'gnuDiagnostics', 'isNodeRuntime', 'isShadowAddress', 'ldDiagnostics',
-    'locateDiagnosticColumn', 'locateDiagnosticSpan', 'nasmDiagnostics', 'observeCallbackResult',
-    'readLogicalStBits', 'readLogicalStTags', 'readResourceBytes', 'selectX86Source', 'stageX86Project',
-    'toResourceUrl', 'validateX86Project', 'x86ProjectSourcePath', 'x86ProjectText',
+    'BaseEmulator',
+    'BlinkRuntime',
+    'BlinkState',
+    'DEFAULT_ASSEMBLER_ID',
+    'EmulatorStatus',
+    'RegisterSize',
+    'X86Emulator',
+    'X86_FPU_STATE_CW_OFFSET',
+    'X86_FPU_STATE_DP_OFFSET',
+    'X86_FPU_STATE_IP_OFFSET',
+    'X86_FPU_STATE_MXCSR_OFFSET',
+    'X86_FPU_STATE_OP_OFFSET',
+    'X86_FPU_STATE_SIZE',
+    'X86_FPU_STATE_ST_OFFSET',
+    'X86_FPU_STATE_SW_OFFSET',
+    'X86_FPU_STATE_TW_OFFSET',
+    'X86_FPU_STATE_XMM_OFFSET',
+    'X86_PROJECT_ROOT',
+    'X86_REGISTER_NAMES',
+    'X86_SSE_REGISTERS',
+    'X86_X87_REGISTERS',
+    'assemblers',
+    'createX86Emulator',
+    'decodeFpuState',
+    'defaultResourceUrl',
+    'emptyFpuStateBlock',
+    'encodeFpuState',
+    'fasmDiagnostics',
+    'fpuStateBlocksEqual',
+    'gnuDiagnostics',
+    'isNodeRuntime',
+    'isShadowAddress',
+    'ldDiagnostics',
+    'locateDiagnosticColumn',
+    'locateDiagnosticSpan',
+    'nasmDiagnostics',
+    'observeCallbackResult',
+    'readLogicalStBits',
+    'readLogicalStTags',
+    'readResourceBytes',
+    'selectX86Source',
+    'stageX86Project',
+    'toResourceUrl',
+    'validateX86Project',
+    'x86ProjectSourcePath',
+    'x86ProjectText'
 ]
+// The token provideInput() takes for End of input, and where programs start.
+const ROOT_EXPORTS_5_0_0 = ['END_OF_INPUT', 'X86_WORKING_DIRECTORY', 'X86EnvironmentError']
+const ROOT_EXPORTS = [...ROOT_EXPORTS_2_8_0, ...ROOT_EXPORTS_5_0_0]
 
 const root = await import(dist)
 const rootNames = Object.keys(root)
 assert.deepEqual(
     {
-        added: rootNames.filter((name) => !ROOT_EXPORTS_2_8_0.includes(name)),
-        removed: ROOT_EXPORTS_2_8_0.filter((name) => !rootNames.includes(name)),
+        added: rootNames.filter((name) => !ROOT_EXPORTS.includes(name)),
+        removed: ROOT_EXPORTS.filter((name) => !rootNames.includes(name))
     },
     { added: [], removed: [] },
-    'the root module exports exactly the names 2.8.0 did'
+    'the root module exports exactly the names 2.8.0 did and the ones 5.0.0 adds'
 )
 
-const { createX86Emulator, EmulatorStatus, RegisterSize, X86_SSE_REGISTERS, X86_X87_REGISTERS, X86_FPU_STATE_SIZE, decodeFpuState, encodeFpuState } = root
+const {
+    createX86Emulator,
+    EmulatorStatus,
+    RegisterSize,
+    X86_SSE_REGISTERS,
+    X86_X87_REGISTERS,
+    X86_FPU_STATE_SIZE,
+    decodeFpuState,
+    encodeFpuState,
+    END_OF_INPUT,
+    X86_WORKING_DIRECTORY
+} = root
 
 // ---------------------------------------------------------------------------
 // Assembling and running
@@ -294,12 +448,16 @@ const SOURCE = [
     '  syscall',
     '  mov rax, 60',
     '  mov rdi, 7',
-    '  syscall',
+    '  syscall'
 ].join('\n')
 
 let stdout = ''
 const emulator = await createX86Emulator({
-    callbacks: { stdout: (charCode) => { stdout += String.fromCharCode(charCode) } },
+    callbacks: {
+        stdout: (chunk) => {
+            stdout += String.fromCharCode(...chunk)
+        }
+    }
 })
 assert.equal(emulator.state, 'READY', 'the runtime initializes from the inlined wasm')
 
@@ -328,10 +486,106 @@ assert.equal(emulator.stopReason?.exitCode, 7, 'stepping replays exit without ab
 emulator.undo()
 await emulator.runUntilBlocked()
 assert.equal(emulator.stopReason?.exitCode, 7, 'running replays exit on the same machine')
-// The callback carries the emulator's own log lines too - the assembler and
-// linker commands it ran - so the program's own output is what it ends with.
-assert.ok(stdout.endsWith('ok\n'), `the write syscall reached the stdout callback: ${JSON.stringify(stdout)}`)
+// The callback carries what the program wrote, once per run above, and nothing
+// of the emulator's own: no banner, and no echo of the command it ran.
+assert.match(
+    stdout,
+    /^(ok\n)+$/,
+    `the write syscall, alone, reached the stdout callback: ${JSON.stringify(stdout)}`
+)
+// The system calls the wasm was compiled with, which a documentation generator
+// reads from the published package.
+const syscalls = emulator.getImplementedSyscalls()
+assert.deepEqual(
+    syscalls.filter((syscall) => [12, 60, 302].includes(syscall.number)),
+    [
+        { number: 12, name: 'brk', arity: 1 },
+        { number: 60, name: 'exit', arity: 1 },
+        { number: 302, name: 'prlimit64', arity: 4 }
+    ],
+    'the bundle reports the implemented system calls'
+)
 emulator.dispose()
+
+// ---------------------------------------------------------------------------
+// Standard input and the run's file system
+// ---------------------------------------------------------------------------
+
+// The terminal's input lives in the wasm, so this covers the embind calls that
+// feed it: a line the read takes in two, End of input, and the working
+// directory a program starts in, which getcwd(2) reports.
+const reader = await createX86Emulator()
+const readerBuilt = await reader.compile(
+    [
+        'bits 64',
+        'global _start',
+        'section .bss',
+        'line: resb 64',
+        'section .text',
+        '_start:',
+        '  xor eax, eax',
+        '  xor edi, edi',
+        '  lea rsi, [rel line]',
+        '  mov edx, 2',
+        '  syscall', // read(0, line, 2)
+        '  mov r12, rax',
+        '  xor eax, eax',
+        '  xor edi, edi',
+        '  lea rsi, [rel line + 2]',
+        '  mov edx, 64',
+        '  syscall',
+        '  add r12, rax',
+        '  xor eax, eax',
+        '  xor edi, edi',
+        '  lea rsi, [rel line + 8]',
+        '  mov edx, 64',
+        '  syscall', // End of input
+        '  add r12, rax',
+        '  mov eax, 79',
+        '  lea rdi, [rel line + 16]',
+        '  mov esi, 48',
+        '  syscall', // getcwd
+        '  mov eax, 1',
+        '  mov edi, 1',
+        '  lea rsi, [rel line]',
+        '  mov edx, 32',
+        '  syscall',
+        '  mov eax, 60',
+        '  mov rdi, r12',
+        '  syscall'
+    ].join('\n')
+)
+assert.equal(readerBuilt.ok, true, `the reader should assemble: ${readerBuilt.report}`)
+let echoed = ''
+reader.on('stdout', (chunk) => {
+    echoed += String.fromCharCode(...chunk)
+})
+const requests = []
+reader.on('inputRequest', ({ maxBytes }) => {
+    requests.push(maxBytes)
+})
+const answers = ['hey\n', END_OF_INPUT]
+for (let slice = 0; slice < 10 && !reader.hasTerminated(); slice++) {
+    if ((await reader.run()) === EmulatorStatus.WaitingForInput)
+        reader.provideInput(answers.shift())
+}
+assert.equal(
+    reader.stopReason?.exitCode,
+    4,
+    'two reads took "hey\\n" and End of input ended the third'
+)
+assert.deepEqual(
+    requests,
+    [2n, 64n],
+    'only the first and the third read waited, each for what it asked'
+)
+assert.equal(echoed.slice(0, 4), 'hey\n')
+assert.equal(
+    echoed.slice(16, 16 + X86_WORKING_DIRECTORY.length + 1),
+    `${X86_WORKING_DIRECTORY}\0`,
+    'the program starts in the working directory'
+)
+reader.dispose()
 
 // ---------------------------------------------------------------------------
 // A project of several files
@@ -345,9 +599,14 @@ const project = await createX86Emulator()
 const built = await project.compileProject({
     entry: 'src/main.asm',
     files: {
-        'src/main.asm': ['bits 64', 'global _start', 'section .text', '%include "parts/exit.asm"'].join('\n'),
-        'src/parts/exit.asm': ['_start:', '  mov rax, 60', '  xor rdi, rdi', '  syscall'].join('\n'),
-    },
+        'src/main.asm': [
+            'bits 64',
+            'global _start',
+            'section .text',
+            '%include "parts/exit.asm"'
+        ].join('\n'),
+        'src/parts/exit.asm': ['_start:', '  mov rax, 60', '  xor rdi, rdi', '  syscall'].join('\n')
+    }
 })
 assert.equal(built.ok, true, `a project of two files should assemble: ${built.report}`)
 
@@ -381,19 +640,21 @@ assert.equal(X86_FPU_STATE_SIZE, 356)
 assert.equal(RegisterSize.Quad, 16, 'an SSE register is 16 bytes wide')
 
 const fpu = await createX86Emulator({ mode: 'GNU_trunk' })
-const fpuBuilt = await fpu.compile([
-    '.global _start',
-    '.text',
-    '_start:',
-    '  movabs $0x4010000000000000, %rax',
-    '  movq %rax, %xmm0',
-    '  fld1',
-    '  fld1',
-    '  faddp',
-    '  mov $60, %rax',
-    '  xor %rdi, %rdi',
-    '  syscall',
-].join('\n'))
+const fpuBuilt = await fpu.compile(
+    [
+        '.global _start',
+        '.text',
+        '_start:',
+        '  movabs $0x4010000000000000, %rax',
+        '  movq %rax, %xmm0',
+        '  fld1',
+        '  fld1',
+        '  faddp',
+        '  mov $60, %rax',
+        '  xor %rdi, %rdi',
+        '  syscall'
+    ].join('\n')
+)
 assert.equal(fpuBuilt.ok, true, `the FPU program should assemble: ${fpuBuilt.report}`)
 
 fpu.initialize(8)
@@ -403,11 +664,17 @@ assert.equal(fpu.getFpuState().xmm[0], 0x4010000000000000n, 'movq wrote 4.0 into
 
 const xmmWrite = fpu
     .getUndoHistory(1)[0]
-    .mutations.find((mutation) => mutation.type === 'WriteRegister' && mutation.value.register === 'xmm0')
+    .mutations.find(
+        (mutation) => mutation.type === 'WriteRegister' && mutation.value.register === 'xmm0'
+    )
 assert.ok(xmmWrite, 'the step names xmm0 as a register write')
 assert.equal(xmmWrite.value.size, RegisterSize.Quad, 'an xmm write is 16 bytes wide')
 assert.equal(xmmWrite.value.old, 0n)
-assert.equal(xmmWrite.value.new, 0x4010000000000000n, 'the write reports the value it wrote as well as the one it replaced')
+assert.equal(
+    xmmWrite.value.new,
+    0x4010000000000000n,
+    'the write reports the value it wrote as well as the one it replaced'
+)
 
 await fpu.step()
 await fpu.step()
@@ -449,18 +716,20 @@ fpu.dispose()
 // The memory half of the write values: a store's history entry names the bytes
 // it replaced and the bytes it left, at the width of the store.
 const stores = await createX86Emulator({ mode: 'GNU_trunk' })
-const storesBuilt = await stores.compile([
-    '.global _start',
-    '.data',
-    'buffer: .quad 0x1122334455667788',
-    '.text',
-    '_start:',
-    '  lea buffer(%rip), %rbx',
-    '  movw $0xbeef, (%rbx)',
-    '  mov $60, %rax',
-    '  xor %rdi, %rdi',
-    '  syscall',
-].join('\n'))
+const storesBuilt = await stores.compile(
+    [
+        '.global _start',
+        '.data',
+        'buffer: .quad 0x1122334455667788',
+        '.text',
+        '_start:',
+        '  lea buffer(%rip), %rbx',
+        '  movw $0xbeef, (%rbx)',
+        '  mov $60, %rax',
+        '  xor %rdi, %rdi',
+        '  syscall'
+    ].join('\n')
+)
 assert.equal(storesBuilt.ok, true, `the store program should assemble: ${storesBuilt.report}`)
 
 stores.initialize(8)
@@ -473,10 +742,18 @@ const memoryWrite = stores
 assert.ok(memoryWrite, 'the step names the memory it wrote')
 assert.equal(memoryWrite.value.address, bufferAddress)
 assert.deepEqual(memoryWrite.value.old, [0x88, 0x77], 'the two bytes the store replaced')
-assert.deepEqual(memoryWrite.value.new, [0xef, 0xbe], 'the two bytes it left, at the width of the store')
+assert.deepEqual(
+    memoryWrite.value.new,
+    [0xef, 0xbe],
+    'the two bytes it left, at the width of the store'
+)
 assert.deepEqual(Array.from(stores.readMemoryBytes(bufferAddress, 2n)), memoryWrite.value.new)
 stores.undo()
-assert.deepEqual(Array.from(stores.readMemoryBytes(bufferAddress, 2n)), [0x88, 0x77], 'undo puts the old bytes back')
+assert.deepEqual(
+    Array.from(stores.readMemoryBytes(bufferAddress, 2n)),
+    [0x88, 0x77],
+    'undo puts the old bytes back'
+)
 stores.dispose()
 
 // ---------------------------------------------------------------------------
@@ -486,7 +763,9 @@ stores.dispose()
 // A mistake builds no program and is reported on the line it is written on,
 // which means the assembler's log reached the diagnostics parser.
 const broken = await createX86Emulator()
-const failed = await broken.compile(['bits 64', 'global _start', 'section .text', '_start:', '  mov rax, nope nonsense'].join('\n'))
+const failed = await broken.compile(
+    ['bits 64', 'global _start', 'section .text', '_start:', '  mov rax, nope nonsense'].join('\n')
+)
 assert.equal(failed.ok, false, 'a program with an error does not assemble')
 assert.ok(failed.errors.length > 0, 'a failed build says what is wrong')
 // A compile diagnostic carries the assembler's own 1-based line; checkCode is
@@ -537,15 +816,23 @@ async function runTranslated(name, translation) {
         const build = await machine.compileProject({
             entry: 'main.asm',
             files: { 'main.asm': translation.text },
-            library: { 'start.asm': START_UNIT },
+            library: { 'start.asm': START_UNIT }
         })
         assert.equal(build.ok, true, `${name} should build: ${build.report}`)
-        assert.deepEqual(build.diagnostics, [], `${name}: what the translator writes assembles with no NASM warnings`)
+        assert.deepEqual(
+            build.diagnostics,
+            [],
+            `${name}: what the translator writes assembles with no NASM warnings`
+        )
 
         // Loads the program and pauses at its entry, which is in the start unit.
         const compiled = machine.getCompiledInstructions()
         assert.equal(machine.getNextInstruction().file, 'start.asm', `${name} starts at _start`)
-        assert.equal(machine.getRegisterValue('rsp') % 16n, 0n, `${name} starts with rsp 16-byte aligned`)
+        assert.equal(
+            machine.getRegisterValue('rsp') % 16n,
+            0n,
+            `${name} starts with rsp 16-byte aligned`
+        )
 
         // The Core reports each instruction's zero-based line in the File it was
         // assembled from; in the translation, that is an index into lines.
@@ -553,10 +840,16 @@ async function runTranslated(name, translation) {
         // Alignment kept before a function pads with NOPs, listed on its `align`
         // line: no source line made them, and nothing runs them, since they follow
         // the previous function's last instruction. Everything else came from GCC.
-        const isPadding = (instruction) => /^\s*align \d+$/.test(translation.lines[instruction.lineNumber]?.text ?? '')
+        const isPadding = (instruction) =>
+            /^\s*align \d+$/.test(translation.lines[instruction.lineNumber]?.text ?? '')
         for (const instruction of translated.filter(isPadding)) {
-            const text = /class='str'>([^<]*)</.exec(instruction.code ?? '')?.[1] ?? instruction.code
-            assert.match(text.trim(), /^nop\b/, `${name}: the padding on line ${instruction.lineNumber} is NOPs`)
+            const text =
+                /class='str'>([^<]*)</.exec(instruction.code ?? '')?.[1] ?? instruction.code
+            assert.match(
+                text.trim(),
+                /^nop\b/,
+                `${name}: the padding on line ${instruction.lineNumber} is NOPs`
+            )
         }
         const generated = translated.filter((instruction) => !isPadding(instruction))
         assert.equal(
@@ -579,10 +872,128 @@ async function runTranslated(name, translation) {
     }
 }
 
-assert.equal(await runTranslated('ctor-O2', ctor), 42, 'the constructor ran through .init_array before main read its result')
+assert.equal(
+    await runTranslated('ctor-O2', ctor),
+    42,
+    'the constructor ran through .init_array before main read its result'
+)
 if (fixture) {
-    assert.equal(await runTranslated(fixture.name, fixture.translation), fixture.exitCode, `${fixture.name} exits with its intended value`)
+    assert.equal(
+        await runTranslated(fixture.name, fixture.translation),
+        fixture.exitCode,
+        `${fixture.name} exits with its intended value`
+    )
 }
 
-console.log(`ok - ran a program to exit code 7, a two-file project to a breakpoint, the SSE and x87 register files through undo, checked both sides of a store, and read ${failed.errors.length} diagnostic(s)`)
-console.log(`ok - translated GCC output through @specy/x86/compiler-output without WebAssembly, built and ran ${fixture ? `ctor-O2 and ${fixture.name}` : 'ctor-O2'} with a start unit, and the root still exports the ${ROOT_EXPORTS_2_8_0.length} names of 2.8.0`)
+// A packaged mounted session must use the same native serial and barrier API as src/.
+{
+    const machine = await createX86Emulator()
+    let content = new Uint8Array([65])
+    let active = null
+    const serials = []
+    const session = {
+        performInstruction(serial, operation) {
+            assert.match(serial, /^\d+$/)
+            serials.push(serial)
+            active = serial
+            try {
+                return operation()
+            } finally {
+                active = null
+            }
+        },
+        open() {
+            assert.ok(active)
+            return 3
+        },
+        close() {
+            assert.ok(active)
+        },
+        pread(_fd, offset, count) {
+            return content.slice(offset, offset + count)
+        },
+        pwrite(_fd, offset, bytes) {
+            assert.ok(active)
+            const next = new Uint8Array(Math.max(content.length, offset + bytes.length))
+            next.set(content)
+            next.set(bytes, offset)
+            content = next
+            return bytes.length
+        },
+        stat(path) {
+            return path === ''
+                ? { kind: 'directory', size: 0 }
+                : path === 'data'
+                  ? { kind: 'file', size: content.length }
+                  : undefined
+        },
+        fstat() {
+            return { kind: 'file', size: content.length }
+        },
+        list() {
+            return [{ name: 'data', kind: 'file' }]
+        },
+        truncate() {
+            throw new Error('unused')
+        },
+        ftruncate() {
+            throw new Error('unused')
+        },
+        rename() {
+            throw new Error('unused')
+        },
+        remove() {
+            throw new Error('unused')
+        }
+    }
+    try {
+        const compiled = await machine.compile(
+            [
+                'bits 64',
+                'global _start',
+                'section .text',
+                '_start:',
+                'mov eax,2',
+                'lea rdi,[rel path]',
+                'mov esi,2',
+                'xor edx,edx',
+                'syscall',
+                'mov edi,eax',
+                'mov eax,1',
+                'lea rsi,[rel payload]',
+                'mov edx,1',
+                'syscall',
+                'nop',
+                'mov eax,60',
+                'xor edi,edi',
+                'syscall',
+                'section .data',
+                "path: db 'data',0",
+                "payload: db 'B'"
+            ].join('\n')
+        )
+        assert.ok(compiled.ok, compiled.report)
+        machine.initialize(32)
+        machine.mountProjectFileSystem(session)
+        await machine.run(10)
+        assert.deepEqual([...content], [66])
+        assert.equal(machine.canUndo(), false)
+        assert.equal(machine.canUndoSteps(1), false)
+        await machine.step()
+        assert.equal(machine.canUndoSteps(1), true)
+        assert.equal(machine.canUndoSteps(2), false)
+        assert.equal(serials.length, 2)
+        machine.clearExecution()
+        assert.equal(machine.getUndoDepth(), 0)
+        machine.clearExecution()
+    } finally {
+        machine.dispose()
+    }
+}
+
+console.log(
+    `ok - ran a program to exit code 7, a two-file project to a breakpoint, the SSE and x87 register files through undo, checked both sides of a store, and read ${failed.errors.length} diagnostic(s)`
+)
+console.log(
+    `ok - translated GCC output through @specy/x86/compiler-output without WebAssembly, built and ran ${fixture ? `ctor-O2 and ${fixture.name}` : 'ctor-O2'} with a start unit, read standard input, and the root exports the ${ROOT_EXPORTS_2_8_0.length} names of 2.8.0 and the ${ROOT_EXPORTS_5_0_0.length} of 5.0.0`
+)

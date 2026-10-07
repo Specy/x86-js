@@ -47,13 +47,13 @@ async function compare(lines: string[], expected: bigint[], nativeRfMayClear: re
             expect(referenceWords, 'native reference').toEqual(expected)
         }
         const actual: number[] = []
-        emulator.on('stdout', (byte) => { actual.push(byte) })
+        emulator.on('stdout', (chunk) => { actual.push(...chunk) })
         // Handled synchronous signals yield to JavaScript between instructions.
         for (let slice = 0; slice < 100 && !emulator.hasTerminated(); slice++) await emulator.run(100_000)
         expect(emulator.stopReason?.kind, emulator.stopReason?.details).toBe('exit')
         expect(emulator.stopReason?.kind === 'exit' && emulator.stopReason.exitCode).toBe(0)
-        // The runtime echoes the program command before its binary stdout.
-        const bytes = Uint8Array.from(actual.slice(-expected.length * 8))
+        // Everything on stdout is the program's: the runtime echoes no command of its own.
+        const bytes = Uint8Array.from(actual)
         expect(words(bytes), 'Core architectural expectation').toEqual(expected)
         if (referenceWords) expect(words(bytes), 'Core versus native').toEqual(referenceWords)
     } finally {

@@ -119,7 +119,7 @@ let program: Uint8Array
 let observed: bigint[]
 beforeAll(async () => {
     const bytes: number[] = []
-    const emulator = await createX86Emulator({ callbacks: { stdout: (code) => { bytes.push(code) } } })
+    const emulator = await createX86Emulator({ callbacks: { stdout: (chunk) => { bytes.push(...chunk) } } })
     try {
         const result = await emulator.compile(source().join('\n'))
         expect(result.ok, result.report).toBe(true)

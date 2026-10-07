@@ -520,7 +520,7 @@ describe('x87 register encodings the processor leaves undefined', () => {
             '  syscall',
         )
         const output: number[] = []
-        const emulator = await createX86Emulator({ callbacks: { stdout: (code) => void output.push(code & 0xff) } })
+        const emulator = await createX86Emulator({ callbacks: { stdout: (chunk) => void output.push(...chunk) } })
         try {
             const result = await emulator.compile(lines.join('\n'))
             if (!result.ok) throw new Error(`the program did not assemble:\n${result.report}`)

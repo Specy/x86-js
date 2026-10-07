@@ -33,7 +33,7 @@ export const GAS_SYMBOL = /^[A-Za-z_.$][A-Za-z0-9_.$]*$/
  * separators. GCC writes none of them inside a line, and the separators and a carriage return end a
  * line for `.` in a regular expression, so the statement patterns cannot read past them.
  */
-const UNREADABLE_CHARACTER = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u2028\u2029]/
+export const UNREADABLE_CHARACTER = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u2028\u2029]/
 
 /**
  * The first character of a line that the lexer does not read, with its one-based column, or null.

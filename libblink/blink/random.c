@@ -17,6 +17,23 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "blink/random.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+EM_JS(int, HostRandom, (void *p, size_t n), {
+  try {
+    if (Module.blinkHostRandom) Module.blinkHostRandom(p, n);
+    else { for (let i=0; i<n; i+=65536) crypto.getRandomValues(HEAPU8.subarray(p+i,p+Math.min(n,i+65536))); }
+    return n;
+  } catch (error) {
+    // The bridge reports this after returning from wasm, including before
+    // the first instruction on loader failure. Never abort the instance
+    // inside the loader's native assertion or unwind a syscall stack.
+    Module.blinkHostError = error;
+    HEAPU8.fill(0, p, p+n);
+    return n;
+  }
+});
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -108,6 +125,11 @@ static ssize_t GetWeakRandom(char *p, size_t n) {
 // getrandom().
 
 ssize_t GetRandom(void *p, size_t n, int flags) {
+#ifdef __EMSCRIPTEN__
+  int rc = HostRandom(p, n);
+  if (rc < 0) errno = EIO;
+  return rc;
+#endif
 #ifdef GRND_RANDOM
   _Static_assert(GRND_RANDOM == GRND_RANDOM_LINUX, "");
 #endif

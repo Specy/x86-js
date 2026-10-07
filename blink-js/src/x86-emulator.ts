@@ -7,7 +7,7 @@ import {
     type Instruction,
     type MonacoError,
     type PokeWrite,
-    type StackFrame,
+    type StackFrame
 } from './interface'
 import { locateDiagnosticSpan, type AssemblerId, type AssemblerMode } from './assemblers'
 import { BlinkRuntime, type BlinkRuntimeCallbacks, type BlinkRuntimeOptions } from './blink-runtime'
@@ -20,14 +20,17 @@ import {
     type X86EmulatorEventHandler,
     type X86EmulatorEventMap,
     type X86EmulatorEventName,
+    type X86ImplementedSyscall,
+    type X86Input,
     type X86RegisterName,
-    type X86Project,
+    type X86Project
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
 import { X86_FLAGS, deferToHost, maskForSize, maskRegisterValue } from './x86-emulator-utils'
 import { observeCallbackResult } from './callbacks'
 import { NativeHistory } from './native-history'
+import type { X86ProjectFileSystem } from './project-file-system'
 import {
     X86_SSE_REGISTERS,
     X86_X87_REGISTERS,
@@ -35,7 +38,7 @@ import {
     encodeFpuState,
     fpuStateBlocksEqual,
     readLogicalStBits,
-    type X86FpuState,
+    type X86FpuState
 } from './fpu-state'
 
 /** What {@link X86Emulator.run} does with the breakpoint the program counter is on. */
@@ -71,6 +74,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         stderr: new Set(),
         signal: new Set(),
         inputRequest: new Set(),
+        waitRequest: new Set()
     }
 
     private lastCompileResult: X86CompileResult | null = null
@@ -82,6 +86,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     private pokeOpen = false
     /** True while an instruction is running, so a Poke cannot open on top of one. */
     private executing = false
+    private executionGeneration = 0
     /**
      * Input resumed the program and nothing has driven it since. A run left to
      * the runtime's own loop goes on inside `provideInput()`, and may end there
@@ -93,7 +98,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         super({
             systemSize: RegisterSize.Double,
             registerNames: [...X86_REGISTER_NAMES],
-            endianness: 'little',
+            endianness: 'little'
         })
         this.runtime = runtime
         this.history = new NativeHistory(runtime, this.recordFpuMutations.bind(this))
@@ -105,14 +110,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             ...options,
             callbacks: {
                 ...options.callbacks,
-                stdout: (charCode) => {
-                    const result = options.callbacks?.stdout?.(charCode)
-                    emulator?.emit('stdout', charCode)
+                stdout: (bytes) => {
+                    const result = options.callbacks?.stdout?.(bytes)
+                    emulator?.emit('stdout', bytes)
                     return result
                 },
-                stderr: (charCode) => {
-                    const result = options.callbacks?.stderr?.(charCode)
-                    emulator?.emit('stderr', charCode)
+                stderr: (bytes) => {
+                    const result = options.callbacks?.stderr?.(bytes)
+                    emulator?.emit('stderr', bytes)
                     return result
                 },
                 signal: (signal, code) => {
@@ -125,12 +130,17 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                     emulator?.emit('stateChange', { state, oldState })
                     return result
                 },
+                waitRequest: (event) => {
+                    const result = options.callbacks?.waitRequest?.(event)
+                    emulator?.emit('waitRequest', event)
+                    return result
+                },
                 inputRequest: (event) => {
                     const result = options.callbacks?.inputRequest?.(event)
                     emulator?.emit('inputRequest', event)
                     return result
-                },
-            },
+                }
+            }
         })
         NativeHistory.assertSupported(runtime.module)
         emulator = new X86Emulator(runtime)
@@ -149,9 +159,27 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.runtime.stopReason
     }
 
+    /**
+     * The Linux system calls this Core implements, sorted by number, read from the dispatch table
+     * the wasm was compiled with. Any other number answers ENOSYS, as Linux does for a call it
+     * lacks. It needs no program and never changes, so a documentation generator can read it once.
+     */
+    getImplementedSyscalls(): X86ImplementedSyscall[] {
+        return this.runtime.getImplementedSyscalls()
+    }
+
+    /**
+     * The executable the last build linked, or the one `loadElf()` was given, as a copy; null
+     * before either. A program never finds it on the file system: it is written out only for the
+     * loader, at each start, and removed before the program's first instruction.
+     */
+    getExecutable(): Uint8Array | null {
+        return this.runtime.getExecutable()
+    }
+
     on<T extends X86EmulatorEventName>(
         eventName: T,
-        handler: X86EmulatorEventHandler<T>,
+        handler: X86EmulatorEventHandler<T>
     ): () => void {
         this.eventHandlers[eventName].add(handler)
         return () => this.eventHandlers[eventName].delete(handler)
@@ -201,12 +229,53 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.getStatus()
     }
 
-    provideInput(line: string): void {
-        this.runtime.provideInput(line)
-        this.resumedByInput = true
+    /**
+     * Gives the program's terminal input: bytes, a string as its UTF-8 bytes, or `END_OF_INPUT`.
+     * It queues behind what no read has taken yet, and a read takes from the queue as a read of a
+     * Linux terminal does: at most what it asked for and never past a line feed, with
+     * `END_OF_INPUT` ending one read with 0 bytes. A read waits for input, and `getStatus()` says
+     * `WaitingForInput`, only when the queue is empty.
+     *
+     * Given to a read that waits, the input finishes it, as one instruction of the history, and a
+     * run the runtime's own loop was driving goes on; given at any other time, it waits for the
+     * program's next read. Input given during a run is forgotten when the program ends or starts
+     * over; input given after it ended, or after a build, is for the next run.
+     */
+    provideInput(input: X86Input): void {
+        if (this.runtime.provideInput(input)) this.resumedByInput = true
     }
 
+    setEnvironment(environment: import('./types').X86Environment): void {
+        this.runtime.setEnvironment(environment)
+    }
+    getInstructionsExecuted(): bigint {
+        return this.runtime.getInstructionsExecuted()
+    }
+    getCurrentInstructionSerial(): string | null {
+        return this.runtime.getCurrentInstructionSerial()
+    }
+    /** Attach a FileSystemSession-compatible capability for the next run at `/project`. */
+    mountProjectFileSystem(capability: X86ProjectFileSystem | null): void {
+        if (this.executing || this.pokeOpen)
+            throw new Error('Cannot change the x86 Project FileSystem during execution or a Poke')
+        this.runtime.mountProjectFileSystem(capability)
+    }
+    getWaitRequest(): import('./types').X86WaitRequest | null {
+        return this.runtime.getWaitRequest()
+    }
+    resumeWait(): boolean {
+        const resumed = this.runtime.resumeWait()
+        if (resumed) this.resumedByInput = true
+        return resumed
+    }
+    cancelWait(): boolean {
+        const resumed = this.runtime.cancelWait()
+        if (resumed) this.resumedByInput = true
+        return resumed
+    }
     initialize(undoSize: number): void {
+        if (this.runtime.isWaiting())
+            throw new Error('Cannot initialize while an instruction is waiting')
         this.undoSize = Number.isFinite(undoSize) ? Math.max(0, Math.floor(undoSize)) : 0
         this.clearExecutionTrace()
         this.history.initialize(this.undoSize)
@@ -218,6 +287,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     dispose(): void {
+        ++this.executionGeneration
+        this.runtime.dispose()
         this.runtime.setStepRecording(false)
         this.clearExecutionTrace()
         this.history.initialize(0)
@@ -226,6 +297,18 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         this.eventHandlers.stderr.clear()
         this.eventHandlers.signal.clear()
         this.eventHandlers.inputRequest.clear()
+        this.eventHandlers.waitRequest.clear()
+    }
+
+    /** End the debug session before stopping its FileSystem capability; callbacks remain usable. */
+    clearExecution(): void {
+        if (this.pokeOpen) throw new Error('Cannot clear x86 execution during a Poke')
+        this.runtime.clearExecution()
+        ++this.executionGeneration
+        this.clearExecutionTrace()
+        this.lastCompileResult = null
+        this.lastSourceCode = ''
+        this.resumedByInput = false
     }
 
     stringifyError(error: unknown): string {
@@ -260,22 +343,28 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 ...(span.endColumn === undefined ? {} : { endColumn: span.endColumn }),
                 line: {
                     line,
-                    line_index: lineIndex,
+                    line_index: lineIndex
                 },
                 message: diagnostic.error,
                 formatted: diagnostic.error,
                 severity: diagnostic.severity,
-                ...(diagnostic.warningClass ? { code: diagnostic.warningClass } : {}),
+                ...(diagnostic.warningClass ? { code: diagnostic.warningClass } : {})
             }
         })
     }
 
     undo(): void {
+        if (this.runtime.isWaiting()) throw new Error('Cannot undo while an instruction is waiting')
         if (this.history.undo()) this.runtime.resumeAfterStateMutation()
     }
 
     canUndo(): boolean {
-        return this.history.canUndo()
+        return !this.runtime.isWaiting() && this.history.canUndo()
+    }
+
+    /** Preflight every native entry in one editor Undo group, including barriers below Pokes. */
+    canUndoSteps(count: number): boolean {
+        return !this.runtime.isWaiting() && this.history.canUndoSteps(count)
     }
 
     /**
@@ -298,7 +387,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const change = enabled ? 'turn undo on' : 'turn undo off'
         this.assertNoOpenPoke(change)
         if (this.executing) throw new Error(`Cannot ${change} while an instruction is executing`)
-        if (this.getStatus() === EmulatorStatus.WaitingForInput)
+        if (this.runtime.isWaiting())
             throw new Error(`Cannot ${change} while an instruction is waiting for input`)
 
         this.history.setUndoEnabled(enabled)
@@ -345,6 +434,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * poke, and undoing it would then revert the instruction too.
      */
     beginPoke(): void {
+        if (this.runtime.isWaiting())
+            throw new Error('Cannot begin a poke while an instruction is waiting')
         if (this.isPokeOpen()) {
             throw new Error('A poke is already open: end it before beginning another')
         }
@@ -399,7 +490,9 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     getStatus(): EmulatorStatus {
         if (this.runtime.state === BlinkState.NotReady) return EmulatorStatus.NotReady
-        if (this.runtime.state === BlinkState.ProgramReadlinePause) return EmulatorStatus.WaitingForInput
+        if (this.runtime.state === BlinkState.ProgramWaitPause) return EmulatorStatus.Waiting
+        if (this.runtime.state === BlinkState.ProgramReadlinePause)
+            return EmulatorStatus.WaitingForInput
         if (this.runtime.state === BlinkState.ProgramStopped) return EmulatorStatus.Terminated
         return EmulatorStatus.Running
     }
@@ -446,7 +539,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return X86_FLAGS.map((flag) => ({
             name: flag.name,
             value: (flags & BigInt(flag.mask)) > 0n ? 1 : 0,
-            prev: (previousFlags & BigInt(flag.mask)) > 0n ? 1 : 0,
+            prev: (previousFlags & BigInt(flag.mask)) > 0n ? 1 : 0
         }))
     }
 
@@ -464,7 +557,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             file: location?.path,
             size: instruction.size,
             bytes: this.runtime.readMemoryBytes(instruction.address, BigInt(instruction.size)),
-            code: instruction.code,
+            code: instruction.code
         }
     }
 
@@ -486,7 +579,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     getRegisterValuesRecord(): Record<X86RegisterName, bigint> {
         return Object.fromEntries(
-            X86_REGISTER_NAMES.map((register) => [register, this.getRegisterValue(register)]),
+            X86_REGISTER_NAMES.map((register) => [register, this.getRegisterValue(register)])
         ) as Record<X86RegisterName, bigint>
     }
 
@@ -494,10 +587,15 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return maskRegisterValue(this.runtime.getRegister(register), size)
     }
 
-    setRegisterValue(register: X86RegisterName, value: bigint, size: RegisterSize = RegisterSize.Double): void {
+    setRegisterValue(
+        register: X86RegisterName,
+        value: bigint,
+        size: RegisterSize = RegisterSize.Double
+    ): void {
         const current = this.runtime.getRegister(register)
         const masked = maskRegisterValue(value, size)
-        const preserved = size === RegisterSize.Double ? masked : (current & ~maskForSize(size)) | masked
+        const preserved =
+            size === RegisterSize.Double ? masked : (current & ~maskForSize(size)) | masked
         this.runtime.setRegister(register, preserved)
     }
 
@@ -549,7 +647,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     async run(
         limit?: number,
         breakpoints: X86Breakpoint[] = [],
-        options: X86RunOptions = {},
+        options: X86RunOptions = {}
     ): Promise<EmulatorStatus> {
         this.assertNoOpenPoke('run')
         this.validateRunLimit(limit)
@@ -565,6 +663,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     private assertNoOpenPoke(what: string): void {
+        if (this.runtime.state === BlinkState.ProgramWaitPause)
+            throw new Error(`Cannot ${what} while an instruction is waiting`)
         if (this.isPokeOpen()) throw new Error(`Cannot ${what} while a poke is open: end it first`)
     }
 
@@ -622,9 +722,10 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     private async runNativeSlices(
         limit: number | undefined,
         breakpoints: bigint[],
-        options: X86RunOptions,
+        options: X86RunOptions
     ): Promise<EmulatorStatus> {
         this.prepareOneInstructionRun()
+        const generation = this.executionGeneration
         const hasLimit = limit !== undefined && limit > 0
         let executed = 0
         let skipAtPc = options.skipBreakpointAtPc ?? true
@@ -632,12 +733,17 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             const budget = hasLimit ? Math.min(50000, limit - executed) : 50000
             executed += this.runtime.runSlice(budget, breakpoints, skipAtPc)
             skipAtPc = false
-            if ((this.runtime.state as BlinkState) !== BlinkState.ProgramPaused || this.stopReason?.kind !== 'limit') break
+            if (
+                (this.runtime.state as BlinkState) !== BlinkState.ProgramPaused ||
+                this.stopReason?.kind !== 'limit'
+            )
+                break
             if (hasLimit && executed >= limit) {
                 this.runtime.pauseForLimit(this.getPc(), BigInt(executed))
                 break
             }
             await deferToHost()
+            if (generation !== this.executionGeneration) break
             this.runtime.resumeAfterStateMutation()
         }
         // The wasm counts a breakpoint stop within its own slice, so a run longer than one
@@ -650,7 +756,10 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     private prepareOneInstructionRun(): void {
-        if (this.runtime.state === BlinkState.ProgramLoaded || this.runtime.state === BlinkState.ProgramStopped) {
+        if (
+            this.runtime.state === BlinkState.ProgramLoaded ||
+            this.runtime.state === BlinkState.ProgramStopped
+        ) {
             this.runtime.starti()
             return
         }
@@ -674,7 +783,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         fpuBefore: Uint8Array,
         fpuAfter: Uint8Array,
         mutations: ExecutionStep['mutations'],
-        writes?: PokeWrite[],
+        writes?: PokeWrite[]
     ): void {
         if (fpuStateBlocksEqual(fpuBefore, fpuAfter)) return
 
@@ -689,14 +798,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                     register: X86_SSE_REGISTERS[index]!,
                     old: stateBefore.xmm[index]!,
                     new: stateAfter.xmm[index]!,
-                    size: RegisterSize.Quad,
-                },
+                    size: RegisterSize.Quad
+                }
             })
             writes?.push({
                 type: 'register',
                 name: X86_SSE_REGISTERS[index]!,
                 old: stateBefore.xmm[index]!,
-                new: stateAfter.xmm[index]!,
+                new: stateAfter.xmm[index]!
             })
         }
         if (stateBefore.mxcsr !== stateAfter.mxcsr) {
@@ -706,14 +815,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                     register: 'mxcsr',
                     old: BigInt(stateBefore.mxcsr),
                     new: BigInt(stateAfter.mxcsr),
-                    size: RegisterSize.Long,
-                },
+                    size: RegisterSize.Long
+                }
             })
             writes?.push({
                 type: 'register',
                 name: 'mxcsr',
                 old: BigInt(stateBefore.mxcsr),
-                new: BigInt(stateAfter.mxcsr),
+                new: BigInt(stateAfter.mxcsr)
             })
         }
 
@@ -732,14 +841,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                     register: X86_X87_REGISTERS[index]!,
                     old: stBitsBefore[index]!,
                     new: stBitsAfter[index]!,
-                    size: RegisterSize.Double,
-                },
+                    size: RegisterSize.Double
+                }
             })
             writes?.push({
                 type: 'register',
                 name: X86_X87_REGISTERS[index]!,
                 old: stBitsBefore[index]!,
-                new: stBitsAfter[index]!,
+                new: stBitsAfter[index]!
             })
         }
 
@@ -751,19 +860,22 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                     register: word,
                     old: BigInt(stateBefore[word]),
                     new: BigInt(stateAfter[word]),
-                    size: RegisterSize.Word,
-                },
+                    size: RegisterSize.Word
+                }
             })
             writes?.push({
                 type: 'register',
                 name: word,
                 old: BigInt(stateBefore[word]),
-                new: BigInt(stateAfter[word]),
+                new: BigInt(stateAfter[word])
             })
         }
     }
 
-    private emit<T extends X86EmulatorEventName>(eventName: T, event: X86EmulatorEventMap[T]): void {
+    private emit<T extends X86EmulatorEventName>(
+        eventName: T,
+        event: X86EmulatorEventMap[T]
+    ): void {
         for (const handler of this.eventHandlers[eventName]) observeCallbackResult(handler(event))
     }
 }

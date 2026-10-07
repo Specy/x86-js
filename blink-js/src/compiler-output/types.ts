@@ -42,6 +42,10 @@ export type TranslationDiagnosticCode =
     | 'unsupported-operand'
     | 'unsupported-symbol'
     | 'unsupported-instruction'
+    /**
+     * Inline assembly outside what the profile translates: every error on a line between `#APP`
+     * and `#NO_APP`, whatever its kind, with a message that quotes the line.
+     */
     | 'inline-assembly'
     | 'ambiguous-register-name'
     | 'unverified-compiler'

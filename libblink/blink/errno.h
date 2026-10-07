@@ -26,5 +26,7 @@ long eexist(void);
 long eloop(void);
 long exdev(void);
 long enametoolong(void);
+long espipe(void);
+long enotty(void);
 
 #endif /* BLINK_ERRNO_H_ */

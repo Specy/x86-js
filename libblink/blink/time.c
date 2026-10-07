@@ -17,6 +17,7 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "blink/time.h"
+#include "blink/environment.h"
 
 #include <time.h>
 
@@ -48,7 +49,8 @@ void OpPause(P) {
 void OpRdtsc(P) {
   u64 c;
   if (m->traprdtsc) {
-    ThrowSegmentationFault(m, 0);
+    // a #GP, as PR_TSC_SIGSEGV makes it on linux: SIGSEGV with SI_KERNEL
+    ThrowProtectionFault(m);
   }
 #if defined(__GNUC__) && defined(__aarch64__)
   asm volatile("mrs %0, cntvct_el0" : "=r"(c));
@@ -59,7 +61,7 @@ void OpRdtsc(P) {
   c = (u64)dx << 32 | ax;
 #else
   struct timespec ts;
-  unassert(!clock_gettime(CLOCK_MONOTONIC, &ts));
+  unassert(!HostNow(CLOCK_MONOTONIC, &ts));
   c = ts.tv_sec;
   c *= 1000000000;
   c += ts.tv_nsec;

@@ -42,12 +42,18 @@ static void OpRand(P, u64 x) {
 }
 
 void OpRdrand(P) {
+#ifdef __EMSCRIPTEN__
+  u64 x;
+  unassert(GetRandom(&x, 8, 0) == 8);
+  OpRand(A, x);
+#else
   LOCK(&g_rdrand.lock);
   if (!(g_rdrand.count++ % RESEED_INTERVAL)) {
     unassert(GetRandom(&g_rdrand.state, 8, 0) == 8);
   }
   OpRand(A, Vigna(&g_rdrand.state));
   UNLOCK(&g_rdrand.lock);
+#endif
 }
 
 void OpRdseed(P) {

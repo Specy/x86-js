@@ -1,8 +1,8 @@
 // The corpus oracle (milestone 1): every stored `gcc-intel-v1` case reaches its intended outcome.
 // A runnable case, built beside the start unit and its NASM Files, returns its value in Blink and
-// its low byte natively; a link failure names the symbols it should, on the input lines the GNU as
-// reference's link named; a negative case reports its code on the offending lines, with no output;
-// and nothing NASM assembles warns.
+// its low byte natively, writing its intended output in both; a link failure names the symbols it
+// should, on the input lines the GNU as reference's link named; a negative case reports its code on
+// the offending lines, with no output; and nothing NASM assembles warns.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createX86Emulator, type X86Emulator } from '../../src/x86-emulator'
 import {
@@ -13,7 +13,7 @@ import {
     loadManifest,
     NATIVE,
     removeNativeScratch,
-    runInBlink,
+    runInBlinkWithOutput,
     runNatively,
     translate,
     translatedProject,
@@ -37,7 +37,8 @@ const byKind = <K extends CorpusCase['outcome']['kind']>(kind: K) =>
  * Every such line must carry the program's code, and no other line may.
  */
 const OFFENDING_LINES: Readonly<Record<string, RegExp>> = {
-    inlineasm: /^#APP$/,
+    inlineasmatt: /^\s*(?:movl|addl)\s/,
+    inlineasmrept: /^\s*\.(?:rept|endr)\b/,
     tls: /^\s*\.section\s+\.t(?:bss|data)\b/,
     ifunc: /^\s*\.type\s+\S+,\s*@gnu_indirect_function$/,
     ctorpriority: /^\s*\.section\s+\.init_array\.\d+/,
@@ -80,9 +81,9 @@ describe('the stored corpus', () => {
         expect(corpus.filter((entry) => entry.response.code !== 0).map((entry) => entry.case)).toEqual([])
     })
 
-    it('has 146 runnable cases, 15 link failures and 26 translation errors', () => {
+    it('has 171 runnable cases, 15 link failures and 25 translation errors', () => {
         expect([byKind('exit').length, byKind('link-failure').length, byKind('translation-error').length]).toEqual([
-            146, 15, 26,
+            171, 15, 25,
         ])
         expect(Object.keys(OFFENDING_LINES).sort()).toEqual(
             [...new Set(byKind('translation-error').map(([, entry]) => entry.program))].sort(),
@@ -128,19 +129,21 @@ async function buildCase(entry: CorpusCase): Promise<Built> {
 }
 
 describe.each(byKind('exit'))('%s', (_, entry) => {
-    const { value } = entry.outcome
+    const { value, output = '' } = entry.outcome
+    const writing = output ? `, writing ${JSON.stringify(output)},` : ''
 
-    it(`returns ${value} in Blink`, async () => {
+    // `main`'s value, as the status a parent sees: its low eight bits, in Blink as on Linux.
+    it(`returns ${value & 255}${writing} in Blink`, async () => {
         const { program } = await built(entry)
         if (!NATIVE) builds.delete(entry.case)
         emulator.loadElf(program)
-        expect(await runInBlink(emulator)).toBe(value)
+        expect(await runInBlinkWithOutput(emulator)).toEqual({ value: value & 255, output })
     })
 
-    it.skipIf(!NATIVE)(`returns ${value & 255} natively`, async () => {
+    it.skipIf(!NATIVE)(`returns ${value & 255}${writing} natively`, async () => {
         const { program } = await built(entry)
         builds.delete(entry.case)
-        expect(runNatively(program, entry.case)).toBe(value & 255)
+        expect(runNatively(program, entry.case)).toEqual({ status: value & 255, output })
     })
 })
 

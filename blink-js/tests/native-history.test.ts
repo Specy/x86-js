@@ -84,10 +84,14 @@ cell: dq 0
 
     it("counts a breakpoint stop after several slices as the whole run's instructions", async () => {
         // A loop of 60,000 two-instruction passes, then the breakpoint: three slices of 50,000.
-        const source = PREFIX + 'mov ecx, 60000\nnext:\ndec ecx\njnz next\nnop\nmov eax, 60\nxor edi, edi\nsyscall\n'
+        const source =
+            PREFIX +
+            'mov ecx, 60000\nnext:\ndec ecx\njnz next\nnop\nmov eax, 60\nxor edi, edi\nsyscall\n'
         const emulator = await build(source)
         try {
-            expect(await emulator.run(undefined, [source.split('\n').indexOf('nop')])).toBe(EmulatorStatus.Running)
+            expect(await emulator.run(undefined, [source.split('\n').indexOf('nop')])).toBe(
+                EmulatorStatus.Running
+            )
             expect(emulator.stopReason?.kind).toBe('breakpoint')
             expect(emulator.stopReason?.executedInstructions).toBe(120001n)
         } finally {
@@ -182,16 +186,13 @@ cell: dq 0
         }
     })
 
-    it('finishes a paused read as one undoable instruction and checks the next breakpoint', async () => {
+    it('finishes a paused read as one irreversible row and checks the next breakpoint', async () => {
         const source =
             PREFIX +
             'xor eax, eax\nxor edi, edi\nlea rsi, [rel buffer]\nmov edx, 8\nsyscall\ninc rbx\njmp _start\nsection .data\nbuffer: dq 0x0102030405060708\n'
         const emulator = await build(source)
         try {
             expect(await emulator.run(4)).toBe(EmulatorStatus.Running)
-            // Save the state before SYSCALL starts: the paused read already
-            // contains its architectural RCX/R11 clobbers, which undo restores.
-            const before = emulator.runtime.getRegisterSnapshot()
             expect(await emulator.run(20, [source.split('\n').indexOf('inc rbx')])).toBe(
                 EmulatorStatus.WaitingForInput
             )
@@ -207,9 +208,23 @@ cell: dq 0
             })
             expect(emulator.stopReason?.kind).toBe('breakpoint')
             expect(emulator.getRegisterValue('rbx')).toBe(0n)
+            const after = emulator.runtime.getRegisterSnapshot()
+            const row = emulator.getUndoHistory(1)[0]
+            expect(row.undoable).toBe(false)
+            expect(row.mutations).toContainEqual({
+                type: 'WriteMemoryBytes',
+                value: { address, old: old.slice(0, 3), new: [97, 98, 10] }
+            })
+            expect(() => emulator.undo()).toThrow('cannot be undone')
+            expect(emulator.runtime.getRegisterSnapshot()).toEqual(after)
+            expect([...emulator.readMemoryBytes(address, 3n)]).toEqual([97, 98, 10])
+            await emulator.step()
+            expect(emulator.getRegisterValue('rbx')).toBe(1n)
+            expect(emulator.canUndoSteps(1)).toBe(true)
+            expect(emulator.canUndoSteps(2)).toBe(false)
             emulator.undo()
-            expect(emulator.runtime.getRegisterSnapshot()).toEqual(before)
-            expect([...emulator.readMemoryBytes(address, 8n)]).toEqual(old)
+            expect(emulator.getRegisterValue('rbx')).toBe(0n)
+            expect(emulator.canUndo()).toBe(false)
         } finally {
             emulator.dispose()
         }
@@ -315,7 +330,12 @@ cell: dq 0
             expect(mxcsrWrites(emulator.getUndoHistory(1)[0])).toEqual([
                 {
                     type: 'WriteRegister',
-                    value: { register: 'mxcsr', old: BigInt(before), new: 0x9fc0n, size: RegisterSize.Long }
+                    value: {
+                        register: 'mxcsr',
+                        old: BigInt(before),
+                        new: 0x9fc0n,
+                        size: RegisterSize.Long
+                    }
                 }
             ])
             emulator.undo()
@@ -327,7 +347,7 @@ cell: dq 0
 
     it.each([
         ['no history at all', undefined, 'records no undo history'],
-        ['history of another version', 2, 'records undo history version 2'],
+        ['history of another version', 2, 'records undo history version 2']
     ])('refuses a wasm with %s when the emulator is created', async (_, version, message) => {
         const create = BlinkRuntime.create.bind(BlinkRuntime)
         vi.spyOn(BlinkRuntime, 'create').mockImplementationOnce(async (options) => {

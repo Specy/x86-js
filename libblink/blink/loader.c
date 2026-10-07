@@ -810,6 +810,10 @@ error: unsupported executable; we need:\n\
   unassert(CheckMemoryInvariants(m->system));
   elf->execfn = strdup(elf->execfn);
   elf->prog = strdup(elf->prog);
+  // like exec(), which names the task after the file it runs
+  snprintf(m->system->comm, sizeof(m->system->comm), "%s",
+           strrchr(elf->execfn, '/') ? strrchr(elf->execfn, '/') + 1
+                                     : elf->execfn);
   unassert(!VfsMunmap(map, mapsize));
   unassert(!VfsClose(fd));
   m->system->loaded = true;

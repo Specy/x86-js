@@ -44,7 +44,7 @@ const TO_EXIT = 20
 
 async function build(source: string, undoSize: number, output?: number[]): Promise<X86Emulator> {
     const emulator = await createX86Emulator(
-        output ? { callbacks: { stdout: (charCode) => void output.push(charCode) } } : {},
+        output ? { callbacks: { stdout: (chunk) => void output.push(...chunk) } } : {},
     )
     const result = await emulator.compile(source)
     expect(result.ok, result.report).toBe(true)

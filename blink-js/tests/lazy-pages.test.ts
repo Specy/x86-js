@@ -93,23 +93,17 @@ function lineOf(marker: string): number {
 
 type Layout = { table: bigint; values: bigint; untouched: bigint; scratch: bigint; scratchEnd: bigint; rsp: bigint }
 
+/** An emulator with the program built, and what the program writes to stdout from then on. */
 async function started(): Promise<{ emulator: X86Emulator; output: number[] }> {
     const output: number[] = []
     const emulator = await createX86Emulator({
-        callbacks: { stdout: (charCode) => void output.push(charCode) },
+        callbacks: { stdout: (chunk) => void output.push(...chunk) },
     })
     const result = await emulator.compile(PROGRAM.join('\n'))
     if (!result.ok) throw new Error(`the program did not assemble:\n${result.report}`)
+    // Anything the toolchain wrote is not the program's.
+    output.length = 0
     return { emulator, output }
-}
-
-/** What the program itself wrote: the runtime echoes `$ /program` on stdout before it starts. */
-function programOutput(output: number[]): number[] {
-    const echo = Array.from('$ /program\n', (character) => character.charCodeAt(0))
-    for (let start = output.length - echo.length; start >= 0; start -= 1) {
-        if (echo.every((code, index) => output[start + index] === code)) return output.slice(start + echo.length)
-    }
-    throw new Error('the program never started')
 }
 
 async function runTo(emulator: X86Emulator, marker: string): Promise<void> {
@@ -235,9 +229,9 @@ describe('memory the program has not touched yet', () => {
         expectRegions(watched.emulator, layout)
         await watched.emulator.run()
 
-        expect(programOutput(plain.output)).toEqual(EXPECTED_OUTPUT)
+        expect(plain.output).toEqual(EXPECTED_OUTPUT)
         expect(plain.emulator.stopReason?.exitCode).toBe(EXPECTED_EXIT)
-        expect(programOutput(watched.output)).toEqual(programOutput(plain.output))
+        expect(watched.output).toEqual(plain.output)
         expect(watched.emulator.stopReason?.exitCode).toBe(plain.emulator.stopReason?.exitCode)
         plain.emulator.dispose()
         watched.emulator.dispose()
@@ -271,7 +265,7 @@ describe('with native history', () => {
 
         // Run on from the undone state: the program writes and reads as before.
         await emulator.run()
-        expect(programOutput(output)).toEqual(EXPECTED_OUTPUT)
+        expect(output).toEqual(EXPECTED_OUTPUT)
         expect(emulator.stopReason?.exitCode).toBe(EXPECTED_EXIT)
         emulator.dispose()
     })
@@ -298,7 +292,7 @@ describe('with native history', () => {
         emulator.writeMemoryBytes(layout.untouched + 12000n, Uint8Array.of(0x44))
         emulator.endPoke()
         await emulator.run()
-        expect(programOutput(output)).toEqual([0x41, 0x42, 0x44, 0x33, 0x77, 0x5a, 0x00])
+        expect(output).toEqual([0x41, 0x42, 0x44, 0x33, 0x77, 0x5a, 0x00])
         expect(emulator.stopReason?.exitCode).toBe((0x41 + 0x44 + 0x77) & 0xff)
         emulator.dispose()
     })

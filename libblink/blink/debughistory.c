@@ -49,7 +49,7 @@ static u32 budget = HISTORY_BUDGET;
 static u64 held; /* bytes allocated to the packets of the others */
 static u64 serial;
 static struct Snapshot before;
-static bool pending, poke;
+static bool pending, poke, pending_irreversible;
 static struct Frame *stack;
 static struct PokeByte *poke_bytes;
 static u32 poke_count, poke_allocated;
@@ -74,7 +74,24 @@ static void Snapshot(struct Snapshot *out) {
 }
 void DebugHistoryCancel(void) {
   pending = poke = false;
+  pending_irreversible = false;
   poke_count = 0;
+}
+/* B5 can replace this boundary with a journal for signal process state.
+ * Until then the signal frame, mask and pending queue cannot be undone. */
+void DebugHistoryMarkIrreversible(void) {
+  if (pending) {
+    pending_irreversible = true;
+  } else if (count && capacity) {
+    struct Entry *e = &entries[(start + count - 1) % capacity];
+    if (e->bytes) Write32(e->bytes + 20, 0);
+  }
+}
+/* The JavaScript filesystem backend completes a capability callback while the guest syscall is
+ * still active. It marks the same packet as native descriptor and process-state effects do. */
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_history_mark_irreversible(void) {
+  DebugHistoryMarkIrreversible();
 }
 bool DebugHistoryPending(void) { return pending; }
 /* Leaves a slot as one no entry occupies: no packet, no frames. A hollow
@@ -122,7 +139,7 @@ u32 blinkenlib_history_count(void) { return count; }
 /* How many entries the history has recorded since the module loaded: one per
  * instruction and one per Poke that changed something, including those since
  * undone, hollowed or pushed out of a full ring. Nothing is recorded while the
- * capacity is 0, so it doesn't move then. It is the last serial handed out. */
+ * capacity is 0, so it doesn't move then. Instruction identity is separate. */
 EMSCRIPTEN_KEEPALIVE
 u64 blinkenlib_history_recorded(void) { return serial; }
 static struct Entry *EntryAt(u32 offset) {
@@ -138,6 +155,7 @@ void DebugHistoryBegin(u32 flow, u32 size) {
   Snapshot(&before);
   before.flow = flow;
   before.size = size;
+  pending_irreversible = false;
   pending = true;
 }
 /* Read a guest range page by page, avoiding a page-table walk per byte. */
@@ -231,7 +249,7 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
   }
   bool fpu_changed = memcmp(before.fpu, after.fpu, sizeof(before.fpu)) != 0;
   if (fpu_changed) bytes += sizeof(before.fpu) * 2;
-  bool reversible = !truncated;
+  bool reversible = !truncated && !pending_irreversible;
   for (u32 i = 0; i < write_count; ++i) {
     struct MachineWriteRecord *w = &writes[i];
     bytes += 24 + w->oldsize + (w->truncated ? 0 : w->size);
@@ -244,7 +262,8 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
   memset(p, 0, 88);
   Write32(p, 1);
   Write32(p + 4, bytes);
-  Write64(p + 8, ++serial);
+  ++serial;
+  Write64(p + 8, is_poke ? blinkenlib_next_identity() : blinkenlib_active_instruction());
   Write32(p + 16, is_poke);
   Write32(p + 20, reversible);
   Write64(p + 24, before.pc);
@@ -313,6 +332,7 @@ void DebugHistoryFinish(bool exited) {
   Finish(false, m->writeold, m->writeoldcount, m->writeoldbytes,
          m->writeoldtruncated, exited);
   pending = false;
+  pending_irreversible = false;
 }
 EMSCRIPTEN_KEEPALIVE
 bool blinkenlib_history_can_undo(void) {

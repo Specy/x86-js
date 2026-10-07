@@ -45,7 +45,7 @@ function program(body: string[], sections: { data?: string[]; bss?: string[] } =
         'section .text',
         '_start:',
         ...body,
-        ...EXIT,
+        ...EXIT
     ]
 }
 
@@ -92,7 +92,7 @@ function qwords(values: bigint[]): number[] {
 function memoryMutations(emulator: X86Emulator) {
     const mutations = emulator.getUndoHistory(1)[0]?.mutations ?? []
     return mutations.flatMap((mutation) =>
-        mutation.type === 'WriteMemoryBytes' || mutation.type === 'Other' ? [mutation] : [],
+        mutation.type === 'WriteMemoryBytes' || mutation.type === 'Other' ? [mutation] : []
     )
 }
 
@@ -102,14 +102,18 @@ function memoryMutations(emulator: X86Emulator) {
  * record: undo restores every byte and register, and stepping again leaves
  * exactly what the first step left. Returns those bytes.
  */
-async function expectUndoableWrite(emulator: X86Emulator, address: bigint, before: number[]): Promise<number[]> {
+async function expectUndoableWrite(
+    emulator: X86Emulator,
+    address: bigint,
+    before: number[]
+): Promise<number[]> {
     const registers = emulator.runtime.getRegisterSnapshot()
     await emulator.step()
     expect(emulator.canUndo()).toBe(true)
     const after = read(emulator, address, before.length)
     const registersAfter = emulator.runtime.getRegisterSnapshot()
     expect(memoryMutations(emulator)).toEqual([
-        { type: 'WriteMemoryBytes', value: { address, old: before, new: after } },
+        { type: 'WriteMemoryBytes', value: { address, old: before, new: after } }
     ])
 
     emulator.undo()
@@ -129,9 +133,9 @@ describe('the first write into a page the program has not touched', () => {
                 '  lea rbx, [rel area + 4096]',
                 '  and rbx, -4096 ; a page wholly inside area',
                 '  mov rax, 0x1122334455667788',
-                '  mov [rbx + 8], rax ; <-- step',
+                '  mov [rbx + 8], rax ; <-- step'
             ],
-            { bss: ['area: resb 3 * 4096'] },
+            { bss: ['area: resb 3 * 4096'] }
         )
         const emulator = await start(lines)
         try {
@@ -152,15 +156,17 @@ describe('the first write into a page the program has not touched', () => {
             [
                 '  lea rbx, [rel values + 2 * 4096]',
                 '  and rbx, -4096',
-                '  mov qword [rbx + 16], -1 ; <-- step',
+                '  mov qword [rbx + 16], -1 ; <-- step'
             ],
-            { data: ['values: times 4 * 4096 db 0x42'] },
+            { data: ['values: times 4 * 4096 db 0x42'] }
         )
         const emulator = await start(lines)
         try {
             await stepToMarked(emulator, lines)
             const page = emulator.getRegisterValue('rbx')
-            expect(await expectUndoableWrite(emulator, page + 16n, filled(8, 0x42))).toEqual(filled(8, 0xff))
+            expect(await expectUndoableWrite(emulator, page + 16n, filled(8, 0x42))).toEqual(
+                filled(8, 0xff)
+            )
             emulator.undo()
             expect(read(emulator, page, PAGE)).toEqual(filled(PAGE, 0x42))
         } finally {
@@ -170,46 +176,53 @@ describe('the first write into a page the program has not touched', () => {
 
     it.each([
         ['rep stosb', ['  mov al, 0x5a', '  rep stosb ; <-- step'], filled(100, 0x5a)],
-        ['rep movsb', ['  lea rsi, [rel source]', '  rep movsb ; <-- step'], Array.from({ length: 100 }, (_, i) => i)],
-    ])('undoes %s across a page boundary into two untouched pages', async (_, instruction, expected) => {
-        const lines = program(
-            [
-                '  lea rdi, [rel area + 4096]',
-                '  and rdi, -4096',
-                '  sub rdi, 50 ; 50 bytes before a page boundary, 50 after',
-                '  mov rbx, rdi',
-                '  mov ecx, 100',
-                ...instruction,
-            ],
-            {
-                data: [`source: db ${Array.from({ length: 100 }, (_, i) => i).join(', ')}`],
-                bss: ['area: resb 3 * 4096'],
-            },
-        )
-        const emulator = await start(lines)
-        try {
-            await stepToMarked(emulator, lines)
-            const first = emulator.getRegisterValue('rbx')
-            expect(await expectUndoableWrite(emulator, first, filled(100, 0))).toEqual(expected)
-        } finally {
-            emulator.dispose()
+        [
+            'rep movsb',
+            ['  lea rsi, [rel source]', '  rep movsb ; <-- step'],
+            Array.from({ length: 100 }, (_, i) => i)
+        ]
+    ])(
+        'undoes %s across a page boundary into two untouched pages',
+        async (_, instruction, expected) => {
+            const lines = program(
+                [
+                    '  lea rdi, [rel area + 4096]',
+                    '  and rdi, -4096',
+                    '  sub rdi, 50 ; 50 bytes before a page boundary, 50 after',
+                    '  mov rbx, rdi',
+                    '  mov ecx, 100',
+                    ...instruction
+                ],
+                {
+                    data: [`source: db ${Array.from({ length: 100 }, (_, i) => i).join(', ')}`],
+                    bss: ['area: resb 3 * 4096']
+                }
+            )
+            const emulator = await start(lines)
+            try {
+                await stepToMarked(emulator, lines)
+                const first = emulator.getRegisterValue('rbx')
+                expect(await expectUndoableWrite(emulator, first, filled(100, 0))).toEqual(expected)
+            } finally {
+                emulator.dispose()
+            }
         }
-    })
+    )
 
     it('undoes a push into a page the stack has just grown into', async () => {
-        const lines = program(
-            [
-                '  sub rsp, 0x20000',
-                '  and rsp, -4096 ; the push lands in the page below',
-                '  mov rax, 0x0123456789abcdef',
-                '  push rax ; <-- step',
-            ],
-        )
+        const lines = program([
+            '  sub rsp, 0x20000',
+            '  and rsp, -4096 ; the push lands in the page below',
+            '  mov rax, 0x0123456789abcdef',
+            '  push rax ; <-- step'
+        ])
         const emulator = await start(lines)
         try {
             await stepToMarked(emulator, lines)
             const slot = emulator.getSp() - 8n
-            expect(await expectUndoableWrite(emulator, slot, filled(8, 0))).toEqual(qwords([0x0123456789abcdefn]))
+            expect(await expectUndoableWrite(emulator, slot, filled(8, 0))).toEqual(
+                qwords([0x0123456789abcdefn])
+            )
         } finally {
             emulator.dispose()
         }
@@ -221,7 +234,9 @@ describe('the first write into a page the program has not touched', () => {
         try {
             await stepToMarked(emulator, lines)
             const slot = emulator.getSp() - 0x40000n
-            expect(await expectUndoableWrite(emulator, slot, filled(8, 0))).toEqual(qwords([-2n & 0xffffffffffffffffn]))
+            expect(await expectUndoableWrite(emulator, slot, filled(8, 0))).toEqual(
+                qwords([-2n & 0xffffffffffffffffn])
+            )
         } finally {
             emulator.dispose()
         }
@@ -229,8 +244,13 @@ describe('the first write into a page the program has not touched', () => {
 
     it('undoes a system call that writes a structure into an untouched page', async () => {
         const lines = program(
-            ['  mov eax, 228 ; clock_gettime', '  mov edi, 1 ; CLOCK_MONOTONIC', '  lea rsi, [rel time]', '  syscall ; <-- step'],
-            { bss: ['time: resq 2'] },
+            [
+                '  mov eax, 228 ; clock_gettime',
+                '  mov edi, 1 ; CLOCK_MONOTONIC',
+                '  lea rsi, [rel time]',
+                '  syscall ; <-- step'
+            ],
+            { bss: ['time: resq 2'] }
         )
         const emulator = await start(lines)
         try {
@@ -242,7 +262,10 @@ describe('the first write into a page the program has not touched', () => {
             const written = read(emulator, time, 16)
             expect(written).not.toEqual(filled(16, 0))
             expect(memoryMutations(emulator)).toEqual([
-                { type: 'WriteMemoryBytes', value: { address: time, old: filled(16, 0), new: written } },
+                {
+                    type: 'WriteMemoryBytes',
+                    value: { address: time, old: filled(16, 0), new: written }
+                }
             ])
             emulator.undo()
             expect(read(emulator, time, 16)).toEqual(filled(16, 0))
@@ -252,10 +275,16 @@ describe('the first write into a page the program has not touched', () => {
         }
     })
 
-    it('undoes a read into an untouched .bss buffer as one instruction', async () => {
+    it('captures a read into untouched .bss as one irreversible instruction', async () => {
         const lines = program(
-            ['  xor eax, eax', '  xor edi, edi', '  lea rsi, [rel line]', '  mov edx, 16', '  syscall ; <-- step'],
-            { bss: ['line: resb 3 * 4096'] },
+            [
+                '  xor eax, eax',
+                '  xor edi, edi',
+                '  lea rsi, [rel line]',
+                '  mov edx, 16',
+                '  syscall ; <-- step'
+            ],
+            { bss: ['line: resb 3 * 4096'] }
         )
         const emulator = await start(lines)
         try {
@@ -268,16 +297,25 @@ describe('the first write into a page the program has not touched', () => {
             emulator.provideInput('hello\n')
             expect(emulator.getRegisterValue('rax')).toBe(6n)
             expect(emulator.getUndoHistory(100)).toHaveLength(depth + 1)
-            expect(emulator.canUndo()).toBe(true)
+            expect(emulator.canUndo()).toBe(false)
             expect(memoryMutations(emulator)).toEqual([
                 {
                     type: 'WriteMemoryBytes',
-                    value: { address: buffer, old: filled(6, 0), new: Array.from('hello\n', (c) => c.charCodeAt(0)) },
-                },
+                    value: {
+                        address: buffer,
+                        old: filled(6, 0),
+                        new: Array.from('hello\n', (c) => c.charCodeAt(0))
+                    }
+                }
             ])
-            emulator.undo()
-            expect(read(emulator, buffer, 16)).toEqual(filled(16, 0))
-            expect(emulator.runtime.getRegisterSnapshot()).toEqual(registers)
+            const after = emulator.runtime.getRegisterSnapshot()
+            expect(after).not.toEqual(registers)
+            expect(() => emulator.undo()).toThrow('cannot be undone')
+            expect(read(emulator, buffer, 16)).toEqual([
+                ...Array.from('hello\n', (c) => c.charCodeAt(0)),
+                ...filled(10, 0)
+            ])
+            expect(emulator.runtime.getRegisterSnapshot()).toEqual(after)
         } finally {
             emulator.dispose()
         }
@@ -288,15 +326,20 @@ describe('string instructions over more than sixteen elements', () => {
     /** 1000 distinct qwords in .data, and 1000 more after them. */
     const DATA = [
         `values: dq ${Array.from({ length: 1000 }, (_, i) => `0x${(0x1000 + i).toString(16)}`).join(', ')}`,
-        'more: times 1000 dq 7',
+        'more: times 1000 dq 7'
     ]
     const original = (count: number, offset = 0) =>
         qwords(Array.from({ length: count }, (_, i) => BigInt(0x1000 + offset + i)))
 
     it.each([17, 50, 1000])('undoes rep stosq over %i qwords of .data', async (count) => {
         const lines = program(
-            ['  lea rdi, [rel values]', `  mov ecx, ${count}`, '  mov rax, -1', '  rep stosq ; <-- step'],
-            { data: DATA },
+            [
+                '  lea rdi, [rel values]',
+                `  mov ecx, ${count}`,
+                '  mov rax, -1',
+                '  rep stosq ; <-- step'
+            ],
+            { data: DATA }
         )
         const emulator = await start(lines)
         try {
@@ -304,7 +347,9 @@ describe('string instructions over more than sixteen elements', () => {
             const values = emulator.getRegisterValue('rdi')
             // .data is read first, which is what a debugger showing it does.
             expect(read(emulator, values, count * 8)).toEqual(original(count))
-            expect(await expectUndoableWrite(emulator, values, original(count))).toEqual(filled(count * 8, 0xff))
+            expect(await expectUndoableWrite(emulator, values, original(count))).toEqual(
+                filled(count * 8, 0xff)
+            )
             expect(emulator.getRegisterValue('rcx')).toBe(0n)
             expect(emulator.getRegisterValue('rdi')).toBe(values + BigInt(count * 8))
         } finally {
@@ -314,8 +359,13 @@ describe('string instructions over more than sixteen elements', () => {
 
     it.each([17, 50, 1000])('undoes rep stosq over %i qwords of untouched .bss', async (count) => {
         const lines = program(
-            ['  lea rdi, [rel area]', `  mov ecx, ${count}`, '  mov rax, 0x5555aaaa5555aaaa', '  rep stosq ; <-- step'],
-            { bss: ['area: resq 1000'] },
+            [
+                '  lea rdi, [rel area]',
+                `  mov ecx, ${count}`,
+                '  mov rax, 0x5555aaaa5555aaaa',
+                '  rep stosq ; <-- step'
+            ],
+            { bss: ['area: resq 1000'] }
         )
         const emulator = await start(lines)
         try {
@@ -330,14 +380,21 @@ describe('string instructions over more than sixteen elements', () => {
 
     it('undoes rep movsq over 1000 qwords from .data into untouched .bss', async () => {
         const lines = program(
-            ['  lea rsi, [rel values]', '  lea rdi, [rel area]', '  mov ecx, 1000', '  rep movsq ; <-- step'],
-            { data: DATA, bss: ['area: resq 1000'] },
+            [
+                '  lea rsi, [rel values]',
+                '  lea rdi, [rel area]',
+                '  mov ecx, 1000',
+                '  rep movsq ; <-- step'
+            ],
+            { data: DATA, bss: ['area: resq 1000'] }
         )
         const emulator = await start(lines)
         try {
             await stepToMarked(emulator, lines)
             const area = emulator.getRegisterValue('rdi')
-            expect(await expectUndoableWrite(emulator, area, filled(8000, 0))).toEqual(original(1000))
+            expect(await expectUndoableWrite(emulator, area, filled(8000, 0))).toEqual(
+                original(1000)
+            )
         } finally {
             emulator.dispose()
         }
@@ -345,18 +402,25 @@ describe('string instructions over more than sixteen elements', () => {
 
     it.each([
         ['stosw', 2],
-        ['stosd', 4],
+        ['stosd', 4]
     ])('undoes rep %s over 300 elements', async (instruction, width) => {
         const lines = program(
-            ['  lea rdi, [rel values]', '  mov ecx, 300', '  mov rax, -1', `  rep ${instruction} ; <-- step`],
-            { data: DATA },
+            [
+                '  lea rdi, [rel values]',
+                '  mov ecx, 300',
+                '  mov rax, -1',
+                `  rep ${instruction} ; <-- step`
+            ],
+            { data: DATA }
         )
         const emulator = await start(lines)
         try {
             await stepToMarked(emulator, lines)
             const values = emulator.getRegisterValue('rdi')
             const before = read(emulator, values, 300 * width)
-            expect(await expectUndoableWrite(emulator, values, before)).toEqual(filled(300 * width, 0xff))
+            expect(await expectUndoableWrite(emulator, values, before)).toEqual(
+                filled(300 * width, 0xff)
+            )
         } finally {
             emulator.dispose()
         }
@@ -364,8 +428,13 @@ describe('string instructions over more than sixteen elements', () => {
 
     it('undoes rep movsq copying upward over its own source, as an overlapping copy smears', async () => {
         const lines = program(
-            ['  lea rsi, [rel values]', '  lea rdi, [rel values + 8]', '  mov ecx, 100', '  rep movsq ; <-- step'],
-            { data: DATA },
+            [
+                '  lea rsi, [rel values]',
+                '  lea rdi, [rel values + 8]',
+                '  mov ecx, 100',
+                '  rep movsq ; <-- step'
+            ],
+            { data: DATA }
         )
         const emulator = await start(lines)
         try {
@@ -374,7 +443,7 @@ describe('string instructions over more than sixteen elements', () => {
             const before = read(emulator, destination, 800)
             // Each element copies the one it wrote last: the first value, a hundred times.
             expect(await expectUndoableWrite(emulator, destination, before)).toEqual(
-                qwords(new Array<bigint>(100).fill(0x1000n)),
+                qwords(new Array<bigint>(100).fill(0x1000n))
             )
         } finally {
             emulator.dispose()
@@ -389,9 +458,9 @@ describe('string instructions over more than sixteen elements', () => {
                 '  mov ecx, 100',
                 '  std',
                 '  rep movsq ; <-- step',
-                '  cld',
+                '  cld'
             ],
-            { data: DATA },
+            { data: DATA }
         )
         const emulator = await start(lines)
         try {
@@ -409,7 +478,7 @@ describe('string instructions over more than sixteen elements', () => {
 
     it.each([
         ['zeros of untouched .bss', false],
-        ['the file bytes of untouched .data', true],
+        ['the file bytes of untouched .data', true]
     ])('undoes std; rep stosq downward across a page boundary, over %s', async (_, data) => {
         const lines = program(
             [
@@ -421,9 +490,9 @@ describe('string instructions over more than sixteen elements', () => {
                 '  mov rax, 0x0102030405060708',
                 '  std',
                 '  rep stosq ; <-- step',
-                '  cld',
+                '  cld'
             ],
-            data ? { data: DATA } : { bss: ['area: resb 4 * 4096'] },
+            data ? { data: DATA } : { bss: ['area: resb 4 * 4096'] }
         )
         const emulator = await start(lines)
         try {
@@ -432,7 +501,7 @@ describe('string instructions over more than sixteen elements', () => {
             const offset = Number(lowest - emulator.getRegisterValue('rbx'))
             const before = data ? original(1000).slice(offset, offset + 800) : filled(800, 0)
             expect(await expectUndoableWrite(emulator, lowest, before)).toEqual(
-                qwords(new Array<bigint>(100).fill(0x0102030405060708n)),
+                qwords(new Array<bigint>(100).fill(0x0102030405060708n))
             )
         } finally {
             emulator.dispose()
@@ -442,8 +511,15 @@ describe('string instructions over more than sixteen elements', () => {
     it('undoes std; rep stosb, which Blink stores a byte at a time', async () => {
         const bytes = Array.from({ length: 300 }, (_, i) => (i * 7 + 3) & 0xff)
         const lines = program(
-            ['  lea rdi, [rel area + 299]', '  mov ecx, 300', '  mov al, 0xee', '  std', '  rep stosb ; <-- step', '  cld'],
-            { data: [`area: db ${bytes.join(', ')}`] },
+            [
+                '  lea rdi, [rel area + 299]',
+                '  mov ecx, 300',
+                '  mov al, 0xee',
+                '  std',
+                '  rep stosb ; <-- step',
+                '  cld'
+            ],
+            { data: [`area: db ${bytes.join(', ')}`] }
         )
         const emulator = await start(lines)
         try {
@@ -476,9 +552,9 @@ describe('memory the debugger cannot read back', () => {
                 '  mov qword [rbx], 1 ; <-- step',
                 '  mov qword [rbx + 8], 2',
                 '  lea rcx, [rel cell]',
-                '  mov qword [rcx], 3',
+                '  mov qword [rcx], 3'
             ],
-            { bss: ['cell: resq 1'] },
+            { bss: ['cell: resq 1'] }
         )
         const emulator = await start(lines)
         try {
@@ -555,18 +631,26 @@ describe('a string instruction that faults part way', () => {
             '  ret',
             'restorer:',
             '  mov eax, 15',
-            '  syscall',
+            '  syscall'
         ]
         const emulator = await start(lines)
         try {
             await stepToMarked(emulator, lines)
             const page = emulator.getRegisterValue('rbx')
             await emulator.step()
-            expect(emulator.getInstructionAt(emulator.getPc())?.lineNumber).toBe(lineOf(lines, 'handler:') + 1)
+            expect(emulator.getInstructionAt(emulator.getPc())?.lineNumber).toBe(
+                lineOf(lines, 'handler:') + 1
+            )
             expect(emulator.canUndo()).toBe(false)
             const [run, fault] = memoryMutations(emulator)
-            expect(run).toEqual({ type: 'WriteMemoryBytes', value: { address: page, old: qwords(values), new: filled(80, 0xff) } })
-            expect(fault).toEqual({ type: 'Other', value: `Wrote 8 bytes to 0x${(page - 8n).toString(16)}` })
+            expect(run).toEqual({
+                type: 'WriteMemoryBytes',
+                value: { address: page, old: qwords(values), new: filled(80, 0xff) }
+            })
+            expect(fault).toEqual({
+                type: 'Other',
+                value: `Wrote 8 bytes to 0x${(page - 8n).toString(16)}`
+            })
         } finally {
             emulator.dispose()
         }
@@ -582,9 +666,9 @@ describe('the 64 KiB a step can capture', () => {
                 '  mov rax, -1',
                 ...(down ? ['  std'] : []),
                 '  rep stosq ; <-- step',
-                '  cld',
+                '  cld'
             ],
-            { bss: ['area: resq 9000'] },
+            { bss: ['area: resq 9000'] }
         )
 
     it.each([false, true])('undoes exactly 64 KiB of rep stosq (downward: %s)', async (down) => {
@@ -593,41 +677,54 @@ describe('the 64 KiB a step can capture', () => {
         try {
             await stepToMarked(emulator, lines)
             const area = emulator.getRegisterValue('rdi') - (down ? BigInt(KiB64 - 8) : 0n)
-            expect(await expectUndoableWrite(emulator, area, filled(KiB64, 0))).toEqual(filled(KiB64, 0xff))
+            expect(await expectUndoableWrite(emulator, area, filled(KiB64, 0))).toEqual(
+                filled(KiB64, 0xff)
+            )
         } finally {
             emulator.dispose()
         }
     })
 
-    it.each([false, true])('leaves rep stosq over more than 64 KiB irreversible (downward: %s)', async (down) => {
-        const count = KiB64 / 8 + 1
-        const lines = stosq(count, down)
-        const emulator = await start(lines)
-        try {
-            await stepToMarked(emulator, lines)
-            const area = emulator.getRegisterValue('rdi') - (down ? BigInt((count - 1) * 8) : 0n)
-            const depth = emulator.getUndoHistory(100).length
-            await emulator.step()
-            expect(emulator.getRegisterValue('rcx')).toBe(0n)
-            expect(read(emulator, area, count * 8)).toEqual(filled(count * 8, 0xff))
-            expect(emulator.getUndoHistory(100)).toHaveLength(depth + 1)
-            expect(emulator.canUndo()).toBe(false)
-            expect(() => emulator.undo()).toThrow(/cannot be undone/)
-            // The first 64 KiB, in the direction of the string, are one record
-            // with both sides; the rest is only counted.
-            const captured = down ? area + 8n : area
-            const rest = down ? area : area + BigInt(KiB64)
-            expect(memoryMutations(emulator)).toEqual([
-                { type: 'WriteMemoryBytes', value: { address: captured, old: filled(KiB64, 0), new: filled(KiB64, 0xff) } },
-                { type: 'Other', value: `Wrote 8 bytes to 0x${rest.toString(16)}` },
-            ])
-            // The refused undo changed nothing.
-            expect(read(emulator, area, count * 8)).toEqual(filled(count * 8, 0xff))
-            expect(emulator.getRegisterValue('rcx')).toBe(0n)
-        } finally {
-            emulator.dispose()
+    it.each([false, true])(
+        'leaves rep stosq over more than 64 KiB irreversible (downward: %s)',
+        async (down) => {
+            const count = KiB64 / 8 + 1
+            const lines = stosq(count, down)
+            const emulator = await start(lines)
+            try {
+                await stepToMarked(emulator, lines)
+                const area =
+                    emulator.getRegisterValue('rdi') - (down ? BigInt((count - 1) * 8) : 0n)
+                const depth = emulator.getUndoHistory(100).length
+                await emulator.step()
+                expect(emulator.getRegisterValue('rcx')).toBe(0n)
+                expect(read(emulator, area, count * 8)).toEqual(filled(count * 8, 0xff))
+                expect(emulator.getUndoHistory(100)).toHaveLength(depth + 1)
+                expect(emulator.canUndo()).toBe(false)
+                expect(() => emulator.undo()).toThrow(/cannot be undone/)
+                // The first 64 KiB, in the direction of the string, are one record
+                // with both sides; the rest is only counted.
+                const captured = down ? area + 8n : area
+                const rest = down ? area : area + BigInt(KiB64)
+                expect(memoryMutations(emulator)).toEqual([
+                    {
+                        type: 'WriteMemoryBytes',
+                        value: {
+                            address: captured,
+                            old: filled(KiB64, 0),
+                            new: filled(KiB64, 0xff)
+                        }
+                    },
+                    { type: 'Other', value: `Wrote 8 bytes to 0x${rest.toString(16)}` }
+                ])
+                // The refused undo changed nothing.
+                expect(read(emulator, area, count * 8)).toEqual(filled(count * 8, 0xff))
+                expect(emulator.getRegisterValue('rcx')).toBe(0n)
+            } finally {
+                emulator.dispose()
+            }
         }
-    })
+    )
 })
 
 // The journal pages memory in before the write it records, so the write meets
@@ -654,7 +751,9 @@ function runNatively(executable: Uint8Array): Uint8Array {
 
 function words(bytes: Uint8Array): bigint[] {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    return Array.from({ length: bytes.length / 8 }, (_, index) => view.getBigUint64(index * 8, true))
+    return Array.from({ length: bytes.length / 8 }, (_, index) =>
+        view.getBigUint64(index * 8, true)
+    )
 }
 
 /**
@@ -749,7 +848,7 @@ const FAULTS = [
     '  ret',
     'restorer:',
     '  mov eax, 15',
-    '  syscall',
+    '  syscall'
 ]
 
 const SIGSEGV = 11n
@@ -762,21 +861,29 @@ describe('faults on memory the journal paged in', () => {
             [SIGSEGV, SEGV_ACCERR, 0n, 1n],
             [SIGSEGV, SEGV_MAPERR, 0n, 2n],
             [SIGSEGV, SEGV_ACCERR, 0n, 3n],
-            [SIGSEGV, SEGV_MAPERR, 0n, 15n], // the sixth of twenty qwords faulted
+            [SIGSEGV, SEGV_MAPERR, 0n, 15n] // the sixth of twenty qwords faulted
         ].flat()
         const output: number[] = []
-        const emulator = await createX86Emulator({ callbacks: { stdout: (byte) => void output.push(byte) } })
+        const emulator = await createX86Emulator({
+            callbacks: { stdout: (chunk) => void output.push(...chunk) }
+        })
         try {
             const build = await emulator.compile(FAULTS.join('\n'))
             expect(build.ok, build.report).toBe(true)
             if (NATIVE) {
-                const executable = Uint8Array.from(emulator.module.FS.readFile('/program') as Uint8Array)
+                const executable = Uint8Array.from(
+                    emulator.module.FS.readFile('/program') as Uint8Array
+                )
                 expect(words(runNatively(executable)), 'natively').toEqual(expected)
             }
             emulator.initialize(64)
-            for (let slice = 0; slice < 100 && !emulator.hasTerminated(); slice += 1) await emulator.run(100_000)
+            for (let slice = 0; slice < 100 && !emulator.hasTerminated(); slice += 1)
+                await emulator.run(100_000)
             expect(emulator.stopReason).toMatchObject({ kind: 'exit', exitCode: 0 })
-            expect(words(Uint8Array.from(output.slice(-expected.length * 8))), 'in the Core').toEqual(expected)
+            expect(
+                words(Uint8Array.from(output.slice(-expected.length * 8))),
+                'in the Core'
+            ).toEqual(expected)
         } finally {
             emulator.dispose()
         }

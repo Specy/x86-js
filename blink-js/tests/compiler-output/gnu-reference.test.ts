@@ -59,7 +59,7 @@ describe('the stored GNU references', () => {
         // `asmcallsc` mix C and NASM, and the Core's GNU mode assembles only the Entry.
         expect(new Set(missing)).toEqual(new Set(['asmcallsc', 'callsasm', 'keywords']))
         expect(missing).toHaveLength(15)
-        expect(compared).toHaveLength(131)
+        expect(compared).toHaveLength(156)
     })
 
     it('hold data symbols in most of those cases, and constructors in some', () => {
@@ -71,8 +71,8 @@ describe('the stored GNU references', () => {
         const withConstructors = tables.filter(([, table]) =>
             table.sections.some((section) => section.name === '.init_array' && section.size > 0),
         )
-        // The C++ class programs and `large` keep everything on the stack and in registers.
-        expect(withData).toHaveLength(111)
+        // The C++ class programs, `large` and `inlineasm` keep everything on the stack and in registers.
+        expect(withData).toHaveLength(131)
         // `cpplocalstatic` builds its static on the first call instead.
         expect(new Set(withConstructors.map(([entry]) => entry.program))).toEqual(
             new Set(['ctor', 'ctororder', 'cppunique', 'cppvague']),
@@ -92,7 +92,7 @@ describe.each(
         expect(entry.reference?.status).toBe('built')
         expect(entry.reference?.native?.status).toBe(value! & 255)
         referenceEmulator.loadElf(Uint8Array.from(Buffer.from(entry.reference!.elf!, 'base64')))
-        expect(await runInBlink(referenceEmulator)).toBe(value)
+        expect(await runInBlink(referenceEmulator)).toBe(value! & 255)
     })
 })
 
@@ -113,7 +113,8 @@ describe.each(compared.map((entry) => [entry.case, entry] as const))('%s', (_, e
         const prepared = await comparison(entry)
         comparisons.delete(entry.case)
         const trace = await compareTraces(prepared, translatedEmulator, referenceEmulator)
-        const intended = entry.outcome.kind === 'exit' ? entry.outcome.value : null
+        // The status a parent sees: `main`'s value, its low eight bits.
+        const intended = entry.outcome.kind === 'exit' ? entry.outcome.value & 255 : null
         expect(trace.exitCodes).toEqual([intended, intended])
         expect(trace.instructions).toBeGreaterThan(0)
     })
@@ -184,6 +185,20 @@ describe('the trace comparison', () => {
         const comparison = await prepareComparison(entry, translatedEmulator, mutated)
         await expect(compareTraces(comparison, translatedEmulator, referenceEmulator)).rejects.toThrow(
             /^after input line 130 \(cmp\s+rax, 64\), instruction \d+: PF is 1, not 0$/,
+        )
+    })
+
+    // rcx after a `syscall` is compared as the address after it in each build, not as a place the
+    // two share; a `syscall` that never ran must still show.
+    it("finds a `syscall` made a two-byte NOP (simwrite-O2's out-of-line `sim_write`)", async () => {
+        const entry = named('simwrite-O2')
+        const mutated = edited(entry, (lines, input) => {
+            const syscall = translatedLine(lines, input, /^\s*syscall$/)
+            return lines.map((line) => (line === syscall ? { ...line, text: '    xchg ax, ax' } : line))
+        })
+        const comparison = await prepareComparison(entry, translatedEmulator, mutated)
+        await expect(compareTraces(comparison, translatedEmulator, referenceEmulator)).rejects.toThrow(
+            /^after input line \d+ \(syscall\), instruction \d+: rcx is 0x[0-9a-f]+ and 0x[0-9a-f]+, not the addresses after the two syscalls;/,
         )
     })
 })

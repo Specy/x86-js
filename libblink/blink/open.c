@@ -34,9 +34,19 @@
 #include "blink/overlays.h"
 #include "blink/random.h"
 #include "blink/syscall.h"
+#include "blink/terminal.h"
 #include "blink/thread.h"
 #include "blink/vfs.h"
 #include "blink/xlat.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// Check descriptor capacity before the host FS can create or truncate a File. Closing a
+// descriptor after discovering it is over RLIMIT_NOFILE would leave those changes behind.
+EM_JS(int, NextBrowserDescriptor, (), {
+  try { return FS.nextfd(); } catch (error) { return 0x7fffffff; }
+});
+#endif
 
 static int SysTmpfile(struct Machine *m, i32 dirfildes, i64 pathaddr,
                       i32 oflags, i32 mode) {
@@ -69,6 +79,9 @@ static int SysTmpfile(struct Machine *m, i32 dirfildes, i64 pathaddr,
     return einval();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+#ifdef __EMSCRIPTEN__
+  if (NextBrowserDescriptor() >= lim) return emfile();
+#endif
   unassert(!sigfillset(&ss));
   unassert(!pthread_sigmask(SIG_BLOCK, &ss, &oldss));
   if ((tmpdir = VfsOpen(GetDirFildes(dirfildes), LoadStr(m, pathaddr),
@@ -85,13 +98,22 @@ static int SysTmpfile(struct Machine *m, i32 dirfildes, i64 pathaddr,
       name[i] = 0;
       if ((fildes = VfsOpen(tmpdir, name, sysflags, mode)) != -1) {
         unassert(!VfsUnlink(tmpdir, name, 0));
+        // the file takes the directory's descriptor, the lowest free one,
+        // as linux would give it, and the descriptor it was opened at goes
         unassert(VfsDup2(fildes, tmpdir) == tmpdir);
+        unassert(!VfsClose(fildes));
         fildes = tmpdir;
         if (oflags & O_CLOEXEC_LINUX) {
           unassert(!VfsFcntl(fildes, F_SETFD, FD_CLOEXEC));
         }
         LOCK(&m->system->fds.lock);
-        unassert(AddFd(&m->system->fds, fildes, oflags));
+        // the descriptor keeps host flags, and fcntl(F_GETFL) reports the
+        // O_TMPFILE it was opened with, as linux does
+        unassert(AddFd(&m->system->fds, fildes, XlatOpenFlags(oflags)
+#ifdef O_TMPFILE
+                                                    | O_TMPFILE
+#endif
+                                                    ));
         UNLOCK(&m->system->fds.lock);
       } else {
         unassert(!VfsClose(tmpdir));
@@ -111,7 +133,10 @@ int SysOpenat(struct Machine *m, i32 dirfildes, i64 pathaddr, i32 oflags,
   int sysflags;
   struct Fd *fd;
   const char *path;
-#ifndef O_TMPFILE
+  const struct FdCb *terminal;
+// Emscripten's open() takes O_TMPFILE for O_DIRECTORY and opens the
+// directory itself, so there, too, the file is made and unlinked here.
+#if !defined(O_TMPFILE) || defined(__EMSCRIPTEN__)
 #ifndef DISABLE_NONPOSIX
   if ((oflags & O_TMPFILE_LINUX) == O_TMPFILE_LINUX) {
     return SysTmpfile(m, dirfildes, pathaddr, oflags & ~O_TMPFILE_LINUX, mode);
@@ -121,15 +146,22 @@ int SysOpenat(struct Machine *m, i32 dirfildes, i64 pathaddr, i32 oflags,
   if ((sysflags = XlatOpenFlags(oflags)) == -1) return -1;
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
   if (!(path = LoadStr(m, pathaddr))) return -1;
+#ifdef __EMSCRIPTEN__
+  if (NextBrowserDescriptor() >= lim) return emfile();
+#endif
   RESTARTABLE(fildes = VfsOpen(GetDirFildes(dirfildes), path, sysflags, mode));
   if (fildes != -1) {
     if (fildes >= lim) {
       close(fildes);
       fildes = emfile();
     } else {
+      terminal = GetTerminalDeviceCb(fildes);
       LOCK(&m->system->fds.lock);
       unassert(fd = AddFd(&m->system->fds, fildes, sysflags));
       fd->path = JoinPath(GetDirFildesPath(m->system, dirfildes), path);
+      // /dev/tty and /dev/std* are the terminal, as on linux
+      if (terminal) fd->cb = terminal;
+      else if (!strcmp(path, "/dev/urandom") || !strcmp(path, "/dev/random")) fd->cb = &kFdCbRandom;
       UNLOCK(&m->system->fds.lock);
     }
   } else {

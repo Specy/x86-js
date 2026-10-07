@@ -117,6 +117,14 @@ void blinkenlib_stepi();
 void blinkenlib_continue();
 void blinkenlib_preempt_resume();
 void blinkenlib_faketty_resume();
+void blinkenlib_wait_cancel(void);
+bool blinkenlib_wait_pending(void);
+bool blinkenlib_wait_input(void);
+i64 blinkenlib_wait_deadline(void);
+int blinkenlib_wait_clock(void);
+u64 blinkenlib_instructions_executed(void);
+u64 blinkenlib_active_instruction(void);
+u64 blinkenlib_next_identity(void);
 void *blinkenlib_get_clstruct();
 void *blinkenlib_get_argc_string();
 void *blinkenlib_get_argv_string();
@@ -135,6 +143,12 @@ void blinkenlib_set_flags(u32 flags);
 void blinkenlib_set_step_recording(bool enabled);
 void blinkenlib_set_deferred_disassembly(bool enabled);
 u64 blinkenlib_get_input_max_bytes();
+void blinkenlib_provide_input(const u8 *bytes, u32 length);
+void blinkenlib_provide_end_of_input();
+void blinkenlib_clear_input();
+u32 blinkenlib_get_syscall_count();
+bool blinkenlib_get_syscall(u32 index, u32 *number, u32 *arity,
+                            const char **name);
 
 /**
  * Packed little-endian layout of the machine's FPU register file, as copied

@@ -363,7 +363,8 @@ describe('turning undo off and back on', () => {
         })
         try {
             expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
-            expect(thrown.length).toBeGreaterThanOrEqual(3)
+            // the host hears of the write once, with its three bytes
+            expect(thrown.length).toBe(1)
             for (const error of thrown) {
                 expect(emulator.stringifyError(error)).toMatch(/while an instruction is executing/i)
             }

@@ -104,7 +104,7 @@ describe.each(forms.map((form) => [form.instruction, form] as const))('%s', (_, 
 
     it.skipIf(!NATIVE)(`returns ${form.intended} natively, as the GNU reference did`, async () => {
         const { program } = await built(form)
-        expect(runNatively(program, `x87-${form.name}`)).toBe(form.reference.native?.status)
+        expect(runNatively(program, `x87-${form.name}`).status).toBe(form.reference.native?.status)
     })
 
     it(`encodes as GNU as did, ${form.intelOpcode}`, async () => {

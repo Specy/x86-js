@@ -55,9 +55,20 @@
 
 extern char *g_blink_path;
 
+// A system call OpSyscall() dispatches: the number rax holds, its name, and
+// how many argument registers it reads.
+struct SyscallDescription {
+  u16 number;
+  u8 arity;
+  const char *name;
+};
+
 void OpSyscall(P);
+int CountSyscalls(void);
+const struct SyscallDescription *GetSyscalls(void);
 
 void SysCloseExec(struct System *);
+void SysCloseAll(struct System *);
 int SysClose(struct Machine *, i32);
 int SysCloseRange(struct Machine *, u32, u32, u32);
 int SysDup(struct Machine *, i32, i32, i32, i32);

@@ -267,8 +267,8 @@ _start:
         let stdout = ''
         const emulator = await createX86Emulator({
             callbacks: {
-                stdout: (charCode) => {
-                    stdout += String.fromCharCode(charCode)
+                stdout: (chunk) => {
+                    stdout += String.fromCharCode(...chunk)
                 },
             },
         })
@@ -300,9 +300,9 @@ msg:
         const pendingWrites: Promise<void>[] = []
         const emulator = await createX86Emulator({
             callbacks: {
-                stdout: (charCode) => {
+                stdout: (chunk) => {
                     const pendingWrite = Promise.resolve().then(() => {
-                        stdout += String.fromCharCode(charCode)
+                        stdout += String.fromCharCode(...chunk)
                     })
                     pendingWrites.push(pendingWrite)
                     return pendingWrite

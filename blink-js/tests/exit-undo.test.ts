@@ -44,7 +44,7 @@ function snapshot(emulator: X86Emulator) {
         flags: emulator.getFlags(),
         fpu: emulator.getFpuState(),
         memory: emulator.readMemoryBytes(emulator.getRegisterValue('r12'), 8n),
-        history: emulator.getUndoHistory(16),
+        history: emulator.getUndoHistory(16).map(({ serial: _identity, ...step }) => step)
     }
 }
 
@@ -53,14 +53,21 @@ describe('undo of a trapped exit', () => {
         // A regressed page lock can block inside synchronous wasm. Run this
         // case in a child with a process timeout so the suite still settles.
         if (process.env.X86_EXIT_UNDO_CHILD !== '1') {
-            const child = spawnSync(process.execPath, [
-                fileURLToPath(new URL('../node_modules/vitest/vitest.mjs', import.meta.url)),
-                'run', fileURLToPath(import.meta.url), '-t', 'releases syscall page locks',
-            ], {
-                env: { ...process.env, X86_EXIT_UNDO_CHILD: '1' },
-                timeout: 15_000,
-                encoding: 'utf8',
-            })
+            const child = spawnSync(
+                process.execPath,
+                [
+                    fileURLToPath(new URL('../node_modules/vitest/vitest.mjs', import.meta.url)),
+                    'run',
+                    fileURLToPath(import.meta.url),
+                    '-t',
+                    'releases syscall page locks'
+                ],
+                {
+                    env: { ...process.env, X86_EXIT_UNDO_CHILD: '1' },
+                    timeout: 15_000,
+                    encoding: 'utf8'
+                }
+            )
             expect(child.error, child.stdout + child.stderr).toBeUndefined()
             expect(child.status, child.stdout + child.stderr).toBe(0)
             return
@@ -116,95 +123,111 @@ unmap:
         }
     })
 
-    it.each(['step', 'run'] as const)('replays the exit through %s repeatedly without restarting or losing state', async (drive) => {
-        const emulator = await build()
-        try {
-            expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
-            expectExit(emulator)
-            const exited = snapshot(emulator)
-            expect(exited.registers.rbx).toBe(1n)
-            expect(exited.memory).toEqual(Uint8Array.of(1, 0, 0, 0, 0, 0, 0, 0))
-            expect(exited.history).toHaveLength(INSTRUCTIONS)
-
-            for (let replay = 0; replay < 3; replay++) {
-                emulator.undo()
-                expect(emulator.getStatus()).toBe(EmulatorStatus.Running)
-                expect(emulator.stopReason).toBeNull()
-                expect(emulator.getInstructionAt(emulator.getPc())?.lineNumber).toBe(EXIT_LINE)
-                expect(emulator.getUndoHistory(16)).toHaveLength(INSTRUCTIONS - 1)
-                if (drive === 'step') expect(await emulator.step()).toEqual({ terminated: true })
-                else expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
-                expectExit(emulator)
-                expect(snapshot(emulator)).toEqual(exited)
-            }
-
-            // Undo past the exit's setup too: replaying those instructions
-            // must restore the argument even after a host edit changes it.
-            emulator.undo()
-            emulator.undo()
-            emulator.undo()
-            emulator.setRegisterValue('rdi', 7n)
-            expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
-            expectExit(emulator)
-            const replayed = snapshot(emulator)
-            expect(replayed.registers).toEqual(exited.registers)
-            expect(replayed.flags).toEqual(exited.flags)
-            expect(replayed.fpu).toEqual(exited.fpu)
-            expect(replayed.memory).toEqual(exited.memory)
-            expect(replayed.history).toHaveLength(INSTRUCTIONS)
-        } finally {
-            emulator.dispose()
-        }
-    })
-
-    it.each([60, 231])('uses edited arguments when syscall %i is undone and replayed', async (syscall) => {
-        const emulator = await build(SOURCE.replace('mov eax, 60', `mov eax, ${syscall}`))
-        try {
-            await emulator.run()
-            expectExit(emulator)
-            emulator.undo()
-            emulator.setRegisterValue('rdi', 19n)
-            expect(await emulator.step()).toEqual({ terminated: true })
-            expectExit(emulator, 19)
-            emulator.undo()
-            emulator.setRegisterValue('rdi', 23n)
-            expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
-            expectExit(emulator, 23)
-            expect(emulator.getRegisterValue('rbx')).toBe(1n)
-        } finally {
-            emulator.dispose()
-        }
-    })
-
-    it.each([1, 16])('undoing a Poke after exit leaves the machine exited with capacity %i', async (capacity) => {
-        const emulator = await build(SOURCE, capacity)
-        try {
-            await emulator.run()
-            expectExit(emulator)
-            const exited = snapshot(emulator)
-            emulator.beginPoke()
-            emulator.setRegisterValue('rdi', 99n)
-            emulator.setRegisterValue('rip', emulator.getPc() + 2n)
-            emulator.writeMemoryBytes(emulator.getRegisterValue('r12'), Uint8Array.of(99))
-            expect(emulator.endPoke()).toBe(true)
-
-            emulator.undo()
-            expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
-            expectExit(emulator)
-            expect(emulator.getRegisterValuesRecord()).toEqual(exited.registers)
-            expect(emulator.readMemoryBytes(emulator.getRegisterValue('r12'), 8n)).toEqual(exited.memory)
-            expect(emulator.getUndoHistory(16)).toHaveLength(capacity === 1 ? 0 : INSTRUCTIONS)
-
-            if (capacity > 1) {
-                emulator.undo()
-                emulator.setRegisterValue('rdi', 17n)
+    it.each(['step', 'run'] as const)(
+        'replays the exit through %s repeatedly without restarting or losing state',
+        async (drive) => {
+            const emulator = await build()
+            try {
                 expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
-                expectExit(emulator, 17)
+                expectExit(emulator)
+                const exited = snapshot(emulator)
+                expect(exited.registers.rbx).toBe(1n)
+                expect(exited.memory).toEqual(Uint8Array.of(1, 0, 0, 0, 0, 0, 0, 0))
+                expect(exited.history).toHaveLength(INSTRUCTIONS)
+
+                for (let replay = 0; replay < 3; replay++) {
+                    const previousSerial = emulator.getUndoHistory(1)[0].serial
+                    emulator.undo()
+                    expect(emulator.getStatus()).toBe(EmulatorStatus.Running)
+                    expect(emulator.stopReason).toBeNull()
+                    expect(emulator.getInstructionAt(emulator.getPc())?.lineNumber).toBe(EXIT_LINE)
+                    expect(emulator.getUndoHistory(16)).toHaveLength(INSTRUCTIONS - 1)
+                    if (drive === 'step')
+                        expect(await emulator.step()).toEqual({ terminated: true })
+                    else expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
+                    expectExit(emulator)
+                    expect(snapshot(emulator)).toEqual(exited)
+                    expect(BigInt(emulator.getUndoHistory(1)[0].serial)).toBeGreaterThan(
+                        BigInt(previousSerial)
+                    )
+                }
+
+                // Undo past the exit's setup too: replaying those instructions
+                // must restore the argument even after a host edit changes it.
+                emulator.undo()
+                emulator.undo()
+                emulator.undo()
+                emulator.setRegisterValue('rdi', 7n)
+                expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
+                expectExit(emulator)
+                const replayed = snapshot(emulator)
+                expect(replayed.registers).toEqual(exited.registers)
+                expect(replayed.flags).toEqual(exited.flags)
+                expect(replayed.fpu).toEqual(exited.fpu)
+                expect(replayed.memory).toEqual(exited.memory)
+                expect(replayed.history).toHaveLength(INSTRUCTIONS)
+            } finally {
+                emulator.dispose()
             }
-        } finally {
-            emulator.dispose()
         }
-    })
+    )
+
+    it.each([60, 231])(
+        'uses edited arguments when syscall %i is undone and replayed',
+        async (syscall) => {
+            const emulator = await build(SOURCE.replace('mov eax, 60', `mov eax, ${syscall}`))
+            try {
+                await emulator.run()
+                expectExit(emulator)
+                emulator.undo()
+                emulator.setRegisterValue('rdi', 19n)
+                expect(await emulator.step()).toEqual({ terminated: true })
+                expectExit(emulator, 19)
+                emulator.undo()
+                emulator.setRegisterValue('rdi', 23n)
+                expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
+                expectExit(emulator, 23)
+                expect(emulator.getRegisterValue('rbx')).toBe(1n)
+            } finally {
+                emulator.dispose()
+            }
+        }
+    )
+
+    it.each([1, 16])(
+        'undoing a Poke after exit leaves the machine exited with capacity %i',
+        async (capacity) => {
+            const emulator = await build(SOURCE, capacity)
+            try {
+                await emulator.run()
+                expectExit(emulator)
+                const exited = snapshot(emulator)
+                emulator.beginPoke()
+                emulator.setRegisterValue('rdi', 99n)
+                emulator.setRegisterValue('rip', emulator.getPc() + 2n)
+                emulator.writeMemoryBytes(emulator.getRegisterValue('r12'), Uint8Array.of(99))
+                expect(emulator.endPoke()).toBe(true)
+
+                emulator.undo()
+                expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
+                expectExit(emulator)
+                expect(emulator.getRegisterValuesRecord()).toEqual(exited.registers)
+                expect(emulator.readMemoryBytes(emulator.getRegisterValue('r12'), 8n)).toEqual(
+                    exited.memory
+                )
+                expect(emulator.getUndoHistory(16)).toHaveLength(capacity === 1 ? 0 : INSTRUCTIONS)
+
+                if (capacity > 1) {
+                    emulator.undo()
+                    emulator.setRegisterValue('rdi', 17n)
+                    expect(await emulator.run()).toBe(EmulatorStatus.Terminated)
+                    expectExit(emulator, 17)
+                }
+            } finally {
+                emulator.dispose()
+            }
+        }
+    )
 })
 
 const RESUME_CALLS: Array<[string, (emulator: X86Emulator) => void]> = [
@@ -212,28 +235,31 @@ const RESUME_CALLS: Array<[string, (emulator: X86Emulator) => void]> = [
     ['run_slice', (emulator) => emulator.module._blinkenlib_run_slice!(10, false)],
     ['continue', (emulator) => emulator.module._blinkenlib_continue()],
     ['preempt_resume', (emulator) => emulator.module._blinkenlib_preempt_resume()],
-    ['faketty_resume', (emulator) => emulator.module._blinkenlib_faketty_resume()],
+    ['faketty_resume', (emulator) => emulator.module._blinkenlib_faketty_resume()]
 ]
 
 describe.each([0, 16])('native resume after exit with history capacity %i', (capacity) => {
-    it.each(RESUME_CALLS)('%s reports the retained exit without executing another instruction', async (_, resume) => {
-        const emulator = await build(SOURCE, capacity)
-        try {
-            await emulator.run()
-            expectExit(emulator)
-            const exited = snapshot(emulator)
-            emulator.runtime.resumeAfterStateMutation()
-            resume(emulator)
-            expectExit(emulator)
-            expect(snapshot(emulator)).toEqual(exited)
-            // A second callback is equally safe, including the fake-TTY API
-            // whose normal input invariant does not apply to an exited guest.
-            emulator.runtime.resumeAfterStateMutation()
-            resume(emulator)
-            expectExit(emulator)
-            expect(snapshot(emulator)).toEqual(exited)
-        } finally {
-            emulator.dispose()
+    it.each(RESUME_CALLS)(
+        '%s reports the retained exit without executing another instruction',
+        async (_, resume) => {
+            const emulator = await build(SOURCE, capacity)
+            try {
+                await emulator.run()
+                expectExit(emulator)
+                const exited = snapshot(emulator)
+                emulator.runtime.resumeAfterStateMutation()
+                resume(emulator)
+                expectExit(emulator)
+                expect(snapshot(emulator)).toEqual(exited)
+                // A second callback is equally safe, including the fake-TTY API
+                // whose normal input invariant does not apply to an exited guest.
+                emulator.runtime.resumeAfterStateMutation()
+                resume(emulator)
+                expectExit(emulator)
+                expect(snapshot(emulator)).toEqual(exited)
+            } finally {
+                emulator.dispose()
+            }
         }
-    })
+    )
 })

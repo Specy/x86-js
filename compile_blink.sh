@@ -14,18 +14,17 @@ requirements=(
     "make"
 )
 for cmd in "${requirements[@]}"; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo >&2 "Required program $cmd is not installed. Aborting."; exit 1; }
+  command -v "$cmd" >/dev/null 2>&1 || { echo >&2 "Required program $cmd is not installed. Aborting. (source emsdk_env.sh first)"; exit 1; }
 done
 
 #---------------------
 # compile blink wasm+js
 #---------------------
-rm -f o//blink/blinkenlib.js o//blink/blinkenlib.wasm
-emmake make \
-  CXX=em++ \
-  'CXXFLAGS=-g -O2' \
-  'LDFLAGS=-O2 -sENVIRONMENT=web,node -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sEXIT_RUNTIME=0 -sWASM_BIGINT=1 -sEXPORT_ES6=1 -sMODULARIZE -sEXPORT_NAME="blinkenlib" -sEXPORTED_RUNTIME_METHODS=[UTF8ToString,stringToNewUTF8,AsciiToString,FS,callMain,addFunction,wasmExports] -lembind' \
-  o//blink/blinkenlib.js
+# Everything the build depends on is in the committed config.h and config.mk,
+# so this starts from nothing: a stale object compiled under another
+# configuration cannot end up in the module.
+rm -rf o
+emmake make -j"$(nproc 2>/dev/null || echo 4)" o//blink/blinkenlib.js
 
 
 #---------------------
@@ -34,3 +33,10 @@ emmake make \
 #---------------------
 cp ./o/blink/blinkenlib.wasm ../blink-js/src/wasm/
 cp ./o/blink/blinkenlib.js ../blink-js/src/wasm/
+
+# The same sources built with the same emsdk give the same bytes; this is what
+# to compare when checking that a committed module is the one its sources make.
+echo "emsdk: $(emcc --version | head -n1)"
+for file in ../blink-js/src/wasm/blinkenlib.wasm ../blink-js/src/wasm/blinkenlib.js; do
+  echo "$(sha256sum "$file" | cut -d' ' -f1)  $(wc -c < "$file") bytes  ${file#../}"
+done

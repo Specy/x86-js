@@ -24,6 +24,9 @@
 #include "blink/assert.h"
 #include "blink/atomic.h"
 #include "blink/debug.h"
+#ifdef __EMSCRIPTEN__
+#include "blink/debughistory.h"
+#endif
 #include "blink/dll.h"
 #include "blink/errno.h"
 #include "blink/fds.h"
@@ -69,6 +72,10 @@ int SysClose(struct Machine *m, i32 fildes) {
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
+  // The descriptor is already gone even if the underlying close later reports an error.
+#ifdef __EMSCRIPTEN__
+  DebugHistoryMarkIrreversible();
+#endif
   return FinishClose(m, CloseFd(fd));
 }
 
@@ -88,6 +95,20 @@ void SysCloseExec(struct System *s) {
   CloseFds(fds);
 }
 
+// Closes every descriptor a System has, host descriptors included, as the
+// end of a process does. FreeSystem() only frees the table, since a native
+// execve() hands the host descriptors on; blinkenlib frees a System to start
+// the next program in the same host process, where a descriptor nothing
+// closed would keep its host descriptor, and its number, for good.
+void SysCloseAll(struct System *s) {
+  struct Dll *fds;
+  LOCK(&s->fds.lock);
+  fds = s->fds.list;
+  s->fds.list = 0;
+  UNLOCK(&s->fds.lock);
+  CloseFds(fds);
+}
+
 #ifndef DISABLE_NONPOSIX
 
 static int SysCloseRangeCloexec(struct Machine *m, u32 first, u32 last) {
@@ -99,6 +120,9 @@ static int SysCloseRangeCloexec(struct Machine *m, u32 first, u32 last) {
     fd = FD_CONTAINER(e);
     if (first <= (u32)fd->fildes && (u32)fd->fildes <= last) {
       if (~fd->oflags & O_CLOEXEC) {
+#ifdef __EMSCRIPTEN__
+        DebugHistoryMarkIrreversible();
+#endif
         fd->oflags |= O_CLOEXEC;
         VfsFcntl(fd->fildes, F_SETFD, FD_CLOEXEC);
       }
@@ -113,7 +137,10 @@ int SysCloseRange(struct Machine *m, u32 first, u32 last, u32 flags) {
   struct Fd *fd;
   sigset_t block, oldmask;
   struct Dll *e, *e2, *fds;
-  if ((flags & ~CLOSE_RANGE_CLOEXEC_LINUX) || first > last) {
+  // CLOSE_RANGE_UNSHARE gives the caller a descriptor table of its own
+  // before closing; with no other thread to share one with, it already has
+  if ((flags & ~(CLOSE_RANGE_UNSHARE_LINUX | CLOSE_RANGE_CLOEXEC_LINUX)) ||
+      first > last) {
     return einval();
   }
   if (flags & CLOSE_RANGE_CLOEXEC_LINUX) {
@@ -124,6 +151,9 @@ int SysCloseRange(struct Machine *m, u32 first, u32 last, u32 flags) {
     fd = FD_CONTAINER(e);
     e2 = dll_next(m->system->fds.list, e);
     if (first <= (u32)fd->fildes && (u32)fd->fildes <= last) {
+#ifdef __EMSCRIPTEN__
+      DebugHistoryMarkIrreversible();
+#endif
       dll_remove(&m->system->fds.list, e);
       dll_make_last(&fds, e);
     }

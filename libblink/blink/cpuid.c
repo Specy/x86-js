@@ -97,7 +97,8 @@
 void OpCpuid(P) {
   u32 ax, bx, cx, dx, jit;
   if (m->trapcpuid) {
-    ThrowSegmentationFault(m, 0);
+    // a #GP, as cpuid faulting raises on linux: SIGSEGV with SI_KERNEL
+    ThrowProtectionFault(m);
   }
   ax = bx = cx = dx = 0;
   switch (Get32(m->ax)) {

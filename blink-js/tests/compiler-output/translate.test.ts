@@ -856,19 +856,235 @@ describe('directives that only describe', () => {
             'ret',
         ])
     })
+})
 
-    it('rejects inline assembly between #APP and #NO_APP at the #APP line', () => {
-        const input = unit(
+describe('inline assembly (gate 4)', () => {
+    /**
+     * `main` with one `asm` statement written at src/main.c:5:5, framed as GCC frames one: its
+     * `.loc`, `#APP`, the line markers around the template's lines, `#NO_APP`. With {@link unit}'s
+     * two opening lines, the template's first line is input line 8.
+     */
+    const statement = (...template: string[]) =>
+        unit(
+            '\t.file 1 "src/main.c"',
+            '\t.globl\tmain',
             'main:',
+            '\t.loc 1 5 5',
             '#APP',
             '# 5 "src/main.c" 1',
-            '\tsyscall',
-            '\t.bogus',
+            ...template,
             '# 0 "" 2',
             '#NO_APP',
             '\tret',
         )
-        expect(errors(input)).toEqual([expect.objectContaining({ code: 'inline-assembly', inputLine: 3, column: 1 })])
+
+    /** Each statement line's text, input line and location. */
+    const placed = (input: readonly string[]) =>
+        translated(input)
+            .lines.filter((line) => line.inputLine !== null)
+            .map((line) => [line.text.trim(), line.inputLine, line.location])
+
+    const at = (line: number) => ({ file: 'src/main.c', line, column: 5 })
+
+    it('translates an `asm` statement as GCC writes it, at the location of its `.loc`', () => {
+        const input = statement('\tsyscall')
+        expect(translated(input).diagnostics).toEqual([])
+        expect(placed(input)).toEqual([
+            ['section .text', 1, null],
+            ['global main', 3, null],
+            ['main:', 4, null],
+            ['syscall', 8, at(5)],
+            ['ret', 11, at(5)],
+        ])
+    })
+
+    it("reads GCC's own directives inside a block, such as the `.loc` of what follows it", () => {
+        // GCC's -O2 output for two statements in a row: one block, a `.loc` between them, and the
+        // `.loc` of the next C line written before `#NO_APP`.
+        const input = unit(
+            '\t.file 1 "src/main.c"',
+            'main:',
+            '\t.loc 1 3 5',
+            '#APP',
+            '# 3 "src/main.c" 1',
+            '\tnop',
+            '# 0 "" 2',
+            '\t.loc 1 4 5',
+            '# 4 "src/main.c" 1',
+            '\tnop',
+            '        nop',
+            '# 0 "" 2',
+            '\t.loc 1 5 1',
+            '#NO_APP',
+            '\tret',
+        )
+        expect(placed(input)).toEqual([
+            ['section .text', 1, null],
+            ['main:', 3, null],
+            ['nop', 7, at(3)],
+            ['nop', 11, at(4)],
+            ['nop', 12, at(4)],
+            ['ret', 16, { file: 'src/main.c', line: 5, column: 1 }],
+        ])
+    })
+
+    it('admits `syscall` in inline assembly alone, and only without operands', () => {
+        expect(body(statement('\tsyscall'))).toContain('syscall')
+        expect(instructionErrors('syscall')).toEqual([
+            expect.objectContaining({
+                code: 'unsupported-instruction',
+                message: expect.stringMatching(/system instruction/),
+            }),
+        ])
+        expect(errors(statement('\tsyscall 1'))).toEqual([
+            expect.objectContaining({
+                code: 'inline-assembly',
+                inputLine: 8,
+                message:
+                    'inline assembly `syscall 1`: `syscall` in this form is a system instruction; the profile allows the x86-64 baseline, x87, SSE, SSE2 and SSE3, and `syscall` in inline assembly',
+            }),
+        ])
+    })
+
+    it("reads instructions, labels and directives by the rules for GCC's output", () => {
+        const output = body(
+            statement(
+                '\tmov rax, QWORD PTR counter[rip]',
+                '\tlea rdx, [rax+rax*2]',
+                '\tmov eax, OFFSET FLAT:table',
+                '\tcmp DWORD PTR [rax+4], 2',
+                '\tjne .Lskip17',
+                '\tsar edx',
+                '.Lskip17:',
+                '\t.section .rodata',
+                '\t.align 4',
+                'table:',
+                '\t.long 1, 2',
+                '\t.text',
+                '\t.intel_syntax noprefix',
+                '\t.cfi_remember_state',
+            ),
+        )
+        expect(output).toEqual([
+            'section .text',
+            'global main',
+            'main:',
+            'mov rax, qword [rel counter]',
+            'lea rdx, [rax+rax*2]',
+            'mov eax, table',
+            'cmp dword [rax+4], 2',
+            'jne Lskip17',
+            'sar edx, 1',
+            'Lskip17:',
+            'section .rodata',
+            'align 4, db 0',
+            'table:',
+            'dd 1, 2',
+            'section .text',
+            'ret',
+        ])
+    })
+
+    it("rejects, quoting the line, what GCC's output never has: each is `inline-assembly` on its own line", () => {
+        const intel =
+            'the profile compiles with -masm=intel, so inline assembly is written in Intel syntax (`mov eax, 1`, not `movl $1, %eax`)'
+        const rejected: [string, number, string][] = [
+            ['\tmovl $1, %eax', 11, `\`%eax\` is AT&T syntax; ${intel}`],
+            ['\tadd eax, $2', 11, `\`$2\` is an AT&T immediate; ${intel}`],
+            ['\tpushq rax', 2, `\`pushq\` is \`push\` with an AT&T size suffix; ${intel}`],
+            [
+                '\tinc [rdi]',
+                6,
+                'memory operand `[rdi]` has no size, which NASM and GNU as do not read alike; name its size as GCC does, such as `DWORD PTR [rdi]`',
+            ],
+            [
+                '\tmov eax, counter[rip]',
+                11,
+                'memory operand `counter[rip]` has no size, which NASM and GNU as do not read alike; name its size as GCC does, such as `DWORD PTR counter[rip]`',
+            ],
+            [
+                '\tint 0x80',
+                2,
+                '`int` is a system instruction; the profile allows the x86-64 baseline, x87, SSE, SSE2 and SSE3, and `syscall` in inline assembly',
+            ],
+            ['\t.rept 2', 2, '`.rept` (repetition) has no translation'],
+            ['\t.byte 0x0f, 0x05', 2, '`.byte` in a code section has no translation'],
+            ['\t.att_syntax', 2, '`.att_syntax` (AT&T syntax) has no translation'],
+            ['# keep the flags', 1, 'a comment has no translation; remove it from the `asm` statement'],
+            ['\tnop # wait', 6, 'a comment after a statement has no translation; remove it from the `asm` statement'],
+            [
+                '\tpush rax; pop rax',
+                10,
+                'several statements on one line have no translation; put each on a line of its own',
+            ],
+            ['again: nop', 8, 'several statements on one line have no translation; put each on a line of its own'],
+            ['1:', 1, 'numeric label `1:` has no translation; name the label instead, made unique with `%=`'],
+            ['#APP', 1, 'a comment has no translation; remove it from the `asm` statement'],
+            ['# 5 "src/main.c" 3', 1, 'a comment has no translation; remove it from the `asm` statement'],
+        ]
+        for (const [line, column, message] of rejected) {
+            const quoted = line.trim().replace(/\t/g, ' ')
+            expect(errors(statement(line)), line).toEqual([
+                {
+                    severity: 'error',
+                    code: 'inline-assembly',
+                    inputLine: 8,
+                    column,
+                    location: at(5),
+                    message: `inline assembly \`${quoted}\`: ${message}`,
+                },
+            ])
+        }
+        // Each line of a template is its own: only the offending ones are reported.
+        expect(errorCodes(statement('\tnop', '\t.rept 3', '\tnop', '\t.endr'))).toEqual([
+            ['inline-assembly', 9],
+            ['inline-assembly', 11],
+        ])
+    })
+
+    it('reports as inline assembly what a later pass finds on a line of a block', () => {
+        const [duplicate] = errors(statement('main:'))
+        expect(duplicate).toMatchObject({
+            code: 'inline-assembly',
+            inputLine: 8,
+            message: 'inline assembly `main:`: `main` is defined twice',
+        })
+        const [numeric] = errors(statement('\tjmp 1f'))
+        expect(numeric).toMatchObject({ code: 'inline-assembly', inputLine: 8, column: 6 })
+        expect(numeric!.message).toMatch(/^inline assembly `jmp 1f`: `1f` refers to a numeric label/)
+    })
+
+    it('quotes a long line in part, and a control character as an escape', () => {
+        const long = 'x'.repeat(80)
+        const [diagnostic] = errors(statement(`\t${long}`))
+        expect(diagnostic!.message).toBe(
+            `inline assembly \`${'x'.repeat(60)}…\`: NASM 3.00 has no instruction \`${long}\``,
+        )
+        const [control] = errors(statement('\tnop\u0001'))
+        expect(control).toMatchObject({ code: 'inline-assembly', inputLine: 8, column: 5 })
+        expect(control!.message).toMatch(/^inline assembly `nop\\u0001`: control character or line break U\+0001/)
+    })
+
+    it("reads line markers only inside a block, where any line and file are GCC's", () => {
+        expect(body(statement('# 12 "sysroot/include/sim.h" 1', '\tnop', '# 0 "" 2'))).toContain('nop')
+        expect(errorCodes(unit('# 5 "src/main.c" 1'))).toEqual([['unsupported-directive', 2]])
+        expect(errorCodes(unit('# 0 "" 2'))).toEqual([['unsupported-directive', 2]])
+        expect(errorCodes(unit('#NO_APP'))).toEqual([['unsupported-directive', 2]])
+    })
+
+    it('translates a file-scope `asm`, whose block GCC may leave open to the end', () => {
+        const input = unit('#APP', '\t.text', '.globl asm_triple', 'asm_triple:', '\tlea eax, [rdi+rdi*2]', '\tret')
+        const result = translated(input)
+        expect(result.diagnostics).toEqual([])
+        expect(body(input)).toEqual([
+            'section .text',
+            'section .text',
+            'global asm_triple',
+            'asm_triple:',
+            'lea eax, [rdi+rdi*2]',
+            'ret',
+        ])
+        expect(result.symbols.defined).toEqual([{ name: 'asm_triple', nasmName: 'asm_triple', binding: 'global' }])
     })
 })
 

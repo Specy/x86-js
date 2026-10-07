@@ -17,6 +17,9 @@
 #include "blink/map.h"
 #include "blink/rde.h"
 #include "blink/syscall.h"
+#include "blink/terminal.h"
+#include "blink/environment.h"
+#include "blink/signal.h"
 #include "blink/x86.h"
 
 void update_clstruct(struct Machine *m);
@@ -49,11 +52,11 @@ void update_clstruct(struct Machine *m);
 int switches_count = 0;
 
 /*
- * This blink wrapper will communicate events with
- * the javascript side via SIGTRAP signals and the
- * additional SIGTRAP event codes.
- * The event codes are defined here. An event code
- * of 0 will be recognized as an actuall SIGTRAP.
+ * This blink wrapper communicates its own events to the javascript side as
+ * SIGTRAP with the codes below. Linux never sends SIGTRAP with a code from
+ * 40 to 44 (its si_codes are 1 to 6, SI_KERNEL and the negative SI_*), so
+ * a SIGTRAP with any other code is the signal itself, which ends the
+ * program, as Linux's default action does, when no handler takes it.
  */
 #define SIGTRAP_CODE_SIGTRAP  0
 #define SIGTRAP_CODE_PREEMPT  40
@@ -61,10 +64,13 @@ int switches_count = 0;
 #define SIGTRAP_CODE_FAKE_TTY 42
 #define SIGTRAP_CODE_BREAKPOINT 43
 #define SIGTRAP_CODE_RUN_LIMIT 44
+#define SIGTRAP_CODE_WAIT 45
 
 /*
  * These variables are defined by javascript;
- * the pointers are passed to main when this module starts
+ * the pointers are passed to main when this module starts.
+ * The third, terminal_output_callback, receives what programs write
+ * to the terminal (see blink/terminal.c).
  */
 void (*signal_callback)(int, int) = 0;
 void (*exit_callback)(int) = 0;
@@ -111,6 +117,24 @@ static bool step_recording_enabled = false;
  * legacy clstruct interface keeps its eager listing unless it opts in. */
 static bool deferred_disassembly = false;
 static bool active_step = false;
+/* Independent of history capacity, Undo and Pokes. Identities never reset. */
+static u64 instructions_executed, identity_allocator, active_identity;
+EMSCRIPTEN_KEEPALIVE
+u64 blinkenlib_instructions_executed(void) { return instructions_executed; }
+EMSCRIPTEN_KEEPALIVE
+u64 blinkenlib_active_instruction(void) { return active_identity; }
+u64 blinkenlib_next_identity(void) { return ++identity_allocator; }
+static void FinishExecution(void) {
+  if (active_identity) { ++instructions_executed; ++run_instruction_count; active_identity = 0; }
+}
+EM_JS(bool, HasHostError, (), { return Module.blinkHostError !== undefined; });
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_abandon_execution(void) {
+  if (m) GuestWaitFinish(m);
+  DebugHistoryCancel();
+  active_identity = 0;
+  active_step = false;
+}
 static bool native_slice = false;
 static u64 active_pc_before = 0;
 static u64 active_sp_before = 0;
@@ -124,6 +148,13 @@ static struct blinkenlib_step_info last_step_info;
  * SIGTRAP will not terminate the program
  */
 void TerminateSignal(struct Machine *m, int sig, int code) {
+  /* Default signal actions stop after this instruction as well as on a
+   * fault's longjmp. In particular, HandleSigpipe must not run the next
+   * instruction and replace this stop with its later exit. */
+  if (sig != SIGTRAP || code < SIGTRAP_CODE_PREEMPT || code > SIGTRAP_CODE_WAIT) {
+    m->system->exited = true;
+    m->system->exitcode = 128 + sig;
+  }
 #ifdef DEBUG
   if (sig != SIGTRAP) {
     printf("Terminate signal received! %d : %d \n", sig, code);
@@ -314,7 +345,7 @@ static void ClearLastStepInfo(void) {
 
 static void BeginRecordedStep(u32 control_flow) {
   if (!step_recording_enabled || !debugger_enabled || !m) return;
-  if (active_step && DebugHistoryPending()) return;
+  if (active_step) return;
   ClearStepMemoryWrites();
   memset(&last_step_info, 0, sizeof(last_step_info));
   active_pc_before = GetPc(m);
@@ -436,6 +467,12 @@ void runLoop() {
   if (!(interrupt = sigsetjmp(m->onhalt, 1))) {
     m->canhalt = true;
     for (int i = 0; i < MAX_CYCLES; i++) {
+      if (!active_identity) {
+        GuestTimerCheck(m);
+        if (atomic_load_explicit(&m->attention, memory_order_acquire))
+          CheckForSignals(m);
+        if (s->exited) { m->canhalt = false; return; }
+      }
       u64 pc = GetPc(m);
       if (run_instruction_limit &&
           run_instruction_count >= run_instruction_limit) {
@@ -459,10 +496,15 @@ void runLoop() {
         }
       }
 
+      if (!active_identity) active_identity = blinkenlib_next_identity();
       BeginRecordedStep(GetControlFlowKind());
       ExecuteInstruction(m);
-      FinishRecordedStep(false);
-      run_instruction_count += 1;
+      FinishRecordedStep(s->exited);
+      FinishExecution();
+      // Host callbacks return EIO through the syscall stack. Stop only after its cleanup and
+      // history packet finish, before another guest instruction can observe a partial effect.
+      if (HasHostError()) { m->canhalt = false; return; }
+      if (s->exited) { m->canhalt = false; return; }
 
       if (single_stepping) {
         TerminateSignal(m, SIGTRAP, SIGTRAP_CODE_STEP);
@@ -494,10 +536,11 @@ void runLoop() {
     printf("handling machine interrupt: %d \n", interrupt);
     puts("--");
 #endif
-    if (interrupt == kMachineExitTrap) {
-      /* Exit abandons OpSyscall's stack. Release its temporary state as
-       * Blink() does after a halt, so undo can resume ordinary instructions
-       * without retaining syscall page locks or nesting depth. */
+    if (interrupt == kMachineExitTrap || interrupt == kMachineFakeTTYtrap || interrupt == kMachineWaitTrap) {
+      /* Exit and a read waiting for input abandon OpSyscall's stack.
+       * Release its temporary state as Blink() does after a halt, so undo
+       * and the read that starts over run without syscall page locks or
+       * nesting depth left behind. */
       m->sysdepth = 0;
       m->sigdepth = 0;
       m->canhalt = false;
@@ -508,13 +551,20 @@ void runLoop() {
     }
     // A blocked read has not executed yet. Retain its before-state until the
     // resumed syscall completes, so input is one reversible instruction.
-    if (interrupt != kMachineFakeTTYtrap || !DebugHistoryPending())
-      FinishRecordedStep(interrupt == kMachineExitTrap);
+    if (interrupt != kMachineFakeTTYtrap && interrupt != kMachineWaitTrap) {
+      FinishRecordedStep(interrupt == kMachineExitTrap || s->exited);
+      /* Faulting instructions do not retire; exit does. */
+      if (interrupt == kMachineExitTrap) FinishExecution();
+      else active_identity = 0;
+      GuestWaitFinish(m);
+    }
     if (interrupt == kMachineExitTrap) {
       if (exit_callback) {
         update_clstruct(m);
         exit_callback(m->system->exitcode);
       }
+    } else if (interrupt == kMachineWaitTrap) {
+      TerminateSignal(m, SIGTRAP, SIGTRAP_CODE_WAIT);
     } else if (interrupt == kMachineFakeTTYtrap) {
       update_clstruct(m);
       TerminateSignal(m, SIGTRAP, SIGTRAP_CODE_FAKE_TTY);
@@ -529,8 +579,9 @@ void SetUp(void) {
   s = NewSystem(XED_MACHINE_MODE_LONG);
   m = g_machine = NewMachine(s, 0);
   m->metal = false;
-  // when true, read(0) will halt the machine, with a SIGTRAP_CODE_FAKE_TTY
-  // To resume the machine, a call to blinkenlib_faketty_resume is required
+  // when true, a read the terminal has no input for halts the machine, with
+  // a SIGTRAP_CODE_FAKE_TTY. To resume the machine, give the terminal input
+  // and call blinkenlib_faketty_resume (see blink/terminal.c)
   m->fakettycanhalt = true;
   // when true, guest exit syscalls will generate an interrupt that
   // can be handled via sigsetjmp, instead of calling the native _exit().
@@ -554,9 +605,7 @@ void OnSymbols(struct System *s) {
 }
 
 void PostLoadSetup() {
-  AddStdFd(&m->system->fds, 0);
-  AddStdFd(&m->system->fds, 1);
-  AddStdFd(&m->system->fds, 2);
+  AddTerminalFds(&m->system->fds);
   if (debugger_enabled) {
     // initialize the disassembler
     m->system->dis = dis;
@@ -567,11 +616,30 @@ void PostLoadSetup() {
 }
 
 void TearDown(void) {
+  if (m) GuestWaitFinish(m);
+  GuestTimerReset();
+  active_identity = 0;
   DebugHistoryClear();
   // TODO: make sure free is ok when not allocated
   DisFree(dis);
+  // what the last program left open is closed, as its end would have,
+  // before the next one opens anything
+  if (m) SysCloseAll(m->system);
   FreeMachine(m);
+  m = g_machine = 0;
+  s = 0;
   memset(dis_buffer, 0, sizeof(dis_buffer));
+}
+
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_clear_execution(void) {
+  blinkenlib_abandon_execution();
+  TearDown();
+  ClearTerminalInput();
+  ClearLastStepInfo();
+  run_instruction_count = 0;
+  run_instruction_limit = 0;
+  native_slice = false;
 }
 
 void stringToArgsArray(char *argsString, char **argsArray, int maxArgs) {
@@ -596,9 +664,6 @@ void setupProgram(bool withdebugger) {
   debugger_enabled = withdebugger;
   native_slice = false;
 
-  // terminal prompt
-  printf("\n$ %s\n", argc_string);
-
   // get **argc
   char *args[ARGC_MAX_LINE_LEN];
   char argc_string_copy[ARGC_MAX_LINE_LEN];
@@ -612,6 +677,7 @@ void setupProgram(bool withdebugger) {
   // close previous instances
   TearDown();
   SetUp();
+  OpenTerminalHostFds();
   char *bios = 0;
   LoadProgram(m, progname_string, progname_string, args, &vars, bios);
   PostLoadSetup();
@@ -708,16 +774,14 @@ void blinkenlib_preempt_resume() {
   runLoop();
 }
 
+/* Resumes a read that waited for input: it starts over, and halts again
+ * if the host has still given the terminal nothing. */
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_faketty_resume() {
   if (s->exited) {
     if (exit_callback) exit_callback(s->exitcode);
     return;
   }
-  if (!m->fakettycanhalt) {
-    unassert(!"Invalid state (tty)");
-  }
-  m->fakettycanhalt = false;
   if (native_slice) {
     // Feeding input completes only the blocked instruction. The caller owns
     // resuming the following batch, including checking its first breakpoint.
@@ -813,8 +877,22 @@ void blinkenlib_set_step_recording(bool enabled) {
   }
 }
 
+/* How many bytes the read waiting for input asked for: a read's count, the
+ * sum of a readv's vectors. */
 u64 blinkenlib_get_input_max_bytes() {
-  return blinkenlib_get_register_u64(BLINKENLIB_REG_RDX);
+  return GetTerminalWaitSize();
+}
+
+void blinkenlib_provide_input(const u8 *bytes, u32 length) {
+  ProvideTerminalInput(bytes, length);
+}
+
+void blinkenlib_provide_end_of_input() {
+  ProvideTerminalEndOfInput();
+}
+
+void blinkenlib_clear_input() {
+  ClearTerminalInput();
 }
 
 _Static_assert(BLINKENLIB_FPU_STATE_SIZE ==
@@ -1069,6 +1147,25 @@ void blinkenlib_set_program_args(const char *progname, const char *argc,
   CopySafeAscii(argv_string, ARGV_MAX_LINE_LEN, argv);
 }
 
+u32 blinkenlib_get_syscall_count() {
+  return CountSyscalls();
+}
+
+/* One of the system calls the dispatcher answers, in no particular order:
+ * the table is the one OpSyscall() was compiled from (see GetSyscalls()). */
+bool blinkenlib_get_syscall(u32 index, u32 *number, u32 *arity,
+                            const char **name) {
+  const struct SyscallDescription *syscall;
+  if (index >= (u32)CountSyscalls() || !number || !arity || !name) {
+    return false;
+  }
+  syscall = GetSyscalls() + index;
+  *number = syscall->number;
+  *arity = syscall->arity;
+  *name = syscall->name;
+  return true;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void *blinkenlib_get_clstruct() {
   return &cls;
@@ -1103,15 +1200,17 @@ int main(int argc, char *argv[]) {
   puts("This program is designed to run in emscripten");
   return 1;
 #endif
-  puts("Initializing blink emulator...");
-  if (argc != 3) {
-    puts("Error. main expected 3 args");
+  if (argc != 4) {
+    puts("Error. main expected 4 args");
     return 1;
   }
   int signal_callback_num = atoi(argv[1]);
   int exit_callback_num = atoi(argv[2]);
+  int output_callback_num = atoi(argv[3]);
   signal_callback = (void (*)(int, int))signal_callback_num;
   exit_callback = (void (*)(int))exit_callback_num;
+  terminal_output_callback =
+      (void (*)(int, const u8 *, u32))output_callback_num;
 #ifdef DEBUG
   printf("fp1: %d\n", signal_callback_num);
   printf("fp2: %d\n", exit_callback_num);
@@ -1122,5 +1221,4 @@ int main(int argc, char *argv[]) {
   cls.version = CLSTRUCT_VERSION;
   // overlays setup goes here
   // vfs setup goes here
-  puts("blink ready!");
 }

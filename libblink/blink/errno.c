@@ -127,3 +127,11 @@ long exdev(void) {
 long enametoolong(void) {
   return ReturnErrno(ENAMETOOLONG);
 }
+
+long espipe(void) {
+  return ReturnErrno(ESPIPE);
+}
+
+long enotty(void) {
+  return ReturnErrno(ENOTTY);
+}

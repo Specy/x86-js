@@ -27,6 +27,9 @@
 #include "blink/builtin.h"
 #include "blink/bus.h"
 #include "blink/debug.h"
+#ifdef __EMSCRIPTEN__
+#include "blink/debughistory.h"
+#endif
 #include "blink/errno.h"
 #include "blink/fds.h"
 #include "blink/jit.h"
@@ -190,8 +193,40 @@ long GetMaxRss(struct System *s) {
   return MIN(kMaxResident, Read64(s->rlim[RLIMIT_AS_LINUX].cur)) / 4096;
 }
 
+static void SetResourceLimitDefault(struct System *s, int resource, u64 cur,
+                                    u64 max) {
+  Write64(s->rlim[resource].cur, cur);
+  Write64(s->rlim[resource].max, max);
+}
+
+static void InitResourceLimits(struct System *s) {
+  int i;
+  for (i = 0; i < RLIM_NLIMITS_LINUX; ++i) {
+    SetResourceLimitDefault(s, i, RLIM_INFINITY_LINUX, RLIM_INFINITY_LINUX);
+  }
+#ifdef __EMSCRIPTEN__
+  // the limits linux starts its first process with (INIT_RLIMITS). The two
+  // it sizes at boot are half its thread count, one 16kb stack per 128kb of
+  // memory (fork_init), for a machine of kMaxResident bytes. With no host to
+  // keep them, blink keeps them all; it enforces RLIMIT_AS and RLIMIT_NOFILE
+  // and the rest are only reported
+  SetResourceLimitDefault(s, RLIMIT_STACK_LINUX, kStackSize,
+                          RLIM_INFINITY_LINUX);
+  SetResourceLimitDefault(s, RLIMIT_CORE_LINUX, 0, RLIM_INFINITY_LINUX);
+  SetResourceLimitDefault(s, RLIMIT_NPROC_LINUX, kMaxResident / 262144,
+                          kMaxResident / 262144);
+  SetResourceLimitDefault(s, RLIMIT_NOFILE_LINUX, 1024, 4096);
+  SetResourceLimitDefault(s, RLIMIT_MEMLOCK_LINUX, 8 * 1024 * 1024,
+                          8 * 1024 * 1024);
+  SetResourceLimitDefault(s, RLIMIT_SIGPENDING_LINUX, kMaxResident / 262144,
+                          kMaxResident / 262144);
+  SetResourceLimitDefault(s, RLIMIT_MSGQUEUE_LINUX, 819200, 819200);
+  SetResourceLimitDefault(s, RLIMIT_NICE_LINUX, 0, 0);
+  SetResourceLimitDefault(s, RLIMIT_RTPRIO_LINUX, 0, 0);
+#endif
+}
+
 struct System *NewSystem(struct XedMachineMode mode) {
-  long i;
   struct System *s;
   unassert(mode.omode == XED_MODE_REAL ||    //
            mode.omode == XED_MODE_LEGACY ||  //
@@ -235,10 +270,16 @@ struct System *NewSystem(struct XedMachineMode mode) {
                  (u64)1 << (SIGBUS_LINUX - 1) |   //
                  (u64)1 << (SIGPIPE_LINUX - 1) |  //
                  (u64)1 << (SIGTRAP_LINUX - 1);
-  for (i = 0; i < RLIM_NLIMITS_LINUX; ++i) {
-    Write64(s->rlim[i].cur, RLIM_INFINITY_LINUX);
-    Write64(s->rlim[i].max, RLIM_INFINITY_LINUX);
+  InitResourceLimits(s);
+#ifdef __EMSCRIPTEN__
+  // starts as the root its host reports, a member of group 0 alone
+  if (!(s->groups = (u32 *)calloc(1, sizeof(*s->groups)))) {
+    free(s);
+    enomem();
+    return 0;
   }
+  s->ngroups = 1;
+#endif
   s->pid = getpid();
   return s;
 }
@@ -351,6 +392,7 @@ void FreeSystem(struct System *s) {
 #ifdef HAVE_JIT
   DestroyJit(&s->jit);
 #endif
+  free(s->groups);
   free(s);
 }
 
@@ -701,6 +743,9 @@ static void RemoveVirtual(struct System *s, i64 virt, i64 size,
           if (pt & PAGE_LOCKS) {
             WaitForPageToNotBeLocked(s, virt, pp);
           } else if (CasPte(pp, pt, 0)) {
+#ifdef __EMSCRIPTEN__
+            if (g_machine && g_machine->insyscall) DebugHistoryMarkIrreversible();
+#endif
             break;
           }
           pt = LoadPte(pp);
@@ -988,6 +1033,9 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
             unassert(pt & PAGE_V);
             WaitForPageToNotBeLocked(s, virt, mi);
           } else if (CasPte(mi, pt, entry)) {
+#ifdef __EMSCRIPTEN__
+            if (g_machine && g_machine->insyscall) DebugHistoryMarkIrreversible();
+#endif
             break;
           }
         }
@@ -1210,7 +1258,13 @@ int ProtectVirtual(struct System *s, i64 virt, i64 size, int prot,
         if (!hostonly) {
           for (;;) {
             pt2 = (pt & ~(PAGE_U | PAGE_RW | PAGE_XD)) | key;
-            if (CasPte(mi, pt, pt2)) break;
+            if (CasPte(mi, pt, pt2)) {
+#ifdef __EMSCRIPTEN__
+              if (pt != pt2 && g_machine && g_machine->insyscall)
+                DebugHistoryMarkIrreversible();
+#endif
+              break;
+            }
             pt = LoadPte(mi);
             if (!(pt & PAGE_V)) {
               goto MemoryDisappeared;

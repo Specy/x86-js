@@ -17,6 +17,7 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "blink/fds.h"
+#include "blink/browserpipe.h"
 
 #include <fcntl.h>
 #include <limits.h>
@@ -63,6 +64,9 @@ struct Fd *ForkFd(struct Fds *fds, struct Fd *fd, int fildes, int oflags) {
   struct Fd *fd2;
   if ((fd2 = AddFd(fds, fildes, oflags))) {
     if (fd) {
+      // a copy is the same file: a terminal's stays the terminal
+      fd2->cb = fd->cb;
+      if (fd->cb == &kFdCbBrowserPipe) BrowserPipeDup(fd->fildes, fildes);
       fd2->path = fd->path ? strdup(fd->path) : 0;
       fd2->socktype = fd->socktype;
       fd2->norestart = fd->norestart;

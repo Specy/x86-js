@@ -50,6 +50,7 @@
 #define kMachineSimdException        -9
 #define kMachineExitTrap             -10
 #define kMachineFatalSystemSignal    -11
+#define kMachineWaitTrap             -14
 #define kMachineFakeTTYtrap          -12
 #define kMachineSingleStep           -13
 
@@ -278,6 +279,7 @@ struct System {
   u64 cr3;
   u64 cr4;
   i64 brk;
+  i64 brkstart;
   i64 automap;
   i64 memchurn;
   i64 codestart;
@@ -296,6 +298,17 @@ struct System {
   struct sigaction_linux hands[64];
   u64 blinksigs;  // signals blink itself handles
   struct rlimit_linux rlim[RLIM_NLIMITS_LINUX];
+  // the process's credentials, on a host that keeps none (see syscall.c):
+  // the real, effective and saved user and group ids, and the groups
+  u32 uid[3];
+  u32 gid[3];
+  u32 ngroups;
+  u32 *groups;
+  // what prctl() sets
+  char comm[16];
+  u8 pdeathsig;
+  bool undumpable;
+  bool nonewprivs;
 #ifdef HAVE_THREADS
   pthread_cond_t machines_cond;
   pthread_mutex_t machines_lock;
@@ -427,6 +440,7 @@ struct Machine {               //
   struct PageLocks pagelocks;            // track page table entry locks
   struct JitPath path;                   // under construction jit route
   _Atomicish(u64) signals;               // [attention] pending delivery
+  int signal_codes[64];                  // Linux si_code for pending signals
   _Atomicish(u64) sigmask;               // signals that've been blocked
   i64 bofram[2];                         // helps debug bootloading code
   i64 faultaddr;                         // used for tui error reporting
