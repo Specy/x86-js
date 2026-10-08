@@ -525,9 +525,20 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
 
     getUndoHistory(max: number): ExecutionStep[] {
+        return this.getUndoHistoryRange(0, max)
+    }
+
+    /** Whether every entry in a history window is reversible, without decoding its rows. */
+    canUndoHistoryRange(skip: number, count: number): boolean {
+        return this.history.canUndoRange(skip, count)
+    }
+
+    /** The requested window, newest first, without decoding the skipped entries. */
+    getUndoHistoryRange(skip: number, max: number): ExecutionStep[] {
+        const start = Math.max(0, Math.floor(skip))
         const count = Math.max(0, Math.floor(max))
-        if (count === 0) return []
-        return this.history.newestFirst(count)
+        if (!Number.isFinite(start) || Number.isNaN(count) || count === 0) return []
+        return this.history.range(start, count)
     }
 
     getPc(): bigint {

@@ -153,9 +153,16 @@ export class NativeHistory {
     canUndoSteps(count: number): boolean {
         if (!Number.isSafeInteger(count) || count < 0)
             throw new RangeError('Invalid Undo step count')
+        return this.canUndoRange(0, count)
+    }
+
+    /** Inspect only reversibility headers in a requested window, without decoding mutations. */
+    canUndoRange(skip: number, count: number): boolean {
+        if (!Number.isSafeInteger(skip) || skip < 0 || !Number.isSafeInteger(count) || count < 0)
+            throw new RangeError('Invalid Undo history range')
         if (count === 0) return true
-        if (count > this.depth()) return false
-        for (let offset = 0; offset < count; offset++) {
+        if (count > this.depth() - skip) return false
+        for (let offset = skip; offset < skip + count; offset++) {
             const pointer = this.runtime.module._blinkenlib_history_entry!(offset)
             if (!pointer || !this.view(pointer, 24).getUint32(20, true)) return false
         }
@@ -219,14 +226,19 @@ export class NativeHistory {
     }
 
     newestFirst(max: number): ExecutionStep[] {
-        const count = Math.min(max, this.depth())
+        return this.range(0, max)
+    }
+
+    /** Decode only the requested rows; skipped packets are never transferred or decoded. */
+    range(skip: number, max: number): ExecutionStep[] {
+        const count = Math.min(max, Math.max(0, this.depth() - skip))
         const nextCache = new Map<
             bigint,
             { length: number; undoable: boolean; step: ExecutionStep }
         >()
         const steps: ExecutionStep[] = []
         for (let index = 0; index < count; index++) {
-            const pointer = this.runtime.module._blinkenlib_history_entry!(index)
+            const pointer = this.runtime.module._blinkenlib_history_entry!(skip + index)
             const header = this.view(pointer, 88)
             const serial = header.getBigUint64(8, true)
             const length = header.getUint32(4, true)

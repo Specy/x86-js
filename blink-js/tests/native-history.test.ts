@@ -14,6 +14,42 @@ async function build(source: string, capacity = 100): Promise<X86Emulator> {
 const PREFIX = 'bits 64\nglobal _start\nsection .text\n_start:\n'
 
 describe('native undo recording', () => {
+    it('decodes only a requested history window, including across Undo serial gaps', async () => {
+        const emulator = await build(PREFIX + 'inc rbx\njmp _start\n', 1000)
+        try {
+            await emulator.run(300)
+            emulator.getUndoHistory(2)
+            const history = (
+                emulator as unknown as {
+                    history: { decode(pointer: number, length: number): ExecutionStep }
+                }
+            ).history
+            const decode = vi.spyOn(history, 'decode')
+            const rows = emulator.getUndoHistoryRange(200, 3)
+            expect(rows).toHaveLength(3)
+            expect(decode).toHaveBeenCalledTimes(3)
+            expect(emulator.canUndoHistoryRange(200, 3)).toBe(true)
+            expect(emulator.canUndoHistoryRange(299, 2)).toBe(false)
+            expect(decode).toHaveBeenCalledTimes(3)
+            decode.mockRestore()
+            expect(rows).toEqual(emulator.getUndoHistory(203).slice(200))
+            emulator.undo()
+            emulator.undo()
+            await emulator.run(3)
+            expect(emulator.getUndoHistoryRange(200, 3)).toEqual(
+                emulator.getUndoHistory(203).slice(200)
+            )
+            expect(emulator.getUndoHistoryRange(1000, 3)).toEqual([])
+            expect(emulator.getUndoHistoryRange(200, 0)).toEqual([])
+            emulator.setUndoEnabled(false)
+            expect(emulator.getUndoHistoryRange(0, 3)).toEqual([])
+            emulator.setUndoEnabled(true)
+            await emulator.run(2)
+            expect(emulator.getUndoHistoryRange(1, 3)).toHaveLength(1)
+        } finally {
+            emulator.dispose()
+        }
+    })
     it('records the same history, CPU, FPU, memory and calls in batches as step by step, through undo', async () => {
         const source =
             PREFIX +
