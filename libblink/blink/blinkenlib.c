@@ -97,6 +97,8 @@ char progname_string[PROGNAME_MAX_LINE_LEN] = {0};
 
 struct clstruct cls;
 struct System *s;
+u64 memory_stack_top;
+static u64 memory_sp_before;
 struct Machine *m;
 static struct Dis dis[1];
 bool single_stepping = false;
@@ -499,7 +501,11 @@ void runLoop() {
 
       if (!active_identity) active_identity = blinkenlib_next_identity();
       BeginRecordedStep(GetControlFlowKind());
+      memory_sp_before = Read64(m->sp);
       ExecuteInstruction(m);
+      u64 current_sp = Read64(m->sp);
+      u64 distance = current_sp > memory_sp_before ? current_sp - memory_sp_before : memory_sp_before - current_sp;
+      if (distance > 4096 || current_sp > memory_stack_top) memory_stack_top = current_sp;
       FinishRecordedStep(s->exited);
       FinishExecution();
       // Host callbacks return EIO through the syscall stack. Stop only after its cleanup and
@@ -606,6 +612,7 @@ void OnSymbols(struct System *s) {
 }
 
 void PostLoadSetup() {
+  memory_stack_top = Read64(m->sp);
   AddTerminalFds(&m->system->fds);
   if (debugger_enabled) {
     // initialize the disassembler
@@ -822,6 +829,13 @@ EMSCRIPTEN_KEEPALIVE
 u64 blinkenlib_get_pc() {
   return m ? GetPc(m) : 0;
 }
+
+EMSCRIPTEN_KEEPALIVE
+u64 blinkenlib_get_brk() { return m ? m->system->brk : 0; }
+EMSCRIPTEN_KEEPALIVE
+u64 blinkenlib_get_brk_start() { return m ? (m->system->brkstart ? m->system->brkstart : m->system->brk) : 0; }
+EMSCRIPTEN_KEEPALIVE
+u64 blinkenlib_get_stack_top() { return m ? memory_stack_top : 0; }
 
 u64 blinkenlib_get_sp() {
   return m ? Read64(m->sp) : 0;

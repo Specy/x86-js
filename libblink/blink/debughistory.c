@@ -22,6 +22,7 @@
 #include <string.h>
 
 extern struct Machine *m;
+extern u64 memory_stack_top;
 
 struct Frame {
   struct Frame *previous;
@@ -34,10 +35,12 @@ struct Entry {
   struct Frame *stack_before;
   bool exited;
   u64 instructions_before;
+  u64 stack_top_before;
 };
 struct Snapshot {
   u64 registers[17], pc;
   u64 instructions;
+  u64 stack_top;
   u32 flags, flow, size;
   u8 fpu[BLINKENLIB_FPU_STATE_SIZE];
 };
@@ -156,6 +159,7 @@ const u8 *blinkenlib_history_entry(u32 offset) {
 void DebugHistoryBegin(u32 flow, u32 size) {
   if (!capacity || pending || poke || !m) return;
   Snapshot(&before);
+  before.stack_top = memory_stack_top;
   before.flow = flow;
   before.size = size;
   pending_irreversible = false;
@@ -236,6 +240,7 @@ static struct Entry *NewEntry(u32 bytes) {
   if (room != e->allocated) Reallocate(e, room);
   held += room;
   e->stack_before = Retain(stack);
+  e->stack_top_before = before.stack_top;
   ++count;
   return e;
 }
@@ -387,6 +392,7 @@ int blinkenlib_history_undo(void) {
     m->system->exited = false;
     m->system->exitcode = 0;
   }
+  memory_stack_top = e->stack_top_before;
   Release(stack);
   stack = Retain(e->stack_before);
   blinkenlib_restore_instruction_count(e->instructions_before);
@@ -415,6 +421,7 @@ bool blinkenlib_history_begin_poke(void) {
   /* A host edit while waiting for input precedes the eventual read. */
   pending = false;
   Snapshot(&before);
+  before.stack_top = memory_stack_top;
   before.flow = before.size = 0;
   poke = true;
   poke_count = 0;

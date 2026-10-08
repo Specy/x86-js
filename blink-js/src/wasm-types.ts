@@ -146,6 +146,9 @@ export type BlinkenlibModule = {
     blinkHostNow?: (clock: number) => number
     blinkHostRandom?: (pointer: number, length: number) => void
     blinkHostError?: unknown
+    _blinkenlib_get_brk(): bigint
+    _blinkenlib_get_brk_start(): bigint
+    _blinkenlib_get_stack_top(): bigint
     _blinkenlib_instructions_executed(): bigint
     _blinkenlib_active_instruction(): bigint
     _blinkenlib_wait_pending(): boolean

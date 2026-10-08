@@ -72,6 +72,8 @@ export class NameMap {
     }
 
     /** Whether any name emitted so far is `$`-escaped, which the header must allow for. */
+    entries(): [string, string][] { return [...this.spelled] }
+
     get escapes(): boolean {
         return this.escapedAny
     }

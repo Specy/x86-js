@@ -322,6 +322,10 @@ export function emit(analysis: Analysis, resolution: Resolution): { lines: Trans
         header.push(`extern ${externNames[index]}${extern.weak ? ':weak' : ''}`),
     )
 
+    for (const [original, spelling] of names.entries()) {
+        const assembled = spelling.replace(/^\$/, '')
+        if (assembled !== original) header.push(`; compiler-symbol ${assembled} ${original}`)
+    }
     const lines: TranslatedLine[] = [
         ...header.map((text) => ({ text: `${INDENT}${text}`, inputLine: null, synthesized: true, location: null })),
         ...body,

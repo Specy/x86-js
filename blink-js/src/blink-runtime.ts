@@ -1,3 +1,4 @@
+import { readMemoryLayout, type X86MemoryLayout } from './memory-layout'
 import blinkenlib from './wasm/blinkenlib.js'
 import initBlinkWasm from './wasm/blinkenlib.wasm?init'
 import {
@@ -324,6 +325,7 @@ export class BlinkRuntime {
         validateX86Project(project)
         this.detachProjectFileSystem()
         const sourceProject = copyX86Project(project)
+        this.layoutUnits = []
         this.sourceProject = sourceProject
         // The build starts from the file system every program does, so nothing an earlier run
         // left behind can stand in for a File, an object or a tool; it replaces the program, and
@@ -367,6 +369,19 @@ export class BlinkRuntime {
         if (this.state === BlinkState.ProgramLoaded) this.sourceMap = this.tryReadSourceMap()
         return toCompileResult(diagnostics, this.assemblerLogs)
     }
+
+    private layoutUnits: { path: string; object: Uint8Array }[] = []
+    getMemoryLayout(): X86MemoryLayout {
+        return this.programBytes ? readMemoryLayout(this.programBytes, this.layoutUnits, this.sourceProject) : { sections: [], items: [], symbols: [] }
+    }
+    resolveMemoryLabel(name: string): bigint | undefined {
+        const data = this.getMemoryLayout().symbols.find(symbol => symbol.name === name)
+        if (data) return data.address
+        return this.programBytes ? readElfSymbolTable(this.programBytes).symbols.find(symbol => symbol.name === name && symbol.sectionIndex !== 0)?.value : undefined
+    }
+    getHeapBreak(): bigint { return this.module._blinkenlib_get_brk() }
+    getHeapStart(): bigint { return this.module._blinkenlib_get_brk_start() }
+    getStackTop(): bigint { return this.module._blinkenlib_get_stack_top() }
 
     /**
      * The objects this build's assembler wrote, for the checks that read them
@@ -504,6 +519,7 @@ export class BlinkRuntime {
             return
         }
 
+        this.layoutUnits = assembled.units
         this.assembledObjects = assembled.units.map((unit) => unit.object)
         if (!options.link) {
             this.setState(BlinkState.Ready)

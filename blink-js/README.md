@@ -509,3 +509,24 @@ _start:
 ```
 
 `ld` defines `__init_array_start` and `__init_array_end` even when no unit has a constructor, and the loop then runs none. `main` gets no arguments, which suits `int main(void)`. Linux starts a program with `rsp` 16-byte aligned, and because `_start` pushes nothing, every call it makes enters its callee 8 bytes below a 16-byte boundary, as the System V ABI requires. Keep it that way if you change it: GCC's SSE code relies on that alignment, and Blink, unlike a real processor, does not fault on a misaligned `movaps`, so a misaligned start can run here and crash natively.
+
+## Memory layout and bounds
+
+`getMemoryLayout()` returns `{ sections, items, symbols }` from the linked ELF.
+`items` is a flat `bigint[]`, with five fields per allocated non-empty section:
+address, byte length, kind (`0` executable code, `1` data, `2` NOBITS reserved),
+index into `sections`, and alignment. Unwind metadata, notes and GOT sections are
+omitted. Executable sections remain code even when they contain inline data.
+
+Data symbols carry `{ name, address, section, fromLibrary, file? }`. Ownership
+comes from the defining object, including local symbols and the startup units.
+Compiler-symbol comments emitted by the Intel-to-NASM translator preserve names
+such as `.LC0`, including in included Generated assembly. They are metadata only
+and do not affect NASM output. `resolveMemoryLabel(name)` resolves a data or code
+name to its address, or returns `undefined` when no definition is present.
+
+`getHeapStart()`, `getHeapBreak()` and `getStackTop()` return `bigint`. The heap
+uses Linux `brk`. The stack top begins at the initialized RSP; an instruction moving
+RSP by more than 4096 bytes starts a new stack, and raising RSP above its top raises
+the top. Native history restores the previous top on Undo. Linux `brk` retains its
+existing irreversible-history boundary.

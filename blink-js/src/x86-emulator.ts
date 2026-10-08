@@ -211,6 +211,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.lastCompileResult
     }
 
+    resolveMemoryLabel(name: string) { return this.runtime.resolveMemoryLabel(name) }
+    getMemoryLayout() { return this.runtime.getMemoryLayout() }
+    getHeapStart(): bigint { return this.runtime.getHeapStart() }
+    getHeapBreak(): bigint { return this.runtime.getHeapBreak() }
+    getStackTop(): bigint { return this.runtime.getStackTop() }
+
     loadElf(data: ArrayBuffer | Uint8Array): void {
         this.clearExecutionTrace()
         this.runtime.loadElf(data)
