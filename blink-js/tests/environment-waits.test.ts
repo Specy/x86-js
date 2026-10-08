@@ -406,12 +406,12 @@ describe('sources and execution accounting', () => {
             const after = emulator.getInstructionsExecuted()
             if (capacity) {
                 emulator.undo()
-                expect(emulator.getInstructionsExecuted()).toBe(after)
+                expect(emulator.getInstructionsExecuted()).toBe(after - 1n)
             }
             emulator.dispose()
         }
     )
-    it('keeps count through Pokes/Undo/reset and allocates new identities after replay', async () => {
+    it('rewinds guest count with Undo and allocates new identities after replay', async () => {
         const emulator = await make(['mov r12,1', 'mov r12,2', 'sys 60,0'])
         emulator.initialize(20)
         const before = emulator.getInstructionsExecuted()
@@ -425,12 +425,12 @@ describe('sources and execution accounting', () => {
         emulator.undo()
         emulator.undo()
         await emulator.step()
-        expect(emulator.getInstructionsExecuted() - before).toBe(2n)
+        expect(emulator.getInstructionsExecuted() - before).toBe(1n)
         expect(BigInt(emulator.getUndoHistory(1)[0].serial)).toBeGreaterThan(BigInt(serial))
         emulator.initialize(0)
-        expect(emulator.getInstructionsExecuted() - before).toBe(2n)
+        expect(emulator.getInstructionsExecuted() - before).toBe(1n)
         await emulator.step()
-        expect(emulator.getInstructionsExecuted() - before).toBe(3n)
+        expect(emulator.getInstructionsExecuted() - before).toBe(2n)
         emulator.dispose()
     })
     it('does not count a faulting instruction as retired', async () => {

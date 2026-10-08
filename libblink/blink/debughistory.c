@@ -33,9 +33,11 @@ struct Entry {
   u32 allocated;
   struct Frame *stack_before;
   bool exited;
+  u64 instructions_before;
 };
 struct Snapshot {
   u64 registers[17], pc;
+  u64 instructions;
   u32 flags, flow, size;
   u8 fpu[BLINKENLIB_FPU_STATE_SIZE];
 };
@@ -69,6 +71,7 @@ static void Snapshot(struct Snapshot *out) {
   for (int i = 0; i < 17; ++i)
     out->registers[i] = blinkenlib_get_register_u64(i);
   out->pc = blinkenlib_get_pc();
+  out->instructions = blinkenlib_instructions_executed();
   out->flags = blinkenlib_get_flags();
   blinkenlib_get_fpu_state(out->fpu);
 }
@@ -257,6 +260,7 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
   }
   if (!capacity) return;
   struct Entry *e = NewEntry(bytes);
+  e->instructions_before = before.instructions;
   e->exited = exited;
   u8 *p = e->bytes;
   memset(p, 0, 88);
@@ -385,6 +389,7 @@ int blinkenlib_history_undo(void) {
   }
   Release(stack);
   stack = Retain(e->stack_before);
+  blinkenlib_restore_instruction_count(e->instructions_before);
   held -= e->allocated; /* the newest entry is never hollow: it was reversible */
   Empty(e);
   --count;

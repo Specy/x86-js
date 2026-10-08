@@ -86,7 +86,7 @@ describe('translation units', () => {
         ),
         'main.asm': main,
       },
-      library: { '@runtime/x86-start.asm': start },
+      startUnits: { '@runtime/x86-start.asm': start },
     })
 
     expect(result.ok).toBe(false)

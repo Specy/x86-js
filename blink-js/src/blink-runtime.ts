@@ -16,7 +16,7 @@ import {
     X86_PROJECT_ROOT,
     x86ProjectSourcePath
 } from './project'
-import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols } from './elf-symbols'
+import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols, readElfSymbolTable } from './elf-symbols'
 import { captureFileSystemSkeleton, resetFileSystem, type FileSystemSkeleton } from './file-system'
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
 import {
@@ -60,7 +60,7 @@ const ENTRY_OBJECT = '/program.o'
 /** Every other unit's object, as a member `ld` takes only when the program needs it. */
 const UNIT_ARCHIVE = '/program.a'
 /** How `ld` names an archive member in its messages, `/program.a(u3.o)`, with the member's position. */
-const ARCHIVE_MEMBER = /^\/program\.a\(u(\d+)\.o\)$/
+const ARCHIVE_MEMBER = /^\/(?:program|support)\.a\(u(\d+)\.o\)$/
 
 /** The name of the archive's member at `position`: short enough to need no long-name table. */
 function archiveMemberName(position: number): string {
@@ -174,6 +174,8 @@ export class BlinkRuntime {
     private assembledObjects: Uint8Array[] = []
     /** The path of the unit each member of the archive was assembled from, in member order. */
     private archiveMembers: string[] = []
+    private startObjectSources = new Map<string, string>()
+    private unitDiagnostics: X86CompilationDiagnostic[] = []
     /** What the linker said, kept apart from the assembler's log so `ld`'s own parser reads it. */
     private linkerLogs: string | null = null
 
@@ -303,6 +305,7 @@ export class BlinkRuntime {
         const report = assembled.stdout + assembled.stderr
         const diagnostics = [
             ...this.parseAssemblerDiagnostics(report, sourceProject),
+            ...duplicateUserDefinitions(assembled.units, sourceProject),
             ...this.entryPointDiagnostics(
                 assembled.units.map((unit) => unit.object),
                 sourceProject
@@ -334,6 +337,8 @@ export class BlinkRuntime {
         this.assemblerDiagnostics = []
         this.assembledObjects = []
         this.archiveMembers = []
+        this.startObjectSources.clear()
+        this.unitDiagnostics = []
         this.linkerLogs = null
         this.sourceMap = null
         this.assembleOnly = !options.link
@@ -354,6 +359,7 @@ export class BlinkRuntime {
                 ...diagnostic,
                 file: x86ProjectSourcePath(diagnostic.file, sourceProject)
             })),
+            ...this.unitDiagnostics,
             ...this.entryPointDiagnostics(this.takeAssembledObjects(), sourceProject),
             ...this.linkDiagnostics(sourceProject)
         ]
@@ -415,6 +421,7 @@ export class BlinkRuntime {
      */
     private objectSource(object: string): string | undefined {
         if (object === ENTRY_OBJECT) return '/assembly.s'
+        if (this.startObjectSources.has(object)) return this.startObjectSources.get(object)
         const member = ARCHIVE_MEMBER.exec(object)
         const path = member ? this.archiveMembers[Number(member[1])] : undefined
         return path === undefined ? undefined : `${X86_PROJECT_ROOT}/${path}`
@@ -503,32 +510,45 @@ export class BlinkRuntime {
             return
         }
 
-        // Linked the way a C toolchain links a program's objects with a static library: the Entry's
-        // unit as an object, and every other unit as a member of an archive, which `ld` takes a
-        // member from only for a symbol still undefined - the entry symbol among them, undefined
-        // from the start. A unit nothing needs is then left out of the program instead of clashing
-        // with it, as a second `_start` would. The library's units lead the archive, which makes
-        // them the ones taken for a symbol a Project unit defines too. Members are named by
-        // position, so the linker command never has to carry a Project path.
-        const [entry, ...members] = assembled.units
+        const [entry, ...others] = assembled.units
+        this.unitDiagnostics = duplicateUserDefinitions(assembled.units, sourceProject)
+        if (this.unitDiagnostics.length) { this.setState(BlinkState.Ready); return }
         this.writeExecutableSync(ENTRY_OBJECT, entry!.object)
         const inputs = [ENTRY_OBJECT]
-        if (members.length) {
-            const archive = writeArchive(
-                members.map((unit, position) => ({
-                    name: archiveMemberName(position),
-                    data: unit.object
-                }))
-            )
-            this.writeExecutableSync(UNIT_ARCHIVE, archive)
-            inputs.push(UNIT_ARCHIVE)
+        const starts = others.filter(unit => Object.hasOwn(sourceProject.startUnits ?? {}, unit.path))
+        for (const [i, unit] of starts.entries()) {
+            const object = `/start${i}.o`
+            this.writeExecutableSync(object, unit.object)
+            this.startObjectSources.set(object, `${X86_PROJECT_ROOT}/${unit.path}`)
+            inputs.push(object)
         }
-        this.archiveMembers = members.map((unit) => unit.path)
-
+        const members = others.filter(unit => !Object.hasOwn(sourceProject.startUnits ?? {}, unit.path))
+        this.archiveMembers = members.map(unit => unit.path)
+        const userMembers = members.filter(unit => Object.hasOwn(sourceProject.files, unit.path))
+        const support = members.filter(unit => Object.hasOwn(sourceProject.library ?? {}, unit.path))
+        for (const [archivePath, units] of [[UNIT_ARCHIVE, userMembers], ['/support.a', support]] as const) {
+            if (!units.length) continue
+            this.writeExecutableSync(archivePath, writeArchive(units.map(unit => ({
+                name: archiveMemberName(members.indexOf(unit)), data: unit.object
+            }))))
+            inputs.push(archivePath)
+        }
+        // A support member may reference a secondary user definition. Re-search archives for it.
         this.beginLinking()
         await defer()
-        this.runTool('/linker', this.mode.binaries.linker?.link(inputs) ?? '')
-        await this.waitForState((state) => state !== BlinkState.Linking)
+        this.runTool('/linker', this.mode.binaries.linker?.link(inputs).replace(
+            inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) + ' -Map /program.map')
+        await this.waitForState(state => state !== BlinkState.Linking)
+        if (this.state === BlinkState.ProgramLoaded) {
+            const map = this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string
+            for (const unit of userMembers) {
+                const member = archiveMemberName(members.indexOf(unit))
+                if (!map.includes(`${UNIT_ARCHIVE}(${member})`)) this.unitDiagnostics.push({
+                    file: unit.path, line: 1, severity: 'hint', warningClass: 'not-linked',
+                    error: 'nothing refers to a symbol this File defines, so it is not part of the program'
+                })
+            }
+        }
     }
 
     /**
@@ -661,6 +681,7 @@ export class BlinkRuntime {
         this.environment = environment
     }
     getInstructionsExecuted(): bigint {
+        if (this.state === BlinkState.ProgramLoaded) return 0n
         return this.module._blinkenlib_instructions_executed()
     }
     getCurrentInstructionSerial(): string | null {
@@ -1526,7 +1547,8 @@ function copyX86Project(project: X86Project): X86Project {
     return {
         entry: project.entry,
         files: copy(project.files),
-        ...(project.library ? { library: copy(project.library) } : {})
+        ...(project.library ? { library: copy(project.library) } : {}),
+        ...(project.startUnits ? { startUnits: copy(project.startUnits) } : {})
     }
 }
 
@@ -1538,4 +1560,20 @@ function hostRandom(length: number): Uint8Array {
     for (let i = 0; i < length; i += 65536)
         crypto.getRandomValues(bytes.subarray(i, Math.min(length, i + 65536)))
     return bytes
+}
+
+function duplicateUserDefinitions(units: readonly { path: string; object: Uint8Array }[], project: X86Project): X86CompilationDiagnostic[] {
+    const definitions = new Map<string, string[]>()
+    for (const unit of units) {
+        if (!Object.hasOwn(project.files, unit.path)) continue
+        for (const symbol of readElfSymbolTable(unit.object).symbols) {
+            if (symbol.binding !== 'global' || symbol.sectionIndex === 0 || !symbol.name) continue
+            const paths = definitions.get(symbol.name) ?? []
+            paths.push(unit.path)
+            definitions.set(symbol.name, paths)
+        }
+    }
+    return [...definitions].flatMap(([name, files]) => files.length < 2 ? [] : files.map(file => ({
+        file, line: 1, severity: 'error' as const, error: `multiple definition of '${name}'`
+    })))
 }

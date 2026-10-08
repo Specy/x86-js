@@ -121,6 +121,7 @@ static bool active_step = false;
 static u64 instructions_executed, identity_allocator, active_identity;
 EMSCRIPTEN_KEEPALIVE
 u64 blinkenlib_instructions_executed(void) { return instructions_executed; }
+void blinkenlib_restore_instruction_count(u64 count) { instructions_executed = count; }
 EMSCRIPTEN_KEEPALIVE
 u64 blinkenlib_active_instruction(void) { return active_identity; }
 u64 blinkenlib_next_identity(void) { return ++identity_allocator; }
@@ -680,6 +681,7 @@ void setupProgram(bool withdebugger) {
   OpenTerminalHostFds();
   char *bios = 0;
   LoadProgram(m, progname_string, progname_string, args, &vars, bios);
+  instructions_executed = 0;
   PostLoadSetup();
   m->recordwrites = withdebugger && step_recording_enabled;
   ClearStepMemoryWrites();

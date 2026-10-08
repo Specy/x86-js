@@ -3,7 +3,7 @@ export type StatusRegister = {
     value: number
     prev: number
 }
-export type DiagnosticSeverity = 'error' | 'warning'
+export type DiagnosticSeverity = 'error' | 'warning' | 'hint'
 
 export type MonacoError = {
     /** Project-relative source path when checking a virtual Project. */

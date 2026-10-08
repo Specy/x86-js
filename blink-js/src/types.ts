@@ -117,6 +117,9 @@ export type X86Project = {
      * Entry, and the Project's Files cannot `%include` it. It goes into the archive ahead of the
      * Project's other units, so `ld` takes it first for a symbol both define.
      */
+    /** Start objects are always linked, before the user archive. */
+    startUnits?: Readonly<Record<string, X86ProjectFile>>
+    /** Support archive, searched after all user units. */
     library?: Readonly<Record<string, X86ProjectFile>>
 }
 

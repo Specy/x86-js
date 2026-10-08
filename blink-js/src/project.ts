@@ -19,10 +19,13 @@ export function validateX86Project(project: X86Project): void {
             throw new Error(`Invalid x86 Project file contents: ${path}`)
         }
     }
+    for (const path of Object.keys(project.startUnits ?? {})) {
+        if (Object.hasOwn(project.library ?? {}, path)) throw new Error(`Duplicate start/library path: ${path}`)
+    }
     // A library unit is staged beside the Project's Files and named by its path wherever theirs
     // are, so a path that is also a File's, or a directory of one, would leave every mention of
     // it meaning two things - and the two could not both be written to the filesystem.
-    for (const [path, contents] of Object.entries(project.library ?? {})) {
+    for (const [path, contents] of Object.entries({ ...project.library, ...project.startUnits })) {
         if (!isProjectPath(path)) throw new Error(`Invalid x86 Project library path: ${path}`)
         if (typeof contents !== 'string' && !(contents instanceof Uint8Array)) {
             throw new Error(`Invalid x86 Project library contents: ${path}`)
@@ -87,12 +90,12 @@ export function selectX86Source(fs: EmscriptenFS, project: X86Project, path: str
  */
 export function x86ProjectSourcePath(
     sourcePath: string | undefined,
-    project: Pick<X86Project, 'entry' | 'files' | 'library'>,
+    project: Pick<X86Project, 'entry' | 'files' | 'library' | 'startUnits'>,
 ): string {
     if (!sourcePath || sourcePath === '/assembly.s' || sourcePath === 'assembly.s') return project.entry
 
     const isKnown = (path: string) =>
-        path in project.files || (project.library !== undefined && path in project.library)
+        path in project.files || (project.library !== undefined && path in project.library) || (project.startUnits !== undefined && path in project.startUnits)
     // A path under the Project root is the one a unit was assembled from, written out in full, so
     // it names its File exactly, wherever the Entry is.
     const underRoot = sourcePath.startsWith(`${X86_PROJECT_ROOT}/`)
@@ -107,7 +110,7 @@ export function x86ProjectSourcePath(
     if (relativeToRoot && isKnown(relativeToRoot)) return relativeToRoot
 
     const suffix = `/${withoutLeadingSlash}`
-    const suffixMatches = [...Object.keys(project.files), ...Object.keys(project.library ?? {})].filter(
+    const suffixMatches = [...Object.keys(project.files), ...Object.keys(project.library ?? {}), ...Object.keys(project.startUnits ?? {})].filter(
         (path) => path === withoutLeadingSlash || path.endsWith(suffix),
     )
     return suffixMatches.length === 1 ? suffixMatches[0]! : project.entry

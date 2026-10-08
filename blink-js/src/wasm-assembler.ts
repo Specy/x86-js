@@ -112,7 +112,7 @@ async function scanIncludedFiles(project: X86Project, candidates: readonly strin
  * from `%include`ing it.
  */
 function withLibraryUnit(project: X86Project, path: string): X86Project {
-    return { entry: project.entry, files: { ...project.files, [path]: project.library![path]! } }
+    return { entry: project.entry, files: { ...project.files, [path]: (project.startUnits?.[path] ?? project.library?.[path])! } }
 }
 
 export const nasmWasmAssembler: WasmAssembler = {
@@ -120,7 +120,7 @@ export const nasmWasmAssembler: WasmAssembler = {
         const candidates = x86TranslationUnitCandidates(project)
         const included = await scanIncludedFiles(project, candidates)
         const [entry, ...others] = candidates.filter((path) => path === project.entry || !included.has(path))
-        const library = new Set(Object.keys(project.library ?? {}))
+        const library = new Set(Object.keys({ ...project.startUnits, ...project.library }))
         const units = [entry!, ...[...library].sort(), ...others]
 
         let stdout = ''

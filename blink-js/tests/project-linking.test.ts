@@ -77,17 +77,13 @@ describe('linking a Project', () => {
         expect(emulator.projectLinking).toBe('archive')
     })
 
-    it("builds the Entry's program when a File nothing needs defines `_start` too", async () => {
-        await build({
-            entry: 'main.asm',
-            files: {
-                'main.asm': ['global _start', 'section .text', '_start:', ...exit(42)].join('\n'),
-                'other.asm': ['global _start', 'section .text', '_start:', ...exit(7)].join('\n'),
-            },
-        })
-
-        expect(await exitCode()).toBe(42)
-        expect(linkedFiles()).toEqual(['main.asm'])
+    it('rejects a second strong _start even in an unused File', async () => {
+        const result = await emulator.compileProject({ entry: 'main.asm', files: {
+            'main.asm': ['global _start', 'section .text', '_start:', ...exit(42)].join('\n'),
+            'other.asm': ['global _start', 'section .text', '_start:', ...exit(7)].join('\n')
+        } })
+        expect(result.ok).toBe(false)
+        expect(result.diagnostics.filter(d => d.error.includes("multiple definition of '_start'")).map(d => d.file)).toEqual(['main.asm', 'other.asm'])
     })
 
     it('assembles a File nothing needs, and reports its mistakes, but leaves it out of the program', async () => {
@@ -180,7 +176,7 @@ describe('linking a Project', () => {
                 'src/main.c.asm': MAIN,
                 'main.asm': ['global _start', 'section .text', '_start:', ...exit(7)].join('\n'),
             },
-            library: { [START_PATH]: START },
+            startUnits: { [START_PATH]: START },
         })
 
         expect(emulator.getNextInstruction()?.file).toBe(START_PATH)
@@ -271,7 +267,7 @@ describe('linking a Project', () => {
                     '    dq count_more',
                 ].join('\n'),
             },
-            library: { [START_PATH]: START },
+            startUnits: { [START_PATH]: START },
         })
 
         expect(await exitCode()).toBe(42)
@@ -375,5 +371,42 @@ describe('a library unit', () => {
 
         expect(emulator.state).toBe(BlinkState.ProgramLoaded)
         expect(await exitCode()).toBe(42)
+    })
+})
+
+describe('reviewed link policy', () => {
+    it('prefers a secondary user memcpy over trailing weak support', async () => {
+        await build({ entry: 'main.asm', files: {
+            'main.asm': ['global _start', 'extern memcpy', 'section .text', '_start:', 'call memcpy', 'mov edi, eax', 'mov eax, 60', 'syscall'].join('\n'),
+            'copy.asm': ['global memcpy', 'section .text', 'memcpy:', 'mov eax, 42', 'ret'].join('\n')
+        }, library: { '@runtime/support.asm': ['global memcpy:weak', 'section .text', 'memcpy:', 'mov eax, 7', 'ret'].join('\n') } })
+        expect(await exitCode()).toBe(42)
+    })
+    it('reports duplicate strong globals on both Files even when neither would be extracted', async () => {
+        const result = await emulator.compileProject({ entry: 'main.asm', files: {
+            'main.asm': ['global _start', 'section .text', '_start:', ...exit(0)].join('\n'),
+            'a.asm': 'global duplicate\nsection .text\nduplicate: ret',
+            'b.asm': 'global duplicate\nsection .text\nduplicate: ret'
+        } })
+        expect(result.ok).toBe(false)
+        expect(result.diagnostics.filter(d => d.error.includes("multiple definition of 'duplicate'")).map(d => d.file)).toEqual(['a.asm', 'b.asm'])
+    })
+    it('allows a weak definition beside a strong definition and hints at an unused File', async () => {
+        const result = await emulator.compileProject({ entry: 'main.asm', files: {
+            'main.asm': ['global _start', 'extern value', 'section .text', '_start:', 'call value', ...exit(0)].join('\n'),
+            'a.asm': 'global value\nsection .text\nvalue: ret',
+            'b.asm': 'global value:weak\nsection .text\nvalue: ret'
+        } })
+        expect(result.ok).toBe(true)
+        expect(result.diagnostics).toContainEqual(expect.objectContaining({ file: 'b.asm', severity: 'hint', warningClass: 'not-linked' }))
+    })
+    it('resets instruction count per program and rewinds it with native Undo', async () => {
+        await build({ entry: 'main.asm', files: { 'main.asm': ['global _start', 'section .text', '_start:', 'nop', 'nop', ...exit(0)].join('\n') } })
+        emulator.initialize(100)
+        expect(emulator.getInstructionsExecuted()).toBe(0n)
+        await emulator.step()
+        expect(emulator.getInstructionsExecuted()).toBe(1n)
+        emulator.undo()
+        expect(emulator.getInstructionsExecuted()).toBe(0n)
     })
 })

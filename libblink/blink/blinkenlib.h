@@ -123,6 +123,7 @@ bool blinkenlib_wait_input(void);
 i64 blinkenlib_wait_deadline(void);
 int blinkenlib_wait_clock(void);
 u64 blinkenlib_instructions_executed(void);
+void blinkenlib_restore_instruction_count(u64);
 u64 blinkenlib_active_instruction(void);
 u64 blinkenlib_next_identity(void);
 void *blinkenlib_get_clstruct();
