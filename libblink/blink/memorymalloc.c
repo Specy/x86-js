@@ -832,6 +832,11 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
   i64 ti, pt, end, pages, level, entry;
   bool executable_code_was_made_non_executable;
   struct ContiguousMemoryRanges ranges;
+#ifdef __EMSCRIPTEN__
+  // Private mappings own their bytes: avoid one 128 KiB host mmap per 4 KiB
+  // guest page, and Emscripten munmap failures past the file end.
+  bool copyfile = fd != -1 && !shared && !HasLinearMapping();
+#endif
 
   // we determine these
   unassert(!(flags & PAGE_TA));
@@ -954,9 +959,18 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
     vss_delta += pages;
     rss_delta += pages;
   } else if (fd != -1 || shared) {
+#ifdef __EMSCRIPTEN__
+    if (copyfile) {
+      vss_delta += pages;
+      s->memstat.committed += pages;
+      flags |= PAGE_HOST;
+    } else
+#endif
+    {
     vss_delta += pages;
     s->memstat.reserved += pages;
     flags |= PAGE_HOST | PAGE_MAP | PAGE_MUG | PAGE_RSRV;
+    }
   } else {
     flags |= PAGE_RSRV;
     vss_delta += pages;
@@ -990,6 +1004,26 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
       }
       for (;;) {
         uintptr_t real;
+#ifdef __EMSCRIPTEN__
+        if (copyfile) {
+          i64 copied = 0;
+          ssize_t received;
+          u64 page = AllocateAnonymousPage(s);
+          if (page == (u64)-1) PanicDueToMmap();
+          real = page & PAGE_TA;
+          memset((void *)real, 0, 4096);
+          while (copied < 4096) {
+            received = pread(fd, (u8 *)real + copied, 4096 - copied,
+                             offset + copied);
+            if (received < 0 && errno == EINTR) continue;
+            if (received < 0) PanicDueToMmap();
+            if (!received) break;
+            copied += received;
+          }
+          offset += 4096;
+          entry = real | flags | PAGE_V;
+        } else
+#endif
         if (flags & PAGE_MAP) {
           if (flags & PAGE_MUG) {
             void *mug;

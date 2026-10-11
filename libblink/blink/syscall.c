@@ -933,6 +933,46 @@ static i32 SysSetRobustList(struct Machine *m, i64 head_addr, u64 len) {
   return 0;
 }
 
+#ifdef __EMSCRIPTEN__
+static i32 SysRseq(struct Machine *m, u64 area, u32 len, u32 flags, u32 sig) {
+  u8 cpu[4] = {0};
+  if (flags & ~1u) return einval();
+  if (flags == 1) {
+    if (area != m->rseq_area || len != m->rseq_size) return einval();
+    if (sig != m->rseq_signature) return eperm();
+    // Linux marks the area unregistered on unregister.
+    Write32(cpu, -1);
+    if (CopyToUserWrite(m, area + 4, cpu, 4) == -1) return -1;
+    m->rseq_area = 0;
+    m->rseq_size = 0;
+    return 0;
+  }
+  if (len < 32 || (area & 31)) return einval();
+  if (m->rseq_area) {
+    if (area != m->rseq_area || len != m->rseq_size) return einval();
+    if (sig != m->rseq_signature) return eperm();
+    errno = EBUSY;
+    return -1;
+  }
+  if (!IsValidMemory(m, area, len, PROT_READ | PROT_WRITE)) return -1;
+  if (CopyToUserWrite(m, area, cpu, 4) == -1 ||
+      CopyToUserWrite(m, area + 4, cpu, 4) == -1) return -1;
+  if (len >= 24 && CopyToUserWrite(m, area + 20, cpu, 4) == -1) return -1;
+  if (len >= 28 && CopyToUserWrite(m, area + 24, cpu, 4) == -1) return -1;
+  m->rseq_area = area;
+  m->rseq_size = len;
+  m->rseq_signature = sig;
+  return 0;
+}
+
+static i32 SysPtrace(struct Machine *m, u64 request, u64 pid, u64 addr, u64 data) {
+  if (request) return esrch();
+  if (m->ptrace_traceme) return eperm();
+  m->ptrace_traceme = true;
+  return 0;
+}
+#endif
+
 // This process is the only one there is, so any other pid names nobody.
 static int ValidateAffinityPid(struct Machine *m, int pid) {
   if (pid && pid != m->tid && pid != m->system->pid) return esrch();
@@ -6453,6 +6493,8 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
     case 0x109: /* linkat */
     case 0x10A: /* symlinkat */
     case 0x10C: /* fchmodat */
+    case 0x065: /* ptrace */
+    case 0x14E: /* rseq */
     case 0x111: /* set_robust_list */
     case 0x118: /* utimensat */
     case 0x124: /* dup3 */
@@ -6669,8 +6711,12 @@ void OpSyscall(P) {
     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
     SYSCALL(2, 0x0C8, "tkill", SysTkill, STRACE_TKILL);
     SYSCALL(3, 0x0EA, "tgkill", SysTgkill, STRACE_3);
+    SYSCALL(2, 0x111, "set_robust_list", SysSetRobustList, STRACE_2);
+    SYSCALL(3, 0x112, "get_robust_list", SysGetRobustList, STRACE_3);
+    SYSCALL(4, 0x14E, "rseq", SysRseq, STRACE_4);
+    SYSCALL(4, 0x065, "ptrace", SysPtrace, STRACE_4);
 #endif
-#ifdef HAVE_THREADS
+#if defined(HAVE_THREADS) || defined(__EMSCRIPTEN__)
     SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
 #endif
 #ifdef __EMSCRIPTEN__

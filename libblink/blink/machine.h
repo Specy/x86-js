@@ -469,6 +469,10 @@ struct Machine {               //
   struct MachineTlb tlb[32];             //
   sigjmp_buf onhalt;                     //
   struct sigaltstack_linux sigaltstack;  //
+  u64 rseq_area;                        // single CPU restartable sequence
+  u32 rseq_size;                        //
+  u32 rseq_signature;                   //
+  bool ptrace_traceme;                  //
   i64 robust_list;                       //
   i64 ctid;                              //
   int tid;                               //

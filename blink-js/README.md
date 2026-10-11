@@ -532,3 +532,8 @@ uses Linux `brk`. The stack top begins at the initialized RSP; an instruction mo
 RSP by more than 4096 bytes starts a new stack, and raising RSP above its top raises
 the top. Native history restores the previous top on Undo. Linux `brk` retains its
 existing irreversible-history boundary.
+
+The Linux process also answers `set_robust_list`, `get_robust_list` and `rseq` for a
+single thread on CPU 0. `ptrace(PTRACE_TRACEME)` succeeds once and then returns
+`EPERM`; other requests return `ESRCH`. The existing `futex` wait/wake handler is
+available, including the uncontended wake used by C++ exception handling.

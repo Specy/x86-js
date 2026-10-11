@@ -1257,6 +1257,7 @@ export class BlinkRuntime {
                 exitCode,
                 kind: 'signal',
                 signal: info,
+                address: this.getPc(),
                 details: `Program terminated with Exit(${exitCode}) due to signal ${info.name}: ${info.description}`
             }
             // what was typed for the run is not for the next one
