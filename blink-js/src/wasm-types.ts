@@ -220,6 +220,7 @@ export type BlinkenlibModule = {
     blinkenlibReadMemoryBytes(address: bigint, length: number): MemoryReadResult
     blinkenlibWriteMemoryBytes(address: bigint, bytes: Uint8Array | number[]): MemoryWriteResult
     blinkenlibGetDisassembly(): DisassemblySnapshot
+    blinkenlibSetProgramArguments(argv: string[], envp: string[]): boolean
     blinkenlibSetEmulationArgs(progname: string, argc: string, argv: string): void
     /** How many bytes the read waiting for input asked for. */
     blinkenlibGetInputMaxBytes(): bigint

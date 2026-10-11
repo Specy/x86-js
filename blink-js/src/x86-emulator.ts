@@ -23,7 +23,9 @@ import {
     type X86ImplementedSyscall,
     type X86Input,
     type X86RegisterName,
-    type X86Project
+    type X86Project,
+    type X86ExecutableInfo,
+    type X86ExecutableOptions
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
@@ -217,8 +219,21 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     getHeapBreak(): bigint { return this.runtime.getHeapBreak() }
     getStackTop(): bigint { return this.runtime.getStackTop() }
 
+    async loadExecutable(data: ArrayBuffer | Uint8Array, options?: X86ExecutableOptions): Promise<X86ExecutableInfo> {
+        const info = await this.runtime.loadExecutable(data, options)
+        this.clearExecutionTrace()
+        this.lastSourceCode = ''
+        this.lastCompileResult = null
+        return info
+    }
+
+    setProgramArguments(argv0: string, args: string[]): void { this.runtime.setProgramArguments(argv0, args) }
+    setProtectedPath(path: string | null): void { this.runtime.setProtectedPath(path) }
+
     loadElf(data: ArrayBuffer | Uint8Array): void {
         this.clearExecutionTrace()
+        this.lastSourceCode = ''
+        this.lastCompileResult = null
         this.runtime.loadElf(data)
     }
 

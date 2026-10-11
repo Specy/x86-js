@@ -94,6 +94,36 @@ char dis_buffer[DIS_MAX_LINES][DIS_MAX_LINE_LEN] = {0};
 char argc_string[ARGC_MAX_LINE_LEN] = {0};
 char argv_string[ARGV_MAX_LINE_LEN] = {0};
 char progname_string[PROGNAME_MAX_LINE_LEN] = {0};
+static bool process_arguments_set;
+static char process_args_bytes[128 * 1024];
+static char process_env_bytes[4096];
+static char *process_args[1026];
+static char *process_env[65];
+
+static bool UnpackArguments(char *dest, u32 capacity, char **words,
+                             u32 maxwords, const char *bytes, u32 length) {
+  if (!length || length > capacity || bytes[length - 1]) return false;
+  memcpy(dest, bytes, length);
+  u32 count = 0;
+  for (u32 i = 0; i < length;) {
+    if (count >= maxwords) return false;
+    words[count++] = dest + i;
+    while (dest[i++]) {}
+  }
+  words[count] = 0;
+  return true;
+}
+
+bool blinkenlib_set_process_arguments(const char *args, u32 argslen,
+                                       const char *env, u32 envlen) {
+  process_arguments_set = false;
+  if (!UnpackArguments(process_args_bytes, sizeof(process_args_bytes),
+                         process_args, 1025, args, argslen)) return false;
+  if (!UnpackArguments(process_env_bytes, sizeof(process_env_bytes),
+                         process_env, 64, env, envlen)) return false;
+  process_arguments_set = true;
+  return true;
+}
 
 struct clstruct cls;
 struct System *s;
@@ -688,14 +718,16 @@ void setupProgram(bool withdebugger) {
 
   // get **argv
   // TODO
-  char *vars = 0;
+  char *emptyvars[] = {0};
+  char **vars = process_arguments_set ? process_env : emptyvars;
 
   // close previous instances
   TearDown();
   SetUp();
   OpenTerminalHostFds();
   char *bios = 0;
-  LoadProgram(m, progname_string, progname_string, args, &vars, bios);
+  LoadProgram(m, progname_string, progname_string,
+               process_arguments_set ? process_args : args, vars, bios);
   instructions_executed = 0;
   PostLoadSetup();
   m->recordwrites = withdebugger && step_recording_enabled;
@@ -1166,6 +1198,7 @@ const char *blinkenlib_get_disassembly_line(u32 index) {
 
 void blinkenlib_set_program_args(const char *progname, const char *argc,
                                  const char *argv) {
+  process_arguments_set = false;
   CopySafeAscii(progname_string, PROGNAME_MAX_LINE_LEN, progname);
   CopySafeAscii(argc_string, ARGC_MAX_LINE_LEN, argc);
   CopySafeAscii(argv_string, ARGV_MAX_LINE_LEN, argv);

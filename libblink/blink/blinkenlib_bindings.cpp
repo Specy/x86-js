@@ -277,6 +277,21 @@ val ResolveSymbol(uint64_t address) {
   return result;
 }
 
+bool SetProgramArguments(val args, val env) {
+  std::string packed_args, packed_env;
+  auto pack = [](val words, std::string &packed) {
+    uint32_t length = words["length"].as<uint32_t>();
+    for (uint32_t i = 0; i < length; ++i) {
+      packed.append(words[i].as<std::string>());
+      packed.push_back('\0');
+    }
+  };
+  pack(args, packed_args);
+  pack(env, packed_env);
+  return blinkenlib_set_process_arguments(
+      packed_args.data(), packed_args.size(), packed_env.data(), packed_env.size());
+}
+
 void SetEmulationArgs(const std::string &progname, const std::string &argc,
                       const std::string &argv) {
   blinkenlib_set_program_args(progname.c_str(), argc.c_str(), argv.c_str());
@@ -332,6 +347,7 @@ EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
   emscripten::function("blinkenlibGetInstructionAt", &GetInstructionAt);
   emscripten::function("blinkenlibResolveSymbol", &ResolveSymbol);
   emscripten::function("blinkenlibSetEmulationArgs", &SetEmulationArgs);
+  emscripten::function("blinkenlibSetProgramArguments", &SetProgramArguments);
   emscripten::function("blinkenlibGetSyscalls", &GetSyscalls);
   emscripten::function("blinkenlibGetInputMaxBytes",
                        &blinkenlib_get_input_max_bytes);

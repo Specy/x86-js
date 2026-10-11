@@ -997,3 +997,18 @@ console.log(
 console.log(
     `ok - translated GCC output through @specy/x86/compiler-output without WebAssembly, built and ran ${fixture ? `ctor-O2 and ${fixture.name}` : 'ctor-O2'} with a start unit, read standard input, and the root exports the ${ROOT_EXPORTS_2_8_0.length} names of 2.8.0 and the ${ROOT_EXPORTS_5_0_0.length} of 5.0.0`
 )
+
+// Bundled Linux assets must resolve from dist too, without the source tree.
+const imported = await createX86Emulator()
+try {
+    const info = await imported.loadExecutable(readFileSync(new URL('./fixtures/elf/cpp', import.meta.url)))
+    assert.deepEqual(info.missing, [])
+    imported.setProgramArguments('./cpp', ['two words', '猫'])
+    imported.initialize(0)
+    let output = ''
+    imported.on('stdout', bytes => { output += new TextDecoder().decode(bytes) })
+    await imported.run(2_000_000)
+    assert.equal(imported.stopReason?.kind, 'exit')
+    assert.equal(output, 'hello\nC++\ncaught exception\n')
+    console.log('ok - loaded a dynamic C++ executable using only dist Linux assets')
+} finally { imported.dispose() }

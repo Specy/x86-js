@@ -205,3 +205,16 @@ export class X86EnvironmentError extends Error {
         this.name = 'X86EnvironmentError'
     }
 }
+
+/** What an executable needs and which libraries could not be bundled. */
+export type X86ExecutableInfo = {
+    pie: boolean
+    interpreter?: string
+    needed: string[]
+    missing: string[]
+}
+export type X86ExecutableOptions = {
+    argv0?: string
+    arguments?: string[]
+    protectedPath?: string | null
+}

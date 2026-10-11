@@ -68,7 +68,9 @@ const ERRNO: Record<string, number> = {
     ENOSPC: 51,
     ENOTDIR: 54,
     ENOTSUP: 138,
-    EPERM: 63
+    EPERM: 63,
+    ETXTBSY: 74,
+    EBUSY: 10
 }
 
 /**
@@ -89,7 +91,8 @@ export class ProjectFileSystemMount {
     constructor(
         private readonly module: BlinkenlibModule,
         private readonly capability: X86ProjectFileSystem,
-        private readonly activeSerial: () => string | null
+        private readonly activeSerial: () => string | null,
+        private readonly protectedPath: () => string | null = () => null
     ) {
         const fs = module.FS
         // Emscripten performs O_CREAT and O_TRUNC ahead of stream.open. Defer both to the
@@ -207,6 +210,11 @@ export class ProjectFileSystemMount {
             throw error
         }
     }
+    private protect(path: string, errno: 'ETXTBSY' | 'EBUSY'): void {
+        const protectedPath = this.protectedPath()
+        if (protectedPath && (path === protectedPath.slice('/project/'.length) ||
+            protectedPath.slice('/project/'.length).startsWith(path + '/'))) this.error(errno)
+    }
     private path(node: ProjectNode, name: string): string {
         return node.projectPath ? `${node.projectPath}/${name}` : name
     }
@@ -300,6 +308,8 @@ export class ProjectFileSystemMount {
         rename: (node: ProjectNode, target: ProjectNode, name: string) => {
             if (node.projectKind === 'directory') this.error('EISDIR')
             const path = this.path(target, name)
+            this.protect(node.projectPath, 'EBUSY')
+            this.protect(path, 'EBUSY')
             this.effect(() => this.capability.rename(node.projectPath, path))
             node.projectPath = path
             node.name = name
@@ -309,6 +319,7 @@ export class ProjectFileSystemMount {
             const node = this.module.FS.lookupPath(
                 `${X86_WORKING_DIRECTORY}/${this.path(parent, name)}`
             ).node as ProjectNode
+            this.protect(node.projectPath, 'EBUSY')
             this.effect(() => this.capability.remove(node.projectPath))
             node.unlinked = true
             this.invalidateMissingAncestors(parent)
@@ -321,6 +332,7 @@ export class ProjectFileSystemMount {
         setattr: (node: ProjectNode, attrs: { size?: number; mode?: number }) => {
             if (attrs.size === undefined && attrs.mode === undefined) this.error('ENOTSUP')
             if (attrs.size !== undefined) {
+                this.protect(node.projectPath, 'ETXTBSY')
                 if (this.opening) {
                     node.pendingTruncate = true
                     this.pendingNodes.add(node)
@@ -352,6 +364,8 @@ export class ProjectFileSystemMount {
                         : (stream.flags & O_ACCMODE) === O_RDWR
                           ? 'read-write'
                           : 'read'
+                if (access !== 'read' || node.pendingTruncate || (stream.flags & 512))
+                    this.protect(node.projectPath, 'ETXTBSY')
                 const fd = this.effect(() =>
                     this.capability.open(node.projectPath, {
                         access,

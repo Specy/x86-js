@@ -215,6 +215,7 @@ u32 blinkenlib_refresh_disassembly();
 u32 blinkenlib_get_disassembly_current_line();
 u32 blinkenlib_get_disassembly_line_count();
 const char *blinkenlib_get_disassembly_line(u32 index);
+bool blinkenlib_set_process_arguments(const char *, u32, const char *, u32);
 void blinkenlib_set_program_args(const char *progname, const char *argc,
                                  const char *argv);
 

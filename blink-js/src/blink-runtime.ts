@@ -10,6 +10,9 @@ import {
 } from './assemblers'
 import { writeArchive } from './archive'
 import { readResourceBytes } from './resources'
+import { analyze } from './elf'
+import { resolveLinuxLibraries, validateProgramArguments, X86_PROGRAM_ENVIRONMENT } from './linux-runtime'
+import type { X86ExecutableInfo, X86ExecutableOptions } from './types'
 import { parseSourceMap, type SourceMap } from './source-map'
 import {
     stageX86Project,
@@ -18,7 +21,7 @@ import {
     x86ProjectSourcePath
 } from './project'
 import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols, readElfSymbolTable } from './elf-symbols'
-import { captureFileSystemSkeleton, resetFileSystem, type FileSystemSkeleton } from './file-system'
+import { captureFileSystemSkeleton, resetFileSystem, X86_WORKING_DIRECTORY, type FileSystemSkeleton } from './file-system'
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
 import {
     BlinkState,
@@ -177,6 +180,9 @@ export class BlinkRuntime {
 
     private readonly defaultArgc = '/program'
     private readonly defaultArgv = ''
+    private programArgv = ['/program']
+    private systemFiles = new Map<string, Uint8Array>()
+    private protectedPath: string | null = null
 
     private constructor(
         module: BlinkenlibModule,
@@ -322,6 +328,8 @@ export class BlinkRuntime {
         this.detachProjectFileSystem()
         const sourceProject = copyX86Project(project)
         this.layoutUnits = []
+        this.systemFiles.clear()
+        this.protectedPath = null
         this.sourceProject = sourceProject
         // The build starts from the file system every program does, so nothing an earlier run
         // left behind can stand in for a File, an object or a tool; it replaces the program, and
@@ -593,6 +601,32 @@ export class BlinkRuntime {
         }))
     }
 
+    async loadExecutable(data: ArrayBuffer | Uint8Array, options: X86ExecutableOptions = {}): Promise<X86ExecutableInfo> {
+        const bytes = data instanceof Uint8Array ? data.slice() : new Uint8Array(data.slice(0))
+        const info = analyze(bytes)
+        if (!info.supported) throw new Error(info.reason)
+        if (options.argv0 !== undefined || options.arguments !== undefined)
+            validateProgramArguments(options.argv0 ?? '/program', options.arguments ?? [])
+        const libraries = await resolveLinuxLibraries(info.needed, info.interpreter)
+        this.loadElf(bytes)
+        this.systemFiles = libraries.files
+        if (options.argv0 !== undefined || options.arguments !== undefined)
+            this.setProgramArguments(options.argv0 ?? '/program', options.arguments ?? [])
+        if (options.protectedPath !== undefined) this.setProtectedPath(options.protectedPath)
+        return { pie: info.pie, interpreter: info.interpreter, needed: info.needed, missing: libraries.missing }
+    }
+
+    setProgramArguments(argv0: string, args: string[]): void {
+        validateProgramArguments(argv0, args)
+        this.programArgv = [argv0, ...args]
+    }
+
+    setProtectedPath(path: string | null): void {
+        if (path !== null && (!path.startsWith('/project/') || path.includes('\0') || path.split('/').some(part => part === '.' || part === '..')))
+            throw new Error('The protected Executable must have an absolute /project path')
+        this.protectedPath = path === null ? null : '/project/' + path.slice('/project/'.length).split('/').filter(Boolean).join('/')
+    }
+
     loadElf(data: ArrayBuffer | Uint8Array): void {
         this.clearWaitTransport()
         ++this.generation
@@ -605,6 +639,9 @@ export class BlinkRuntime {
         this.stopReason = null
         this.sourceMap = null
         this.sourceProject = null
+        this.layoutUnits = []
+        this.systemFiles.clear()
+        this.protectedPath = null
         this.setState(BlinkState.ProgramLoaded)
     }
 
@@ -1123,8 +1160,15 @@ export class BlinkRuntime {
             this.setState(BlinkState.ProgramRunning)
             resetFileSystem(this.module.FS, this.skeleton)
             this.projectMountUsed = this.projectMount !== null
+            for (const [path, bytes] of this.systemFiles) {
+                this.module.FS.mkdirTree(path.slice(0, path.lastIndexOf('/')))
+                this.writeExecutableSync(path, bytes)
+                this.module.FS.chmod(path, 0o755)
+            }
             if (this.programBytes) this.writeExecutableSync(PROGRAM, this.programBytes)
             this.setEmulationArgs(PROGRAM, this.defaultArgc, this.defaultArgv)
+            if (!this.module.blinkenlibSetProgramArguments(this.programArgv, [...X86_PROGRAM_ENVIRONMENT]))
+                throw new Error('Arguments exceed the native process limits')
             this.module._blinkenlib_starti()
             this.checkHostError()
             this.module.FS.unlink(PROGRAM)
@@ -1158,8 +1202,10 @@ export class BlinkRuntime {
             throw new Error('Cannot change the x86 Project FileSystem while a program is active')
         this.detachProjectFileSystem()
         if (capability) {
+            this.module.FS.mkdirTree(X86_WORKING_DIRECTORY)
             this.projectMount = new ProjectFileSystemMount(this.module, capability, () =>
-                this.getCurrentInstructionSerial()
+                this.getCurrentInstructionSerial(),
+                () => this.protectedPath
             )
         }
     }

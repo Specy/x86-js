@@ -1,0 +1,47 @@
+[
+    {
+        "soname": "ld-linux-x86-64.so.2",
+        "path": "/lib64/ld-linux-x86-64.so.2",
+        "package": "libc6",
+        "sourcePackage": "glibc",
+        "version": "2.43-2ubuntu2.4",
+        "sha256": "bda779ea9e9ad234f60315477d7cfd0bdde861cd8ddd9df8cdaf62f18c4cec14",
+        "licence": "LGPL-2.1-or-later"
+    },
+    {
+        "soname": "libc.so.6",
+        "path": "/lib/x86_64-linux-gnu/libc.so.6",
+        "package": "libc6",
+        "sourcePackage": "glibc",
+        "version": "2.43-2ubuntu2.4",
+        "sha256": "85e64f97e348786a8fb4d9f3d52fec289e2fb86bba20f0731dfe61990525e0f7",
+        "licence": "LGPL-2.1-or-later"
+    },
+    {
+        "soname": "libm.so.6",
+        "path": "/lib/x86_64-linux-gnu/libm.so.6",
+        "package": "libc6",
+        "sourcePackage": "glibc",
+        "version": "2.43-2ubuntu2.4",
+        "sha256": "1c488db6f4fe8cecb72456bc018de000b7a9b539c2994864b0416b5e8371b3d8",
+        "licence": "LGPL-2.1-or-later"
+    },
+    {
+        "soname": "libstdc++.so.6",
+        "path": "/lib/x86_64-linux-gnu/libstdc++.so.6",
+        "package": "libstdc++6",
+        "sourcePackage": "gcc-16",
+        "version": "16-20260322-1ubuntu1",
+        "sha256": "5bb0d21308f123b6ad46c6f35b42cedfcb8d6d439a53aa3dae04d880aaffdde3",
+        "licence": "GPL-3.0-with-GCC-exception"
+    },
+    {
+        "soname": "libgcc_s.so.1",
+        "path": "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+        "package": "libgcc-s1",
+        "sourcePackage": "gcc-16",
+        "version": "16-20260322-1ubuntu1",
+        "sha256": "9d339ecb409578d6a5d587e6c537a8f9589b8a13fefba30d167433a4b5758bee",
+        "licence": "GPL-3.0-with-GCC-exception"
+    }
+]
