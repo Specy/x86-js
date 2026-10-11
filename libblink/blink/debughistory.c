@@ -47,7 +47,7 @@ struct Snapshot {
 struct PokeByte { u64 address; u32 sequence; u8 old; };
 #define HISTORY_BUDGET (256u << 20)
 static struct Entry *entries;
-static u32 capacity, count, start;
+static u32 capacity, slots, count, start;
 static u32 hollow; /* the oldest `hollow` entries are hollow */
 static u8 (*headers)[88]; /* their headers, by slot, once any is hollowed */
 static u32 budget = HISTORY_BUDGET;
@@ -89,7 +89,7 @@ void DebugHistoryMarkIrreversible(void) {
   if (pending) {
     pending_irreversible = true;
   } else if (count && capacity) {
-    struct Entry *e = &entries[(start + count - 1) % capacity];
+    struct Entry *e = &entries[(start + count - 1) % slots];
     if (e->bytes) Write32(e->bytes + 20, 0);
   }
 }
@@ -110,7 +110,10 @@ static void Empty(struct Entry *e) {
   e->allocated = 0;
 }
 void DebugHistoryClear(void) {
-  for (u32 i = 0; i < capacity; ++i) Empty(&entries[i]);
+  for (u32 i = 0; i < slots; ++i) Empty(&entries[i]);
+  free(entries);
+  entries = 0;
+  slots = 0;
   free(headers);
   headers = 0;
   held = 0;
@@ -125,10 +128,7 @@ u32 blinkenlib_history_version(void) { return 1; }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_history_capacity(u32 size) {
   DebugHistoryClear();
-  free(entries);
   capacity = size;
-  entries = size ? calloc(size, sizeof(*entries)) : 0;
-  if (size && !entries) abort();
 }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_history_clear(void) { DebugHistoryClear(); }
@@ -149,7 +149,7 @@ u32 blinkenlib_history_count(void) { return count; }
 EMSCRIPTEN_KEEPALIVE
 u64 blinkenlib_history_recorded(void) { return serial; }
 static struct Entry *EntryAt(u32 offset) {
-  return offset < count ? &entries[(start + count - 1 - offset) % capacity] : 0;
+  return offset < count ? &entries[(start + count - 1 - offset) % slots] : 0;
 }
 EMSCRIPTEN_KEEPALIVE
 const u8 *blinkenlib_history_entry(u32 offset) {
@@ -193,10 +193,10 @@ static void Reallocate(struct Entry *e, u32 allocated) {
 /* Cuts the oldest entry that isn't hollow down to its 88-byte header, which
  * keeps its serial, addresses and flags but no longer offers it to undo. */
 static void HollowOldest(void) {
-  u32 slot = (start + hollow++) % capacity;
+  u32 slot = (start + hollow++) % slots;
   struct Entry *e = &entries[slot];
   u8 *header;
-  if (!headers && !(headers = calloc(capacity, sizeof(*headers)))) abort();
+  if (!headers && !(headers = calloc(slots, sizeof(*headers)))) abort();
   header = headers[slot];
   memcpy(header, e->bytes, 88);
   Write32(header + 4, 88);
@@ -211,9 +211,34 @@ static void HollowOldest(void) {
   Release(e->stack_before); /* only an undo of this entry would need it */
   e->stack_before = 0;
 }
+/* The configured capacity is a limit, not an allocation. Grow only when all
+ * allocated slots are occupied, moving entries into oldest-first order. Hollow
+ * headers move with their entries, whose pointers must follow the new array. */
+static void Grow(void) {
+  u32 size = slots ? (slots > capacity / 2 ? capacity : slots * 2)
+                   : (capacity < 64 ? capacity : 64);
+  struct Entry *grown = calloc(size, sizeof(*grown));
+  u8 (*grown_headers)[88] = headers ? calloc(size, sizeof(*headers)) : 0;
+  if (!grown || (headers && !grown_headers)) abort();
+  for (u32 i = 0; i < count; ++i) {
+    u32 slot = (start + i) % slots;
+    grown[i] = entries[slot];
+    if (headers && !grown[i].allocated) {
+      memcpy(grown_headers[i], headers[slot], 88);
+      grown[i].bytes = grown_headers[i];
+    }
+  }
+  free(entries);
+  free(headers);
+  entries = grown;
+  headers = grown_headers;
+  slots = size;
+  start = 0;
+}
 static struct Entry *NewEntry(u32 bytes) {
   struct Entry *e;
   u32 room = bytes + bytes / 2, index;
+  if (count == slots && slots < capacity) Grow();
   /* Every step comes through here, so the ring wraps without dividing. */
   if (count == capacity) {
     /* The ring is full: the oldest entry goes, and its slot takes the new one. */
@@ -224,11 +249,11 @@ static struct Entry *NewEntry(u32 bytes) {
     } else {
       held -= e->allocated;
     }
-    if (++start == capacity) start = 0;
+    if (++start == slots) start = 0;
     --count;
   } else {
     index = start + count;
-    if (index >= capacity) index -= capacity;
+    if (index >= slots) index -= slots;
     e = &entries[index]; /* empty */
   }
   Release(e->stack_before);

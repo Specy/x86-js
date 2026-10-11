@@ -14,6 +14,33 @@ async function build(source: string, capacity = 100): Promise<X86Emulator> {
 const PREFIX = 'bits 64\nglobal _start\nsection .text\n_start:\n'
 
 describe('native undo recording', () => {
+    it('allocates a large configured history only as execution fills it', async () => {
+        const emulator = await build(PREFIX + 'inc rbx\njmp _start\n', 0)
+        try {
+            const memory = () => emulator.module.wasmExports!.memory!.buffer.byteLength
+            const before = memory()
+            emulator.initialize(2_000_000)
+            expect(memory() - before).toBeLessThan(2 ** 20)
+            expect(emulator.getUndoDepth()).toBe(0)
+
+            // Cross several growth boundaries and preserve every step's writes and identity.
+            await emulator.run(300)
+            expect(emulator.getUndoDepth()).toBe(300)
+            const rows = emulator.getUndoHistory(300)
+            expect(new Set(rows.map(row => row.serial)).size).toBe(300)
+            for (let i = 0; i < 300; i++) emulator.undo()
+            expect(emulator.getRegisterValue('rbx')).toBe(0n)
+            expect(emulator.getUndoDepth()).toBe(0)
+            await emulator.run(300)
+            expect(emulator.getRegisterValue('rbx')).toBe(150n)
+            emulator.initialize(0)
+            await emulator.run(300)
+            expect(emulator.getUndoDepth()).toBe(0)
+        } finally {
+            emulator.dispose()
+        }
+    })
+
     it('decodes only a requested history window, including across Undo serial gaps', async () => {
         const emulator = await build(PREFIX + 'inc rbx\njmp _start\n', 1000)
         try {
