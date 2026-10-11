@@ -65,7 +65,8 @@ export type Statement =
 
 export type SymbolUse = { readonly name: string; readonly line: number; readonly column: number }
 
-export type Alias = { readonly alias: SymbolUse; readonly target: SymbolUse }
+/** `.set alias, target` or `.set alias, target±offset`: GCC shares a constant inside another. */
+export type Alias = { readonly alias: SymbolUse; readonly target: SymbolUse; readonly offset: bigint }
 
 export type Analysis = {
     readonly statements: readonly Statement[]
@@ -407,7 +408,9 @@ export function analyze(
                 const alias = symbolArgument(aliasToken, line, nameToken)
                 if (!alias) return
                 mention(alias.name, line, alias.column)
-                if (!targetToken || extra || symbolNameProblem(targetToken.text)) {
+                const target = targetToken && /^([^\s+-]+)(?:\s*([+-])\s*(\S+))?$/.exec(targetToken.text)
+                const magnitude = target?.[3] === undefined ? 0n : parseInteger(target[3])
+                if (!target || extra || symbolNameProblem(target[1]!) || magnitude === null) {
                     diagnostics.error(
                         'unsupported-symbol',
                         line,
@@ -416,8 +419,12 @@ export function analyze(
                     )
                     return
                 }
-                mention(targetToken.text, line, targetToken.column)
-                aliases.push({ alias, target: { name: targetToken.text, line, column: targetToken.column } })
+                mention(target[1]!, line, targetToken!.column)
+                aliases.push({
+                    alias,
+                    target: { name: target[1]!, line, column: targetToken!.column },
+                    offset: target[2] === '-' ? -magnitude : magnitude,
+                })
                 return
             }
         }

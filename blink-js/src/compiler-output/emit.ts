@@ -1,4 +1,4 @@
-import type { Analysis, DataValue, Statement, SymbolUse } from './analyze'
+import type { Alias, Analysis, DataValue, Statement, SymbolUse } from './analyze'
 import type { DiagnosticCollector } from './diagnostics'
 import { encodeNasmString } from './lexer'
 import { isLocalLabel, NameMap } from './names'
@@ -14,8 +14,8 @@ type Resolution = {
     readonly globalCommons: ReadonlySet<string>
     readonly weak: ReadonlySet<string>
     readonly global: ReadonlySet<string>
-    /** Alias uses by the label they follow, in `.set` order. */
-    readonly aliasesByLabel: ReadonlyMap<string, readonly SymbolUse[]>
+    /** Alias uses by the label they follow, in `.set` order, with their offset from it: zero for a plain alias. */
+    readonly aliasesByLabel: ReadonlyMap<string, readonly (SymbolUse & { readonly offset: bigint })[]>
     readonly externs: readonly { readonly name: string; readonly weak: boolean; readonly referenced: boolean }[]
     readonly alignment: ReadonlyMap<SectionFamily, number>
 }
@@ -67,8 +67,9 @@ export function resolve(analysis: Analysis, diagnostics: DiagnosticCollector): R
         }
     }
 
-    const aliasTargets = new Map<string, SymbolUse>()
-    for (const { alias, target } of analysis.aliases) {
+    const aliasTargets = new Map<string, Alias>()
+    for (const entry of analysis.aliases) {
+        const { alias } = entry
         if (
             firstDefinition.has(alias.name) ||
             localCommons.has(alias.name) ||
@@ -78,17 +79,20 @@ export function resolve(analysis: Analysis, diagnostics: DiagnosticCollector): R
             diagnostics.error('unsupported-symbol', alias.line, `\`${alias.name}\` is defined twice`, alias.column)
             continue
         }
-        aliasTargets.set(alias.name, target)
+        aliasTargets.set(alias.name, entry)
     }
-    const aliasesByLabel = new Map<string, SymbolUse[]>()
+    const aliasesByLabel = new Map<string, (SymbolUse & { readonly offset: bigint })[]>()
     const aliases = new Set<string>()
-    for (const { alias, target } of analysis.aliases) {
-        if (aliasTargets.get(alias.name) !== target) continue
+    for (const entry of analysis.aliases) {
+        const { alias, target } = entry
+        if (aliasTargets.get(alias.name) !== entry) continue
         const seen = new Set([alias.name])
         let root = target.name
+        let offset = entry.offset
         while (aliasTargets.has(root) && !seen.has(root)) {
             seen.add(root)
-            root = aliasTargets.get(root)!.name
+            offset += aliasTargets.get(root)!.offset
+            root = aliasTargets.get(root)!.target.name
         }
         if (!kept.has(root)) {
             if (!rejected.has(root)) {
@@ -103,7 +107,7 @@ export function resolve(analysis: Analysis, diagnostics: DiagnosticCollector): R
         }
         aliases.add(alias.name)
         const list = aliasesByLabel.get(root) ?? []
-        list.push(alias)
+        list.push({ ...alias, offset })
         aliasesByLabel.set(root, list)
     }
 
@@ -251,7 +255,16 @@ export function emit(analysis: Analysis, resolution: Resolution): { lines: Trans
                 push(`${names.emit(name)}:`, statement.line, { label: true })
                 definedOrder.push(name)
                 for (const alias of resolution.aliasesByLabel.get(name) ?? []) {
-                    push(`${names.emit(alias.name)}:`, alias.line, { label: true })
+                    // GCC names a constant that lies inside another one (`.set .LC12,.LC1+8`); a
+                    // label cannot point into the middle of a data line, so `equ` names the address.
+                    const offset = alias.offset < 0n ? `-${-alias.offset}` : `+${alias.offset}`
+                    push(
+                        alias.offset === 0n
+                            ? `${names.emit(alias.name)}:`
+                            : `${names.emit(alias.name)} equ ${names.emit(name)}${offset}`,
+                        alias.line,
+                        { label: true },
+                    )
                     definedOrder.push(alias.name)
                 }
                 return

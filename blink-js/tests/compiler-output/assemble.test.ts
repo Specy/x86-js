@@ -113,6 +113,75 @@ describe('translated programs in the Core', () => {
         expect(await run(input)).toBe(3 + 5 + 0 + 108)
     })
 
+    it('reads constants GCC shares inside another one, named with equ', async () => {
+        const input = [
+            '\t.intel_syntax noprefix',
+            '\t.section\t.rodata.cst16,"aM",@progbits,16',
+            '\t.align 16',
+            '.LC1:',
+            '\t.long\t3',
+            '\t.long\t5',
+            '\t.long\t7',
+            '\t.long\t11',
+            '\t.set\t.LC2,.LC1+8',
+            '\t.set\t.LC3,.LC2+4',
+            '\t.text',
+            '\t.globl\tmain',
+            'main:',
+            '\tmov\teax, DWORD PTR .LC2[rip]',
+            '\tadd\teax, DWORD PTR .LC3[rip]',
+            '\tret',
+            IDENT,
+            NOTE,
+        ]
+        expect(await run(input)).toBe(7 + 11)
+    })
+
+    it('makes SSE comparisons all-ones masks, unordered counting as not less', async () => {
+        const input = [
+            '\t.intel_syntax noprefix',
+            '\t.section\t.rodata',
+            '\t.align 16',
+            'one:',
+            '\t.long\t0',
+            '\t.long\t1072693248',
+            '\t.long\t0',
+            '\t.long\t1072693248',
+            'two:',
+            '\t.long\t0',
+            '\t.long\t1073741824',
+            '\t.long\t0',
+            '\t.long\t2146959360',
+            '\t.text',
+            '\t.globl\tmain',
+            'main:',
+            // 1 < 2 as a scalar: the low 64 bits all ones
+            '\tmovsd\txmm0, QWORD PTR one[rip]',
+            '\tcmpltsd\txmm0, QWORD PTR two[rip]',
+            '\tmovq\trax, xmm0',
+            '\tmov\tecx, eax',
+            '\tshr\trax, 32',
+            '\tand\tecx, eax',
+            // packed: 1 < 2 and 1 < NaN, so all ones and then zero
+            '\tmovapd\txmm1, XMMWORD PTR one[rip]',
+            '\tcmpltpd\txmm1, XMMWORD PTR two[rip]',
+            '\tmovmskpd\tedx, xmm1',
+            // not less than NaN is true
+            '\tmovapd\txmm2, XMMWORD PTR one[rip]',
+            '\tcmpnltpd\txmm2, XMMWORD PTR two[rip]',
+            '\tmovmskpd\tesi, xmm2',
+            // all ones: 1; mask 0b01: 1; mask 0b10: 2
+            '\tmov\teax, ecx',
+            '\tand\teax, 1',
+            '\tlea\teax, [rax+rdx*2]',
+            '\tlea\teax, [rax+rsi*4]',
+            '\tret',
+            IDENT,
+            NOTE,
+        ]
+        expect(await run(input)).toBe(1 + 1 * 2 + 2 * 4)
+    })
+
     it('runs a constructor from .init_array, a COMDAT weak function and its .set alias', async () => {
         const input = [
             '\t.intel_syntax noprefix',

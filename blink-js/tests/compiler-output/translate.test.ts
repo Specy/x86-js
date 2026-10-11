@@ -1688,9 +1688,34 @@ describe('symbols', () => {
         ])
     })
 
+    it('names a constant GCC shares inside another with equ, offsets added along a chain', () => {
+        const input = unit(
+            '\t.section\t.rodata.cst16,"aM",@progbits,16',
+            '\t.align 16',
+            '.LC1:',
+            '\t.long\t0',
+            '\t.long\t1072693248',
+            '\t.long\t0',
+            '\t.long\t1073741824',
+            '\t.set\t.LC2,.LC1+8',
+            '\t.set\t.LC3,.LC2-4',
+            '\t.text',
+            '\t.globl\tmain',
+            'main:',
+            '\tmovsd\txmm0, QWORD PTR .LC2[rip]',
+            '\tret',
+        )
+        expect(body(input).filter((line) => /^LC\d/.test(line))).toEqual([
+            'LC1:',
+            'LC2 equ LC1+8',
+            'LC3 equ LC1+4',
+        ])
+    })
+
     it('rejects a .set that is not an alias of a label in the same output', () => {
         expect(errorCodes(unit('\t.set\ta, 5'))).toEqual([['unsupported-symbol', 2]])
-        expect(errorCodes(unit('\t.set\ta, b+8', 'b:'))).toEqual([['unsupported-symbol', 2]])
+        expect(errorCodes(unit('\t.set\ta, b*8', 'b:'))).toEqual([['unsupported-symbol', 2]])
+        expect(errorCodes(unit('\t.set\ta, b+c', 'b:', 'c:'))).toEqual([['unsupported-symbol', 2]])
         expect(errorCodes(unit('\t.set\ta, elsewhere'))).toEqual([['unsupported-symbol', 2]])
         expect(errorCodes(unit('\t.set\ta, b', '\t.set\tb, a'))).toEqual([
             ['unsupported-symbol', 2],
