@@ -404,7 +404,11 @@ static bool LoadElf(struct Machine *m,  //
   Elf64_Phdr_ *phdr;
   i64 end = INT64_MIN;
   bool execstack = true;
+#ifdef __EMSCRIPTEN__
+  elf->aslr = ChooseAslr(ehdr, esize, FLAG_imagestart, &elf->base);
+#else
   elf->aslr = ChooseAslr(ehdr, esize, m->system->brk, &elf->base);
+#endif
   m->ip = elf->at_entry = elf->aslr + Read64(ehdr->entry);
   m->cs.sel = USER_CS_LINUX;
   m->ss.sel = USER_DS_LINUX;
@@ -434,6 +438,10 @@ static bool LoadElf(struct Machine *m,  //
         break;
     }
   }
+#ifdef __EMSCRIPTEN__
+  // Interpreter segments must not move the main executable's heap.
+  i64 programbrk = ROUNDUP(m->system->brk, 4096);
+#endif
   if (elf->interpreter) {
     int fd;
     i64 aslr;
@@ -457,10 +465,20 @@ static bool LoadElf(struct Machine *m,  //
       WriteErrorString(")\n");
       exit(127);
     }
+#ifdef __EMSCRIPTEN__
+    i64 interpbase;
+    i64 interpsize = GetElfMemorySize(ehdri, st.st_size, &interpbase);
+    i64 interpaddr = FindVirtualTopDown(m->system, FLAG_automapend,
+                                        interpsize);
+    if (interpaddr == -1) exit(127);
+    aslr = ChooseAslr(ehdri, st.st_size, interpaddr - interpbase,
+                      &elf->at_base);
+#else
     aslr = ChooseAslr(
         ehdri, st.st_size,
         elf->aslr ? elf->aslr - (16 * 1024 * 1024) : FLAG_dyninterpaddr,
         &elf->at_base);
+#endif
     m->ip = elf->at_base + Read64(ehdri->entry);
     for (prot = i = 0; i < Read16(ehdri->phnum); ++i) {
       phdr = GetElfProgramHeaderAddress(ehdri, st.st_size, i);
@@ -476,6 +494,9 @@ static bool LoadElf(struct Machine *m,  //
     unassert(!Munmap(ehdri, st.st_size));
     unassert(!VfsClose(fd));
   }
+#ifdef __EMSCRIPTEN__
+  m->system->brk = m->system->brkstart = programbrk;
+#endif
   return execstack;
 }
 
@@ -748,7 +769,11 @@ error: unsupported executable; we need:\n\
   ResetCpu(m);
   m->system->codesize = 0;
   m->system->codestart = 0;
+#ifdef __EMSCRIPTEN__
+  m->system->brk = 0;
+#else
   m->system->brk = FLAG_imagestart;
+#endif
   m->system->automap = FLAG_automapstart;
   if (HasLinearMapping()) {
     m->system->brk ^= Read64(elf->rng) & FLAG_aslrmask;

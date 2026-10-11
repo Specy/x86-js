@@ -396,8 +396,8 @@ describe('the page lookup beside the bridge', () => {
         }
 
         expect(emulator.runtime.spyMemoryBytes(0x7ffff0000000n, 8)).toBeNull()
-        // The shadow range the bridge refuses is refused here too.
-        expect(isShadowAddress(0x7fff8000n)).toBe(true)
+        // An unmapped guest address is refused by both lookup paths.
+        expect(isShadowAddress(0x7fff8000n)).toBe(false)
         expect(emulator.runtime.spyMemoryBytes(0x7fff8000n, 1)).toBeNull()
         expect(isShadowAddress(buffer)).toBe(false)
         emulator.dispose()

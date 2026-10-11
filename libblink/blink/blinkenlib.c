@@ -185,7 +185,9 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
  * Returns true if 𝑣 is a shadow memory virtual address.
  */
 static bool IsShadow(i64 v) {
-  return 0x7fff8000 <= v && v < 0x100080000000;
+  // ASan's shadow range protects host addresses only with a linear mapping.
+  // The wasm Core always uses guest page tables, including for addresses here.
+  return HasLinearMapping() && 0x7fff8000 <= v && v < 0x100080000000;
 }
 
 /**

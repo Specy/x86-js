@@ -532,12 +532,8 @@ describe('string instructions over more than sixteen elements', () => {
     })
 })
 
-describe('memory the debugger cannot read back', () => {
-    // Blink's own mmap() puts anonymous pages at 0x80000000, inside the range the bridge refuses
-    // as ASan shadow memory. A store there is captured, but what it left cannot be read back, and
-    // undo would write back through the same refused lookup, so the step must report itself
-    // irreversible: offered as undoable, its undo threw, and a debugger counts on canUndo().
-    it("leaves stores into mmap'd memory irreversible, the first and later ones, and other pages undoable", async () => {
+describe('mmap memory in the guest page tables', () => {
+    it("undoes the first and later stores into mmap'd memory and other pages", async () => {
         const lines = program(
             [
                 '  mov eax, 9 ; mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS)',
@@ -559,19 +555,18 @@ describe('memory the debugger cannot read back', () => {
         const emulator = await start(lines)
         try {
             await stepToMarked(emulator, lines)
-            expect(emulator.getRegisterValue('rbx')).toBeGreaterThanOrEqual(0x7fff8000n)
+            expect(emulator.getRegisterValue('rbx')).toBeGreaterThanOrEqual(0x7ffff0000000n)
             await emulator.step()
-            expect(emulator.canUndo()).toBe(false)
+            expect(emulator.canUndo()).toBe(true)
             await emulator.step()
-            expect(emulator.canUndo()).toBe(false)
+            expect(emulator.canUndo()).toBe(true)
             await emulator.step()
             await emulator.step()
             expect(emulator.canUndo()).toBe(true)
             const cell = emulator.getRegisterValue('rcx')
             expect(read(emulator, cell, 8)).toEqual([3, 0, 0, 0, 0, 0, 0, 0])
 
-            // Undo while canUndo() allows takes back the lea and the store into .bss, and stops
-            // at the store into the mmap'd page without throwing.
+            // Undo takes both mapping stores back, stopping at the irreversible mmap syscall.
             let undone = 0
             expect(() => {
                 while (emulator.canUndo()) {
@@ -579,7 +574,8 @@ describe('memory the debugger cannot read back', () => {
                     undone += 1
                 }
             }).not.toThrow()
-            expect(undone).toBe(2)
+            expect(undone).toBe(5)
+            expect(read(emulator, emulator.getRegisterValue('rax'), 16)).toEqual(filled(16, 0))
             expect(read(emulator, cell, 8)).toEqual(filled(8, 0))
         } finally {
             emulator.dispose()

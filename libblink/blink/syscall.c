@@ -1379,7 +1379,12 @@ static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
     goto CreateTheMap;
   }
   if ((!virt || !IsFullyUnmapped(m->system, virt, size))) {
-    if ((virt = FindVirtual(m->system, m->system->automap, size)) == -1) {
+#ifdef __EMSCRIPTEN__
+    virt = FindVirtualTopDown(m->system, FLAG_automapend, size);
+#else
+    virt = FindVirtual(m->system, m->system->automap, size);
+#endif
+    if (virt == -1) {
       goto Finished;
     }
     newautomap = ROUNDUP(virt + size, FLAG_pagesize);

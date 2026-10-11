@@ -8,7 +8,7 @@ it('exports section layout and library ownership, and restores the stack extent 
 extern libraryData
 section .text
 main:
- mov rsp,0x4fffffff0000
+ mov rsp,0x7ffffffff000
  push rax
  mov rax,[libraryData]
  ret
@@ -29,9 +29,9 @@ room: resb 16` }, startUnits: { '@runtime/start.asm': 'global _start\nextern mai
         const top = core.getStackTop()
         await core.step() // startup jump
         await core.step() // new stack
-        expect(core.getStackTop()).toBe(0x4fffffff0000n)
+        expect(core.getStackTop()).toBe(0x7ffffffff000n)
         await core.step() // push
-        expect(core.getStackTop()).toBe(0x4fffffff0000n)
+        expect(core.getStackTop()).toBe(0x7ffffffff000n)
         core.undo(); core.undo()
         expect(core.getStackTop()).toBe(top)
     } finally { core.dispose() }

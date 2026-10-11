@@ -337,8 +337,7 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
       /* Keep the packet layout valid even when the postimage is unreadable. */
       bytes -= newsize;
       newsize = 0;
-      /* Undo writes back through the lookup that just failed, which refuses
-       * blinkenlib's shadow range, where Blink's own mmap() puts pages. */
+      /* Undo cannot write back through a guest lookup that failed. */
       reversible = false;
     }
     p += 24 + w->oldsize + newsize;

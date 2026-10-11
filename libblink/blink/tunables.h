@@ -24,11 +24,19 @@
 #endif
 
 #define kAslrMask      0x03ffff000000  // 16mb before pointers get nasty
+#ifdef __EMSCRIPTEN__
+#define kImageStart    0x555555554000
+#define kAutomapStart  0x200000
+#define kAutomapEnd    0x7ffff7fff000
+#define kDynInterpAddr 0x7ffff7fc3000
+#define kStackTop      0x7ffffffff000
+#else
 #define kImageStart    0x110001000000
 #define kAutomapStart  0x200000000000
 #define kAutomapEnd    0x400000000000
 #define kDynInterpAddr 0x454000000000
 #define kStackTop      0x500000000000
+#endif
 
 #define kRealSize  (16 * 1024 * 1024)  // size of ram for real mode
 #define kStackSize (8 * 1024 * 1024)   // size of stack for user mode

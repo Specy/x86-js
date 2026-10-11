@@ -1122,6 +1122,35 @@ StartOver:
   return virt;
 }
 
+// Find the highest free interval below top. Skip absent page-table subtrees,
+// so scanning the 47-bit guest space does not visit every unmapped page.
+i64 FindVirtualTopDown(struct System *s, i64 top, i64 size) {
+  i64 start, cursor, addr, level, pt, boundary;
+  size = ROUNDUP(size, 4096);
+  top = ROUNDDOWN(top, 4096);
+  while (top >= kNullSize + size) {
+    start = top - size;
+    cursor = top;
+    while (cursor > start) {
+      addr = cursor - 1;
+      for (level = 39, pt = s->cr3; level >= 12; level -= 9) {
+        pt = LoadPte(GetPageAddress(s, pt, level == 39) +
+                     ((addr >> level) & 511) * 8);
+        if (!(pt & PAGE_V) || level == 12) break;
+      }
+      boundary = addr & ~(((i64)1 << level) - 1);
+      if (pt & PAGE_V) {
+        top = boundary;
+        break;
+      }
+      cursor = boundary;
+    }
+    if (cursor <= start) return start;
+  }
+  // Linux's fallback allocation searches from the bottom of the address space.
+  return FindVirtual(s, kNullSize, size);
+}
+
 int FreeVirtual(struct System *s, i64 virt, i64 size) {
   int rc;
   long i;

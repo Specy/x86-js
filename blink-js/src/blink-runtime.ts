@@ -68,14 +68,9 @@ function archiveMemberName(position: number): string {
     return `u${position}.o`
 }
 
-/**
- * The shadow-memory range blink keeps for its own bookkeeping, which the
- * memory bridge refuses to read. Kept in step with `IsShadow` in
- * `blink/blinkenlib.c`, so the fast read path refuses exactly what the bridge
- * refuses.
- */
-export function isShadowAddress(address: bigint): boolean {
-    return address >= 0x7fff8000n && address < 0x100080000000n
+/** The wasm Core uses guest page tables; no guest range is ASan host shadow. */
+export function isShadowAddress(_address: bigint): boolean {
+    return false
 }
 
 const SIGTRAP = 5
@@ -852,8 +847,7 @@ export class BlinkRuntime {
      * so it takes this path and falls back to the bridge whenever this one
      * declines. The two agree byte for byte because they do the same lookup:
      * `blinkenlib_spy_address` IS the lookup `blinkenlib_read_memory_byte`
-     * makes, and the shadow-memory range the bridge refuses is refused here
-     * too. A page is contiguous in the host heap and the next page need not
+     * makes. A page is contiguous in the host heap and the next page need not
      * be, so the read stops at every page boundary and looks the next one up.
      */
     spyMemoryBytes(address: bigint, length: number): Uint8Array | null {

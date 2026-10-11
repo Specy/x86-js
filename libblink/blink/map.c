@@ -148,7 +148,12 @@ static u64 ScaleAddress(u64 address) {
 // assign addresses greater than 2**47 which won't fit with x86_64
 void InitMap(void) {
   FLAG_pagesize = GetSystemPageSize();
+#ifdef __EMSCRIPTEN__
+  // Guest page tables, rather than host pointers, address the emulated process.
+  FLAG_vabits = 47;
+#else
   FLAG_vabits = GetBitsInAddressSpace();
+#endif
   FLAG_vaspace = GetVirtualAddressSpace(FLAG_vabits, FLAG_pagesize);
   FLAG_aslrmask = ScaleAddress(kAslrMask);
   FLAG_imagestart = ScaleAddress(kImageStart);
