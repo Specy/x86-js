@@ -10,12 +10,17 @@ AR = emar
 MODE ?=
 PREFIX = /usr/local
 
-CFLAGS = -g -O2
-CXXFLAGS = -g -O2
+# Wasm's own exception handling for setjmp/longjmp. Emscripten's default implements it in
+# JavaScript, which routes every call made from a function that calls setjmp, as the run loop
+# does, through a JavaScript trampoline: a call out of wasm and back per guest instruction.
+# The C++ bindings and the link then need wasm exceptions as well: with wasm setjmp,
+# Emscripten links a C++ runtime that throws, and C++ throwing is otherwise switched off.
+CFLAGS = -g -O2 -sSUPPORT_LONGJMP=wasm
+CXXFLAGS = -g -O2 -fwasm-exceptions
 CPPFLAGS = -isystem tool/stdatomic -DHTML -D_FILE_OFFSET_BITS=64 -D_DARWIN_C_SOURCE -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_GNU_SOURCE
 UOPFLAGS = -O2
 TARGET_ARCH =
-LDFLAGS = -O2 -sENVIRONMENT=web,node -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sEXIT_RUNTIME=0 -sEXPORT_ES6=1 -sMODULARIZE -sEXPORT_NAME="blinkenlib" -sEXPORTED_RUNTIME_METHODS=[UTF8ToString,stringToNewUTF8,AsciiToString,FS,callMain,addFunction,wasmExports] -lembind
+LDFLAGS = -O2 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sENVIRONMENT=web,node -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sEXIT_RUNTIME=0 -sEXPORT_ES6=1 -sMODULARIZE -sEXPORT_NAME="blinkenlib" -sEXPORTED_RUNTIME_METHODS=[UTF8ToString,stringToNewUTF8,AsciiToString,FS,callMain,addFunction,wasmExports] -lembind
 LDLIBS =
 ZLIB = o/$(MODE)/third_party/libz/zlib.a
 

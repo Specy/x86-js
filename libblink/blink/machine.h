@@ -252,7 +252,9 @@ struct OpCache {
   u32 stashsize;  // for writes that overlap page
   bool writable;
   _Atomic(bool) invalidated;
-  u64 icache[512][kInstructionBytes / 8];
+  // Indexed by the low bits of the instruction's address, so 512 entries held only
+  // 512 bytes of code, and a program as large as ld decoded most instructions again.
+  u64 icache[8192][kInstructionBytes / 8];
 };
 
 struct System {

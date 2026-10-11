@@ -342,6 +342,28 @@ describe('a library unit', () => {
         ])
     })
 
+    it('reports its warnings on every build, not only the one that assembled it', async () => {
+        const withWarning = { ...project, library: { [START_PATH]: START.replace('.done:', '.done') } }
+        for (let build = 0; build < 2; build++) {
+            const built = await emulator.compileProject(withWarning)
+            expect(built.ok, built.report).toBe(true)
+            expect(built.diagnostics).toContainEqual(
+                expect.objectContaining({ file: START_PATH, severity: 'warning', warningClass: 'label-orphan' }),
+            )
+        }
+    })
+
+    it('is assembled again when a File it includes changes', async () => {
+        const library = {
+            '@runtime/value.asm': ['global value', '%include "../value.inc"', 'section .text', 'value:', '    mov eax, VALUE', '    ret'].join('\n'),
+        }
+        const main = ['global _start', 'extern value', 'section .text', '_start:', '    call value', '    mov edi, eax', '    mov eax, 60', '    syscall'].join('\n')
+        for (const value of [3, 4]) {
+            await build({ entry: 'main.asm', files: { 'main.asm': main, 'value.inc': `%define VALUE ${value}` }, library })
+            expect(await exitCode()).toBe(value)
+        }
+    })
+
     it('cannot be included by a File', async () => {
         const main = ['global main', '%include "@runtime/start.asm"', 'section .text', 'main:', '    ret'].join('\n')
 

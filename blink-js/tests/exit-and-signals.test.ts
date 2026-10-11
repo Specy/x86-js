@@ -280,7 +280,7 @@ describe('output', () => {
             await emulator.runUntilBlocked()
             expect(stdout).toBe('hi\n')
             // The build report still says which tool wrote what.
-            expect(build.report).toBe('\n$ /linker --start-group /program.o --end-group -o /program -Map /program.map\n')
+            expect(build.report).toBe('\n$ /linker --start-group /program.o --end-group -o /program\n')
         } finally {
             emulator.dispose()
         }

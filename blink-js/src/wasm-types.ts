@@ -172,6 +172,7 @@ export type BlinkenlibModule = {
     _blinkenlib_faketty_resume(): void
     /** Opt in to refreshing the legacy listing only when explicitly requested. */
     _blinkenlib_set_deferred_disassembly?(enabled: boolean): void
+    _blinkenlib_set_host_error?(pending: boolean): void
     /** Optional bulk/scalar exports, with the Embind APIs retained as fallbacks. */
     _blinkenlib_get_register_snapshot?(): number
     _blinkenlib_get_fpu_snapshot?(): number

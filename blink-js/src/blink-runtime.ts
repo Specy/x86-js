@@ -227,6 +227,7 @@ export class BlinkRuntime {
             }
         })
         const module = await awaitBlinkenlibModule(modulePromise, wasmInitStarted)
+        mirrorHostError(module)
 
         const signalPointer = module.addFunction(
             (signal: number, code: number) => runtime?.handleSignal(signal, code),
@@ -550,12 +551,15 @@ export class BlinkRuntime {
             inputs.push(archivePath)
         }
         // A support member may reference a secondary user definition. Re-search archives for it.
+        // The map only says which of the Project's other Files the link took. Writing it is about a
+        // quarter of a small program's link, so a Project without such Files goes without it.
+        const mapped = userMembers.length > 0
         this.beginLinking()
         await defer()
         this.runTool('/linker', this.mode.binaries.linker?.link(inputs).replace(
-            inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) + ' -Map /program.map')
+            inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) + (mapped ? ' -Map /program.map' : ''))
         await this.waitForState(state => state !== BlinkState.Linking)
-        if (this.state === BlinkState.ProgramLoaded) {
+        if (mapped && this.state === BlinkState.ProgramLoaded) {
             const map = this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string
             for (const unit of userMembers) {
                 const member = archiveMemberName(members.indexOf(unit))
@@ -725,7 +729,7 @@ export class BlinkRuntime {
     private checkHostError(): void {
         if (this.module.blinkHostError === undefined) return
         const error = new X86EnvironmentError(this.module.blinkHostError)
-        delete this.module.blinkHostError
+        this.module.blinkHostError = undefined
         this.clearWaitTransport()
         this.module._blinkenlib_abandon_execution()
         this.stopReason = {
@@ -796,7 +800,7 @@ export class BlinkRuntime {
         this.resumeScheduled = false
         this.detachProjectFileSystem()
         this.module._blinkenlib_clear_execution()
-        delete this.module.blinkHostError
+        this.module.blinkHostError = undefined
         this.programSources = false
         this.programBytes = null
         this.sourceMap = null
@@ -1136,7 +1140,7 @@ export class BlinkRuntime {
             }
         } catch (error) {
             const cause = this.module.blinkHostError ?? error
-            delete this.module.blinkHostError
+            this.module.blinkHostError = undefined
             this.stopReason = {
                 loadFail: true,
                 exitCode: 0,
@@ -1526,9 +1530,41 @@ async function awaitBlinkenlibModule(
     return modulePromise
 }
 
+/**
+ * Keeps blink's copy of `blinkHostError` in step with every write, whether from this package or
+ * from blink's own host calls, so the run loop can check it without calling out of wasm. Writers
+ * clear it by assigning `undefined`: deleting it would delete the accessor.
+ */
+function mirrorHostError(module: BlinkenlibModule): void {
+    let hostError: unknown
+    Object.defineProperty(module, 'blinkHostError', {
+        enumerable: true,
+        get: () => hostError,
+        set: (value: unknown) => {
+            hostError = value
+            module._blinkenlib_set_host_error?.(value !== undefined)
+        }
+    })
+}
+
+/**
+ * Resumes a preempted loop as a task of its own. The browser still renders between tasks when a
+ * frame is due, but a loop no longer waits for one: waiting for an animation frame made a link,
+ * dozens of slices, take a frame per slice, and stopped it outright in a hidden tab, which runs no
+ * frames. A posted message is not throttled as a timer is.
+ */
 function defaultScheduler(callback: () => void): void {
-    if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(callback)
+    if (typeof setImmediate === 'function') {
+        setImmediate(callback)
+        return
+    }
+    if (typeof MessageChannel === 'function') {
+        const channel = new MessageChannel()
+        channel.port1.onmessage = () => {
+            channel.port1.close()
+            callback()
+        }
+        channel.port2.postMessage(null)
         return
     }
     setTimeout(callback, 0)

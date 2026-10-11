@@ -130,7 +130,13 @@ u64 blinkenlib_next_identity(void) { return ++identity_allocator; }
 static void FinishExecution(void) {
   if (active_identity) { ++instructions_executed; ++run_instruction_count; active_identity = 0; }
 }
-EM_JS(bool, HasHostError, (), { return Module.blinkHostError !== undefined; });
+/* Mirrors Module.blinkHostError, which the runtime keeps in step with an accessor. The run loop
+ * reads it after every instruction, and asking JavaScript each time cost a call out of wasm per
+ * instruction. */
+static bool host_error_pending = false;
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_set_host_error(bool pending) { host_error_pending = pending; }
+static bool HasHostError(void) { return host_error_pending; }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_abandon_execution(void) {
   if (m) GuestWaitFinish(m);
