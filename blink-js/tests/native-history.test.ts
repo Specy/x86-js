@@ -27,7 +27,7 @@ describe('native undo recording', () => {
             await emulator.run(300)
             expect(emulator.getUndoDepth()).toBe(300)
             const rows = emulator.getUndoHistory(300)
-            expect(new Set(rows.map(row => row.serial)).size).toBe(300)
+            expect(new Set(rows.map((row) => row.serial)).size).toBe(300)
             for (let i = 0; i < 300; i++) emulator.undo()
             expect(emulator.getRegisterValue('rbx')).toBe(0n)
             expect(emulator.getUndoDepth()).toBe(0)
@@ -200,6 +200,11 @@ cell: dq 0
             await emulator.run(4)
             expect(emulator.getCallStack().map((frame) => frame.name)).toEqual(['outer', 'inner'])
             const frames = emulator.getCallStack()
+            // each call went to where its symbol starts, and returns after the call
+            for (const frame of frames) expect(frame.target).toBe(frame.address)
+            expect(frames[1].destination).toBe(
+                frames[0].address + BigInt(emulator.getInstructionAt(frames[0].address)!.size!)
+            )
             await emulator.step()
             expect(emulator.getCallStack().map((frame) => frame.name)).toEqual(['outer'])
             emulator.undo()

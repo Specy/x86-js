@@ -43,6 +43,30 @@ it('stops at an address before strcmp, exposes its operands and names every load
     }
 })
 
+it('names where a call into a PLT stub went, which no symbol starts', async () => {
+    const bytes = elfFixture('crackme')
+    const fgets = analyze(bytes).plt.find((stub) => stub.name === 'fgets@plt')!
+    const emulator = await createX86Emulator()
+    try {
+        await emulator.loadExecutable(bytes)
+        emulator.initialize(1000)
+        await emulator.run(1_000_000)
+        expect(emulator.stopReason?.kind).toBe('input')
+        // fgets waits inside libc, called through its stub from main
+        const frame = emulator
+            .getCallStack()
+            .find((candidate) => candidate.target === 0x555555554000n + fgets.address)!
+        expect(frame).toBeDefined()
+        expect(frame.address).toBeLessThan(frame.target)
+        expect(frame.name).toBe('_init')
+        const main = emulator.getCallStack().find((candidate) => candidate.name === 'main')!
+        expect(frame.destination).toBeGreaterThan(main.address)
+        expect(frame.destination).toBeLessThan(main.address + 0x100n)
+    } finally {
+        emulator.dispose()
+    }
+})
+
 it('uses Zydis for instruction queries even when Blink cannot execute the instruction', async () => {
     const bytes = elfFixture('avx')
     const info = analyze(bytes)

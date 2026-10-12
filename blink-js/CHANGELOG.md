@@ -37,6 +37,9 @@ Debugger reads and Undo work throughout the guest address space.
   38400 bits per second, so glibc 2.42 and later find a tty: isatty() is
   true, and standard output is line-buffered, which writes a prompt
   without a newline before the read that waits for its answer.
+- A Call stack frame has `target`, where its call went, beside `address`, where
+  the symbol covering it starts: a call into a PLT stub, which no symbol names,
+  goes to the stub, not to `_init` before it.
 - futex waits time out: FUTEX_WAIT's relative and FUTEX_WAIT_BITSET's absolute
   timeouts (CLOCK_MONOTONIC, or CLOCK_REALTIME with FUTEX_CLOCK_REALTIME) wait
   through the environment's clock and answer ETIMEDOUT, so glibc's

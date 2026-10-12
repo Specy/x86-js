@@ -127,6 +127,8 @@ const frames = emulator.getCallStack()
 console.log(frames.map((frame) => frame.name))
 ```
 
+A frame names the symbol its call went into (`name`, starting at `address`), where the call went (`target`, which differs from `address` when no symbol starts there, such as a PLT stub) and where it returns (`destination`).
+
 When history is enabled, every instruction `run()` or `step()` executes is recorded inside the wasm. CPU instructions and queries can be undone; an instruction with unjournaled input, File, descriptor, pipe, mapping or process-state effects forms an irreversible boundary. If history is disabled with `initialize(0)` or by never calling `initialize`, nothing is recorded and `canUndo()` returns `false`.
 
 Very large or truncated memory writes may not be reversible. In that case `canUndo()` returns `false` for the latest step, and calling `undo()` throws instead of restoring a partial state.

@@ -217,6 +217,7 @@ export class NativeHistory {
         return {
             name: symbol?.name ?? '',
             address,
+            target,
             destination,
             sp,
             line: location?.line ?? -1,
