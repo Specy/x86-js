@@ -139,11 +139,6 @@ export type NativeInstruction = {
     code: string
 }
 
-export type DisassemblySnapshot = {
-    lines: string[]
-    currentLine: number
-}
-
 export type BlinkenlibModule = {
     blinkHostNow?: (clock: number) => number
     blinkHostRandom?: (pointer: number, length: number) => void
@@ -160,6 +155,11 @@ export type BlinkenlibModule = {
     _blinkenlib_timer_deadline(): bigint
     _blinkenlib_wait_cancel(): void
     _blinkenlib_abandon_execution(): void
+    /** Releases what a native exit() left behind mid-instruction and ends the program. */
+    _blinkenlib_recover_native_exit?(): void
+    /** Emscripten's C stack pointer, to restore after a native exit() unwound past its frames. */
+    stackSave?(): number
+    stackRestore?(stack: number): void
     _blinkenlib_clear_execution(): void
     FS: EmscriptenFS
     callMain(args: string[]): void
@@ -172,8 +172,6 @@ export type BlinkenlibModule = {
     _blinkenlib_continue(): void
     _blinkenlib_preempt_resume(): void
     _blinkenlib_faketty_resume(): void
-    /** Opt in to refreshing the legacy listing only when explicitly requested. */
-    _blinkenlib_set_deferred_disassembly?(enabled: boolean): void
     _blinkenlib_set_host_error?(pending: boolean): void
     /** Optional bulk/scalar exports, with the Embind APIs retained as fallbacks. */
     _blinkenlib_get_register_snapshot?(): number
@@ -221,7 +219,6 @@ export type BlinkenlibModule = {
     }
     blinkenlibReadMemoryBytes(address: bigint, length: number): MemoryReadResult
     blinkenlibWriteMemoryBytes(address: bigint, bytes: Uint8Array | number[]): MemoryWriteResult
-    blinkenlibGetDisassembly(): DisassemblySnapshot
     onUnimplementedSyscall?: (number: number) => void
     blinkenlibGetFileMaps(): { path: string; address: bigint; size: bigint; offset: bigint }[]
     blinkenlibSetProgramArguments(argv: string[], envp: string[]): boolean
@@ -238,7 +235,6 @@ export type BlinkenlibModule = {
     blinkenlibGetRunControls(): NativeRunControls
     blinkenlibGetRunStop(): NativeRunStop
     blinkenlibGetLastStepInfo(): NativeStepInfo
-    blinkenlibGetInstructionAt(address: bigint): NativeInstruction | null
     blinkenlibResolveSymbol(address: bigint): NativeSymbol | null
     /** The system calls the dispatcher was compiled with, in no particular order. */
     blinkenlibGetSyscalls(): NativeSyscall[]

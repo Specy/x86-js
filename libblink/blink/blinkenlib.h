@@ -145,7 +145,6 @@ const u64 *blinkenlib_get_register_snapshot();
 const u8 *blinkenlib_get_fpu_snapshot();
 void blinkenlib_set_flags(u32 flags);
 void blinkenlib_set_step_recording(bool enabled);
-void blinkenlib_set_deferred_disassembly(bool enabled);
 u64 blinkenlib_get_input_max_bytes();
 void blinkenlib_provide_input(const u8 *bytes, u32 length);
 void blinkenlib_provide_end_of_input();
@@ -207,14 +206,8 @@ bool blinkenlib_get_last_step_info(struct blinkenlib_step_info *info);
 bool blinkenlib_get_last_step_memory_write(u32 index, u64 *address, u32 *size,
                                            const u8 **old_bytes,
                                            u32 *old_size, bool *truncated);
-bool blinkenlib_get_instruction_at(u64 virtual_address, u64 *address, u8 *size,
-                                   char *buffer, u32 buffer_size);
 bool blinkenlib_resolve_symbol(u64 virtual_address, u64 *symbol_address,
                                char *buffer, u32 buffer_size);
-u32 blinkenlib_refresh_disassembly();
-u32 blinkenlib_get_disassembly_current_line();
-u32 blinkenlib_get_disassembly_line_count();
-const char *blinkenlib_get_disassembly_line(u32 index);
 bool blinkenlib_get_file_map(u32, const char **, u64 *, u64 *, u64 *);
 bool blinkenlib_set_process_arguments(const char *, u32, const char *, u32);
 void blinkenlib_set_program_args(const char *progname, const char *argc,

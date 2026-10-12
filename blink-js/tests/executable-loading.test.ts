@@ -88,3 +88,196 @@ it('reports a missing library and preserves the dynamic linker message', async (
         emulator.dispose()
     }
 })
+
+it("copies a caller's Node Buffer, and hands out library bytes nobody else shares", async () => {
+    const buffer = Buffer.from(elfFixture('crackme'))
+    const first = await createX86Emulator()
+    const second = await createX86Emulator()
+    try {
+        await first.loadExecutable(buffer)
+        // Buffer#slice aliases: the program must not change with the caller's Buffer.
+        buffer.fill(0)
+        expect(first.getExecutable()![0]).toBe(0x7f)
+        first.initialize(0)
+        first.provideInput('hunter2\n')
+        await first.run(2_000_000)
+        expect(first.stopReason).toMatchObject({ kind: 'exit', exitCode: 0 })
+        // Mutating libc as handed out must not reach the module-wide cache another emulator loads.
+        const libc = first.getLoadedObjects().find((object) => object.soname === 'libc.so.6')!
+        const bytes = first.getLoadedObjectBytes(libc.path)!
+        expect(Object.getPrototypeOf(bytes)).toBe(Uint8Array.prototype)
+        bytes.fill(0)
+        expect(first.getLoadedObjectBytes(libc.path)![0]).toBe(0x7f)
+        await second.loadExecutable(elfFixture('crackme'))
+        second.initialize(0)
+        second.provideInput('hunter2\n')
+        let output = ''
+        second.on('stdout', (chunk) => {
+            output += new TextDecoder().decode(chunk)
+        })
+        await second.run(2_000_000)
+        expect(output).toBe('Enter password: Correct!\n')
+    } finally {
+        first.dispose()
+        second.dispose()
+    }
+})
+
+it('names the main program among the loaded objects', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        await emulator.loadExecutable(elfFixture('crackme'))
+        emulator.initialize(0)
+        // Stopped in main, reading the password: every library is mapped.
+        await emulator.run(2_000_000)
+        expect(emulator.stopReason?.kind).toBe('input')
+        const objects = emulator.getLoadedObjects()
+        expect(objects.filter((object) => object.main)).toEqual([
+            expect.objectContaining({ path: '/program', base: 0x555555554000n, main: true })
+        ])
+        expect(objects.filter((object) => !object.main).map((object) => object.soname)).toEqual(
+            expect.arrayContaining(['libc.so.6', 'ld-linux-x86-64.so.2'])
+        )
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('lets the latest of overlapping loads win, and fails the superseded one', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        const cpp = emulator.loadExecutable(elfFixture('cpp'))
+        const crackme = emulator.loadExecutable(elfFixture('crackme'))
+        const [first, second] = await Promise.allSettled([cpp, crackme])
+        expect(first).toMatchObject({ status: 'rejected' })
+        expect(String((first as PromiseRejectedResult).reason)).toMatch(/superseded/)
+        expect(second).toMatchObject({ status: 'fulfilled' })
+        expect(emulator.getExecutable()).toEqual(elfFixture('crackme'))
+        // A build started while a load fetches its libraries supersedes it too.
+        const superseded = expect(emulator.loadExecutable(elfFixture('math'))).rejects.toThrow(
+            /superseded/
+        )
+        expect((await emulator.compile('global _start\nsection .text\n_start: nop')).ok).toBe(true)
+        await superseded
+        expect(emulator.getCompiledCode().code).toContain('_start')
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('refuses an invalid protected path before replacing the program', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        await emulator.loadExecutable(elfFixture('crackme'))
+        await expect(
+            emulator.loadExecutable(elfFixture('cpp'), { protectedPath: '/tmp/cpp' })
+        ).rejects.toThrow(/project/)
+        expect(emulator.getExecutable()).toEqual(elfFixture('crackme'))
+        await emulator.loadExecutable(elfFixture('cpp'), { protectedPath: '/project/./cpp' }).then(
+            () => {
+                throw new Error('a dot segment is not a protected path')
+            },
+            (error: Error) => expect(error.message).toMatch(/project/)
+        )
+        expect(emulator.getExecutable()).toEqual(elfFixture('crackme'))
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('accepts an empty environment from the native argument API', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        expect(emulator.module.blinkenlibSetProgramArguments(['./x'], [])).toBe(true)
+        expect(emulator.module.blinkenlibSetProgramArguments([], [])).toBe(true)
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('keeps running a program whose unimplementedSyscall listener throws', async () => {
+    const emulator = await createX86Emulator()
+    const deferred: (() => void)[] = []
+    const realSetTimeout = globalThis.setTimeout
+    try {
+        emulator.on('unimplementedSyscall', () => {
+            throw new Error('listener failed')
+        })
+        const source =
+            'global _start\nsection .text\n_start:\nmov eax,309\nsyscall\nmov rdi,rax\nneg rdi\nmov eax,60\nsyscall'
+        expect((await emulator.compile(source)).ok).toBe(true)
+        emulator.initialize(0)
+        // The hook rethrows on a task of its own; catch that task here instead of in vitest.
+        globalThis.setTimeout = ((callback: () => void, delay?: number) => {
+            if (!delay) {
+                deferred.push(callback)
+                return 0 as unknown as ReturnType<typeof setTimeout>
+            }
+            return realSetTimeout(callback, delay)
+        }) as typeof setTimeout
+        await emulator.run(1000)
+        globalThis.setTimeout = realSetTimeout
+        // ENOSYS reached the program, which exited with it.
+        expect(emulator.stopReason).toMatchObject({ kind: 'exit', exitCode: 38 })
+        expect(() => deferred.forEach((callback) => callback())).toThrow('listener failed')
+    } finally {
+        globalThis.setTimeout = realSetTimeout
+        emulator.dispose()
+    }
+})
+
+it('turns a native exit inside an instruction into a stop and starts afresh', async () => {
+    const emulator = await createX86Emulator()
+    const exitCode = process.exitCode
+    try {
+        const source =
+            'global _start\nsection .text\n_start:\nnop\nnop\nmov eax,60\nmov edi,4\nsyscall'
+        expect((await emulator.compile(source)).ok).toBe(true)
+        emulator.initialize(10)
+        await emulator.step()
+        const step = emulator.module._blinkenlib_stepi
+        // What Emscripten throws out of the wasm for a native exit(250).
+        emulator.module._blinkenlib_stepi = () => {
+            emulator.module._blinkenlib_stepi = step
+            step.call(emulator.module)
+            throw Object.assign(new Error('Program terminated with exit(250)'), {
+                name: 'ExitStatus',
+                status: 250
+            })
+        }
+        await emulator.step()
+        expect(emulator.stopReason).toMatchObject({ kind: 'host-error', exitCode: 250 })
+        expect(emulator.hasTerminated()).toBe(true)
+        expect(process.exitCode).toBe(exitCode)
+        emulator.clearExecution()
+        expect((await emulator.compile(source)).ok).toBe(true)
+        emulator.initialize(10)
+        await emulator.run(1000)
+        expect(emulator.stopReason).toMatchObject({ kind: 'exit', exitCode: 4 })
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it("resolves an assembled program's labels by their exact names, @ included", async () => {
+    const emulator = await createX86Emulator()
+    try {
+        const source = [
+            'global _start',
+            'section .text',
+            '_start:',
+            'foo@bar: nop',
+            'foo@@GLIBC_2.2.5: nop',
+            'section .data',
+            'data@v1: dq 0'
+        ].join('\n')
+        expect((await emulator.compile(source)).ok).toBe(true)
+        const start = emulator.resolveMemoryLabel('_start')!
+        expect(emulator.resolveMemoryLabel('foo@bar')).toBe(start)
+        expect(emulator.resolveMemoryLabel('foo@@GLIBC_2.2.5')).toBe(start + 1n)
+        expect(emulator.resolveMemoryLabel('foo')).toBeUndefined()
+        expect(emulator.resolveMemoryLabel('data@v1')).toBeDefined()
+    } finally {
+        emulator.dispose()
+    }
+})

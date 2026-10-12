@@ -608,6 +608,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.history.callStack()
     }
 
+    /**
+     * The instruction at a run-time address, as the disassembler's NASM text: a one-byte `db` for
+     * bytes that are no instruction, and null where nothing is mapped or the instruction runs
+     * into unmapped memory.
+     */
     getInstructionAt(address: bigint): Instruction | null {
         const instruction = this.runtime.getInstructionAt(address)
         if (!instruction) return null

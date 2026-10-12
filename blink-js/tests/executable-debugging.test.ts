@@ -1,7 +1,10 @@
 import { expect, it } from 'vitest'
-import { analyze, disassemble } from '../src/disassembler'
+import { loadDisassembler } from '../src/disassembler'
+import { analyze } from '../src/elf'
 import { createX86Emulator } from '../src/x86-emulator'
 import { elfFixture, fixtureEmulator } from './elf-fixtures'
+
+const { disassemble } = await loadDisassembler()
 
 it('stops at an address before strcmp, exposes its operands and names every loaded object', async () => {
     const bytes = elfFixture('crackme')
@@ -78,6 +81,56 @@ it('emits a named unimplemented syscall each time while leaving ENOSYS in rax', 
         ])
         expect(emulator.getRegisterValue('r12')).toBe(0xffffffffffffffdan)
         expect(emulator.getRegisterValue('r13')).toBe(0xffffffffffffffdan)
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('answers null for an instruction that runs into unmapped memory', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        // Two pages at 0x20000000, the second unmapped again. The first ends with `push es`,
+        // which is no instruction in 64-bit mode, `mov eax, 0x1`, which ends at the boundary,
+        // and the first byte of another `mov eax, imm32`, whose immediate would be unmapped.
+        const source = [
+            'global _start',
+            'section .text',
+            '_start:',
+            'mov eax, 9',
+            'mov edi, 0x20000000',
+            'mov esi, 0x2000',
+            'mov edx, 3',
+            'mov r10d, 0x32',
+            'mov r8, -1',
+            'xor r9d, r9d',
+            'syscall',
+            'mov eax, 11',
+            'mov edi, 0x20001000',
+            'mov esi, 0x1000',
+            'syscall',
+            'mov byte [0x20000ff9], 0x06',
+            'mov byte [0x20000ffa], 0xb8',
+            'mov dword [0x20000ffb], 1',
+            'mov byte [0x20000fff], 0xb8',
+            'stop:',
+            'mov eax, 60',
+            'xor edi, edi',
+            'syscall'
+        ].join('\n')
+        const build = await emulator.compile(source)
+        expect(build.ok, build.report).toBe(true)
+        const program = analyze(emulator.module.FS.readFile('/program') as Uint8Array)
+        const stop = program.symbols.find((symbol) => symbol.name === 'stop')!.value
+        emulator.initialize(0)
+        await emulator.run(1_000_000, [{ address: stop }])
+        expect(emulator.stopReason?.kind, emulator.stopReason?.details).toBe('breakpoint')
+        expect(emulator.getInstructionAt(0x20000ff9n)).toMatchObject({ code: 'db 0x06', size: 1 })
+        expect(emulator.getInstructionAt(0x20000ffan)).toMatchObject({
+            code: 'mov eax, 0x01',
+            size: 5
+        })
+        expect(emulator.getInstructionAt(0x20000fffn)).toBeNull()
+        expect(emulator.getInstructionAt(0x20001000n)).toBeNull()
     } finally {
         emulator.dispose()
     }

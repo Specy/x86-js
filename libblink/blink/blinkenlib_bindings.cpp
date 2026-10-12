@@ -138,20 +138,6 @@ bool SetFpuState(val bytes) {
   return blinkenlib_set_fpu_state(block);
 }
 
-val GetDisassemblySnapshot() {
-  val result = val::object();
-  val lines = val::array();
-  uint32_t currentLine = blinkenlib_refresh_disassembly();
-  uint32_t lineCount = blinkenlib_get_disassembly_line_count();
-  for (uint32_t index = 0; index < lineCount; ++index) {
-    const char *line = blinkenlib_get_disassembly_line(index);
-    if (line && line[0]) lines.set(index, std::string(line));
-  }
-  result.set("lines", lines);
-  result.set("currentLine", currentLine);
-  return result;
-}
-
 const char *StopKindName(uint32_t kind) {
   switch (kind) {
     case BLINKENLIB_STOP_BREAKPOINT:
@@ -249,21 +235,6 @@ val GetLastStepInfo() {
   return result;
 }
 
-val GetInstructionAt(uint64_t address) {
-  uint64_t resolvedAddress = 0;
-  uint8_t size = 0;
-  char buffer[1024];
-  if (!blinkenlib_get_instruction_at(address, &resolvedAddress, &size, buffer,
-                                     sizeof(buffer))) {
-    return val::null();
-  }
-  val result = val::object();
-  result.set("address", resolvedAddress);
-  result.set("size", size);
-  result.set("code", std::string(buffer));
-  return result;
-}
-
 val ResolveSymbol(uint64_t address) {
   uint64_t symbolAddress = 0;
   char buffer[1024];
@@ -354,12 +325,10 @@ EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
   emscripten::function("blinkenlibSetFpuState", &SetFpuState);
   emscripten::function("blinkenlibReadMemoryBytes", &ReadMemoryBytes);
   emscripten::function("blinkenlibWriteMemoryBytes", &WriteMemoryBytes);
-  emscripten::function("blinkenlibGetDisassembly", &GetDisassemblySnapshot);
   emscripten::function("blinkenlibSetRunControls", &SetRunControls);
   emscripten::function("blinkenlibGetRunControls", &GetRunControls);
   emscripten::function("blinkenlibGetRunStop", &GetRunStop);
   emscripten::function("blinkenlibGetLastStepInfo", &GetLastStepInfo);
-  emscripten::function("blinkenlibGetInstructionAt", &GetInstructionAt);
   emscripten::function("blinkenlibResolveSymbol", &ResolveSymbol);
   emscripten::function("blinkenlibSetEmulationArgs", &SetEmulationArgs);
   emscripten::function("blinkenlibSetProgramArguments", &SetProgramArguments);

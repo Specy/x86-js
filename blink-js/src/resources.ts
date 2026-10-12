@@ -17,22 +17,27 @@ export function toResourceUrl(source: string | URL): URL {
     }
 }
 
+/**
+ * A resource's bytes as a plain Uint8Array, never a Node `Buffer`, whose `slice` would alias it.
+ * A Uint8Array source is not copied.
+ */
 export async function readResourceBytes(source: ResourceSource): Promise<Uint8Array> {
-    if (source instanceof Uint8Array) return source
+    if (source instanceof Uint8Array) return plainBytes(source)
     if (source instanceof ArrayBuffer) return new Uint8Array(source)
 
     if (typeof source === 'string' && isNodeRuntime()) {
+        let url: URL | null = null
         try {
-            const url = new URL(source)
-            if (url.protocol === 'file:') {
-                const { readFile } = await import('node:fs/promises')
-                const { fileURLToPath } = await import('node:url')
-                return readFile(fileURLToPath(url))
-            }
+            url = new URL(source)
         } catch {
             const { readFile } = await import('node:fs/promises')
             const { resolve } = await import('node:path')
-            return readFile(resolve(source))
+            return plainBytes(await readFile(resolve(source)))
+        }
+        if (url.protocol === 'file:') {
+            const { readFile } = await import('node:fs/promises')
+            const { fileURLToPath } = await import('node:url')
+            return plainBytes(await readFile(fileURLToPath(url)))
         }
     }
 
@@ -40,14 +45,21 @@ export async function readResourceBytes(source: ResourceSource): Promise<Uint8Ar
     if (isNodeRuntime() && url.protocol === 'file:') {
         const { readFile } = await import('node:fs/promises')
         const { fileURLToPath } = await import('node:url')
-        return readFile(fileURLToPath(url))
+        return plainBytes(await readFile(fileURLToPath(url)))
     }
 
     const response = await fetch(url)
     if (!response.ok) {
-        throw new Error(`Failed to load resource ${url.href}: ${response.status} ${response.statusText}`)
+        throw new Error(
+            `Failed to load resource ${url.href}: ${response.status} ${response.statusText}`
+        )
     }
     return new Uint8Array(await response.arrayBuffer())
+}
+
+/** The same memory as a plain Uint8Array, so `slice` copies as it does for any Uint8Array. */
+function plainBytes(buffer: Uint8Array): Uint8Array {
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
 }
 
 export function defaultResourceUrl(relativePath: string, baseUrl: string): URL {

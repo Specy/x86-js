@@ -5,6 +5,8 @@ export default defineConfig({
     entry: {
         index: './src/index.ts',
         disassembler: './src/disassembler/index.ts',
+        // The ELF analyser is pure TypeScript, so recognising a program loads no wasm.
+        elf: './src/elf/index.ts',
         // The compiler-output translator imports nothing from the emulator, so its
         // bundle carries no wasm and a consumer that only translates never loads it.
         'compiler-output': './src/compiler-output/index.ts'
@@ -22,6 +24,11 @@ export default defineConfig({
                 types: './dist/disassembler.d.mts',
                 import: './dist/disassembler.mjs',
                 default: './dist/disassembler.mjs'
+            },
+            './elf': {
+                types: './dist/elf.d.mts',
+                import: './dist/elf.mjs',
+                default: './dist/elf.mjs'
             },
             './compiler-output': {
                 types: './dist/compiler-output.d.mts',

@@ -283,6 +283,15 @@ struct System {
   i64 brk;
   i64 brkstart;
   i64 automap;
+  // FindVirtualTopDown()'s free-area cache (see memorymalloc.c): the top the
+  // cache is for, where the next search starts below it, and the largest
+  // free run between those it skipped; then what the last search found, to
+  // become the cache once its mapping succeeds.
+  i64 topdown_top;
+  i64 topdown_hint;
+  i64 topdown_hole;
+  i64 topdown_found;
+  i64 topdown_found_hole;
   i64 memchurn;
   i64 codestart;
   long codesize;
@@ -518,6 +527,7 @@ i64 ReserveVirtual(struct System *, i64, i64, u64, int, i64, bool, bool);
 char *FormatPml4t(struct Machine *);
 i64 FindVirtual(struct System *, i64, i64);
 i64 FindVirtualTopDown(struct System *, i64, i64);
+void CommitVirtualTopDown(struct System *, i64);
 int FreeVirtual(struct System *, i64, i64);
 void CleanseMemory(struct System *, size_t);
 void LoadArgv(struct Machine *, char *, char *, char **, char **, u8[16]);

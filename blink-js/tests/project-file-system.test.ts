@@ -302,7 +302,7 @@ describe('Project FileSystem guest contracts', () => {
             emulator.dispose()
         }
     })
-    it('refuses mounted File mmap before MAP_FIXED can destroy an anonymous mapping', async () => {
+    it('refuses a shared mapping of a mounted File before MAP_FIXED can destroy an anonymous one', async () => {
         const initial = new Session()
         initial.files.set('data.txt', new Uint8Array(4096))
         const { emulator, bytes } = await mounted(
@@ -312,7 +312,8 @@ describe('Project FileSystem guest contracts', () => {
                 'mov qword [r12],123',
                 'sys 2,path,2,0',
                 'mov r13,rax',
-                'sys 9,r12,4096,3,18,r13,0',
+                // MAP_SHARED | MAP_FIXED
+                'sys 9,r12,4096,3,17,r13,0',
                 'save',
                 'saveq r12',
                 'finish',
@@ -323,6 +324,47 @@ describe('Project FileSystem guest contracts', () => {
         try {
             await emulator.run(10000)
             expect(quadwords(Uint8Array.from(bytes))).toEqual([-19n, 123n])
+        } finally {
+            emulator.dispose()
+        }
+    })
+    it('maps a mounted File privately as a copy read through the Project FileSystem', async () => {
+        const initial = new Session()
+        initial.files.set('flag.txt', new TextEncoder().encode('flag{private_copy}\n'))
+        const { emulator, bytes, session } = await mounted(
+            [
+                'sys 2,flag,0,0',
+                'mov r13,rax',
+                // PROT_READ | PROT_WRITE, MAP_PRIVATE: writes stay in the copy
+                'sys 9,0,8192,3,2,r13,0',
+                'mov r12,rax',
+                'sys 1,1,r12,19',
+                'mov byte [r12],70',
+                'movzx eax,byte [r12+4096]',
+                'save',
+                'movzx eax,byte [r12+19]',
+                'save',
+                'finish',
+                ...PATHS,
+                'section .data',
+                "flag: db './flag.txt',0",
+                'section .text'
+            ],
+            initial
+        )
+        let stdout = ''
+        emulator.on('stdout', (chunk) => {
+            stdout += new TextDecoder().decode(chunk)
+        })
+        try {
+            await emulator.run(10000)
+            expect(emulator.stopReason?.kind).toBe('exit')
+            expect(stdout).toBe('flag{private_copy}\n')
+            // past the end of the File, and the page after it, read as zeros
+            expect(quadwords(Uint8Array.from(bytes))).toEqual([0n, 0n])
+            expect(new TextDecoder().decode(session.files.get('flag.txt'))).toBe(
+                'flag{private_copy}\n'
+            )
         } finally {
             emulator.dispose()
         }

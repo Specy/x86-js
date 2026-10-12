@@ -343,6 +343,62 @@ assert.deepEqual(webAssemblyUses, [], 'the compiler-output subpath never touched
 assert.deepEqual(resolvedModules, [compilerOutputDist.href], 'translating loaded no module either')
 
 // ---------------------------------------------------------------------------
+// The elf subpath, without WebAssembly
+// ---------------------------------------------------------------------------
+
+// Recognising a program must not load a decoder or the emulator: @specy/x86/elf is
+// imported, and a fixture analysed, with the same WebAssembly stub in place, and
+// nothing it loads may carry or name a wasm module.
+const elfDist = new URL('../dist/elf.mjs', import.meta.url)
+assert.equal(import.meta.resolve('@specy/x86/elf'), elfDist.href)
+const elfModules = []
+Object.defineProperty(globalThis, 'WebAssembly', {
+    ...realWebAssembly,
+    value: forbiddenWebAssembly
+})
+const elfHooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+        const resolved = nextResolve(specifier, context)
+        elfModules.push(resolved.url)
+        return resolved
+    }
+})
+try {
+    const elf = await import('@specy/x86/elf')
+    assert.deepEqual(Object.keys(elf), ['analyze'], 'the elf subpath exports the analyser')
+    const analysis = elf.analyze(readFileSync(new URL('./fixtures/elf/crackme', import.meta.url)))
+    assert.equal(analysis.supported, true)
+    assert.deepEqual(analysis.needed, ['libc.so.6'])
+} finally {
+    elfHooks.deregister()
+    Object.defineProperty(globalThis, 'WebAssembly', realWebAssembly)
+}
+assert.deepEqual(webAssemblyUses, [], 'the elf subpath never touched WebAssembly')
+assert.equal(elfModules[0], elfDist.href)
+for (const url of elfModules) {
+    const source = readFileSync(new URL(url), 'utf8')
+    for (const marker of ['AGFzbQ', '.wasm', 'blinkenlib', 'nasm.mjs', 'zydis'])
+        assert.equal(source.includes(marker), false, `${url} carries no ${marker}`)
+}
+
+// No module of the package awaits at its top level, so each entry can be loaded with
+// require() too (Node refuses require(esm) of a module graph that does).
+{
+    const { createRequire } = await import('node:module')
+    const require = createRequire(import.meta.url)
+    for (const specifier of [
+        '@specy/x86',
+        '@specy/x86/disassembler',
+        '@specy/x86/elf',
+        '@specy/x86/compiler-output'
+    ])
+        assert.equal(typeof require(specifier), 'object', `require('${specifier}') loads it`)
+}
+console.log(
+    'ok - analysed an ELF through @specy/x86/elf without WebAssembly, and required every entry'
+)
+
+// ---------------------------------------------------------------------------
 // The root export
 // ---------------------------------------------------------------------------
 
@@ -1023,14 +1079,13 @@ assert.equal(
     import.meta.resolve('@specy/x86/disassembler'),
     new URL('../dist/disassembler.mjs', import.meta.url).href
 )
-const decoder = await import('@specy/x86/disassembler')
+const decoderModule = await import('@specy/x86/disassembler')
+assert.deepEqual(Object.keys(decoderModule), ['loadDisassembler'])
+const decoder = await decoderModule.loadDisassembler()
+assert.equal(await decoderModule.loadDisassembler(), decoder, 'one decoder per module')
 assert.equal(
     decoder.disassemble(Uint8Array.of(0xf3, 0x0f, 0x1e, 0xfa), 0x401000n)[0].text,
     'endbr64'
-)
-assert.equal(
-    decoder.analyze(readFileSync(new URL('./fixtures/elf/crackme', import.meta.url))).supported,
-    true
 )
 const patch = await root.assembleInstruction('je 0x555555555170', 0x555555555160n)
 assert.deepEqual([...patch.bytes], [0x74, 0x0e])

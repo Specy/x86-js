@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "blink/assert.h"
@@ -818,6 +819,64 @@ static int DetermineHostProtection(int prot) {
   return sysprot;
 }
 
+static void FreeVirtualTopDown(struct System *, i64, i64);
+
+#ifdef __EMSCRIPTEN__
+// Returns pages [from, to) of copies to the free list, cleared as FreePage()
+// clears the pages it frees.
+static void FreeCopiedPages(struct System *s, u64 *copies, i64 from, i64 to) {
+  u8 *page;
+  for (; from < to; ++from) {
+    page = (u8 *)(uintptr_t)(copies[from] & PAGE_TA);
+    ClearPage(page);
+    FreeAnonymousPage(s, page);
+    s->rss -= 1;
+  }
+}
+
+// Reads the pages of a private file mapping that hold any of the file's
+// bytes into anonymous pages, zero past the end of the file, before the
+// mapping changes anything: running out of memory, or a read that fails,
+// then leaves the address space as it was. The pages after them lie wholly
+// past the end of the file and become lazy zero pages, as anonymous memory
+// is, so a large mapping of a small file costs no memory until touched.
+// Returns how many pages were copied, or -1 with errno set.
+static i64 CopyFilePages(struct System *s, int fd, i64 offset, i64 pages,
+                         i64 filesize, u64 **out) {
+  u8 *page;
+  u64 *copies;
+  i64 i, count, copied;
+  ssize_t received;
+  *out = 0;
+  count = offset < filesize ? MIN(pages, (filesize - offset + 4095) / 4096) : 0;
+  if (!count) return 0;
+  if (!(copies = (u64 *)malloc(count * sizeof(*copies)))) return enomem();
+  for (i = 0; i < count; ++i) {
+    if ((copies[i] = AllocateAnonymousPage(s)) == (u64)-1) {
+      FreeCopiedPages(s, copies, 0, i);
+      free(copies);
+      return enomem();
+    }
+    page = (u8 *)(uintptr_t)(copies[i] & PAGE_TA);
+    memset(page, 0, 4096);
+    for (copied = 0; copied < 4096;) {
+      received = pread(fd, page + copied, 4096 - copied,
+                       offset + i * 4096 + copied);
+      if (received < 0 && errno == EINTR) continue;
+      if (received < 0) {
+        FreeCopiedPages(s, copies, 0, i + 1);
+        free(copies);
+        return -1;
+      }
+      if (!received) break;
+      copied += received;
+    }
+  }
+  *out = copies;
+  return count;
+}
+#endif
+
 i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
                    i64 offset, bool shared, bool fixedmap) {
   u8 *mi;
@@ -836,6 +895,10 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
   // Private mappings own their bytes: avoid one 128 KiB host mmap per 4 KiB
   // guest page, and Emscripten munmap failures past the file end.
   bool copyfile = fd != -1 && !shared && !HasLinearMapping();
+  // For copyfile, the pages copied from the file, and how many of them this
+  // call has mapped so far (see CopyFilePages()).
+  u64 *copies = 0;
+  i64 filepages = 0, copiesmapped = 0;
 #endif
 
   // we determine these
@@ -874,12 +937,28 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
     }
   }
 
+  pages = ROUNDUP(size, 4096) / 4096;
+
+#ifdef __EMSCRIPTEN__
+  // Everything that can refuse the mapping does so before the existing one
+  // is removed. Linux maps only regular files here: a directory, a pipe, a
+  // terminal or a device such as /dev/null answers ENODEV.
+  if (fd != -1) {
+    struct stat st;
+    if (fstat(fd, &st) == -1) return -1;
+    if (!S_ISREG(st.st_mode)) return enodev();
+    if (copyfile && (filepages = CopyFilePages(s, fd, offset, pages,
+                                               st.st_size, &copies)) == -1) {
+      return -1;
+    }
+  }
+#endif
+
   // remove existing mapping
   vss_delta = 0;
   rss_delta = 0;
   mutated = false;
   executable_code_was_made_non_executable = false;
-  pages = ROUNDUP(size, 4096) / 4096;
   if (HasLinearMapping() && FLAG_vabits <= 47) {
     if (fixedmap) {
       method = MAP_FIXED;
@@ -962,7 +1041,8 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
 #ifdef __EMSCRIPTEN__
     if (copyfile) {
       vss_delta += pages;
-      s->memstat.committed += pages;
+      s->memstat.committed += filepages;
+      s->memstat.reserved += pages - filepages;
       flags |= PAGE_HOST;
     } else
 #endif
@@ -995,6 +1075,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
         pt = LoadPte(mi);
         if (!(pt & PAGE_V)) {
           if ((pt = AllocatePageTable(s)) == -1) {
+            if (!HasLinearMapping()) goto OutOfMemory;
             WriteErrorString("mmap() crisis: ran out of page table memory\n");
             exit(250);
           }
@@ -1006,22 +1087,12 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
         uintptr_t real;
 #ifdef __EMSCRIPTEN__
         if (copyfile) {
-          i64 copied = 0;
-          ssize_t received;
-          u64 page = AllocateAnonymousPage(s);
-          if (page == (u64)-1) PanicDueToMmap();
-          real = page & PAGE_TA;
-          memset((void *)real, 0, 4096);
-          while (copied < 4096) {
-            received = pread(fd, (u8 *)real + copied, 4096 - copied,
-                             offset + copied);
-            if (received < 0 && errno == EINTR) continue;
-            if (received < 0) PanicDueToMmap();
-            if (!received) break;
-            copied += received;
+          if (copiesmapped < filepages) {
+            entry = (copies[copiesmapped++] & PAGE_TA) | flags | PAGE_V;
+          } else {
+            // wholly past the end of the file: a zero page on first touch
+            entry = (flags & ~PAGE_HOST) | PAGE_RSRV | PAGE_V;
           }
-          offset += 4096;
-          entry = real | flags | PAGE_V;
         } else
 #endif
         if (flags & PAGE_MAP) {
@@ -1043,6 +1114,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
             mugflags = (shared ? MAP_SHARED : MAP_PRIVATE) |
                        (fd == -1 ? MAP_ANONYMOUS_ : 0);
             mug = AllocateBig(mugsize, sysprot, mugflags, fd, mugoff);
+            if (!mug && !HasLinearMapping()) goto OutOfMemory;
             if (!mug) {
               ERRF("mmap(virt=%" PRIx64
                    ", size=%ld, flags=%#x, fd=%d, offset=%#" PRIx64
@@ -1087,12 +1159,51 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
 #endif
           InvalidateSystem(s, !!rss_delta,
                            executable_code_was_made_non_executable);
+#ifdef __EMSCRIPTEN__
+          free(copies);
+#endif
           return result;
         }
         if (++ti == 512) break;
         mi += 8;
       }
     }
+  }
+
+OutOfMemory:
+  // The host has no memory for a page table or a page: undo what this call
+  // did and fail with ENOMEM rather than ending the process. The pages up to
+  // virt are mapped and are unmapped again; the rest were only counted. As
+  // on Linux, a range a MAP_FIXED mapping replaced is left unmapped.
+  {
+    i64 mapped = (virt - result) / 4096;
+    i64 unmapped = pages - mapped;
+    i64 page;
+    LOGF("mmap(%#" PRIx64 ", %#" PRIx64 ") ran out of host memory", result,
+         size);
+    vss_delta -= unmapped;
+#ifdef __EMSCRIPTEN__
+    if (copyfile) {
+      s->memstat.committed -= filepages - copiesmapped;
+      s->memstat.reserved -= unmapped - (filepages - copiesmapped);
+      FreeCopiedPages(s, copies, copiesmapped, filepages);
+      free(copies);
+    } else
+#endif
+    if (flags & PAGE_RSRV) {
+      s->memstat.reserved -= unmapped;
+    } else {
+      s->memstat.committed -= unmapped;
+    }
+    s->rss += rss_delta;
+    s->vss += vss_delta;
+    if (flags & PAGE_FILE) {
+      for (page = virt; page < end; page += 4096) UnmarkFilePage(s, page);
+    }
+    if (mapped) FreeVirtual(s, result, mapped * 4096);
+    FreeVirtualTopDown(s, result, size);
+    InvalidateSystem(s, true, executable_code_was_made_non_executable);
+    return enomem();
   }
 }
 
@@ -1124,10 +1235,32 @@ StartOver:
 
 // Find the highest free interval below top. Skip absent page-table subtrees,
 // so scanning the 47-bit guest space does not visit every unmapped page.
+//
+// Each search would otherwise walk down through every page mapped below top,
+// which made a program that maps thousands of regions quadratic. Like Linux's
+// old free_area_cache, a search starts below topdown_hint instead: the start
+// of the last mapping placed, below which the previous search stopped. Every
+// free run above the hint is one that search skipped as too small, so it is
+// no larger than topdown_hole; a request that could fit such a run searches
+// from the top again. FreeVirtual() raises the hint over memory it frees
+// above it. A search only proposes the cache (topdown_found); it becomes the
+// cache when the mapping succeeds (CommitVirtualTopDown()).
 i64 FindVirtualTopDown(struct System *s, i64 top, i64 size) {
-  i64 start, cursor, addr, level, pt, boundary;
+  i64 start, cursor, addr, level, pt, boundary, hole;
   size = ROUNDUP(size, 4096);
   top = ROUNDDOWN(top, 4096);
+  if (s->topdown_top != top) {
+    s->topdown_top = top;
+    s->topdown_hint = 0;
+    s->topdown_hole = 0;
+  }
+  s->topdown_found = -1;
+  hole = 0;
+  if (s->topdown_hint > 0 && s->topdown_hint < top &&
+      size > s->topdown_hole) {
+    hole = s->topdown_hole;
+    top = s->topdown_hint;
+  }
   while (top >= kNullSize + size) {
     start = top - size;
     cursor = top;
@@ -1140,15 +1273,44 @@ i64 FindVirtualTopDown(struct System *s, i64 top, i64 size) {
       }
       boundary = addr & ~(((i64)1 << level) - 1);
       if (pt & PAGE_V) {
+        // the free run [boundary + 4096, top) is too small for this request
+        hole = MAX(hole, top - (boundary + 4096));
         top = boundary;
         break;
       }
       cursor = boundary;
     }
-    if (cursor <= start) return start;
+    if (cursor <= start) {
+      s->topdown_found = start;
+      s->topdown_found_hole = hole;
+      return start;
+    }
   }
   // Linux's fallback allocation searches from the bottom of the address space.
   return FindVirtual(s, kNullSize, size);
+}
+
+// The mapping FindVirtualTopDown() last found was made at virt.
+void CommitVirtualTopDown(struct System *s, i64 virt) {
+  if (virt == -1 || virt != s->topdown_found) return;
+  s->topdown_hint = virt;
+  s->topdown_hole = s->topdown_found_hole;
+  s->topdown_found = -1;
+}
+
+// Freeing memory above the hint makes a free run the cache does not know.
+// When the page after it is mapped, the run ends there, and the hint can rise
+// to that end; otherwise it may join a run above, and the next search starts
+// from the top.
+static void FreeVirtualTopDown(struct System *s, i64 virt, i64 size) {
+  i64 end = ROUNDUP(virt + size, 4096);
+  if (s->topdown_hint <= 0 || end <= s->topdown_hint) return;
+  if (end < s->topdown_top && !IsFullyUnmapped(s, end, 4096)) {
+    s->topdown_hint = end;
+  } else {
+    s->topdown_hint = 0;
+    s->topdown_hole = 0;
+  }
 }
 
 int FreeVirtual(struct System *s, i64 virt, i64 size) {
@@ -1185,6 +1347,7 @@ int FreeVirtual(struct System *s, i64 virt, i64 size) {
   s->vss += vss_delta;
   s->rss += rss_delta;
   s->memchurn -= vss_delta;
+  FreeVirtualTopDown(s, virt, size);
   InvalidateSystem(s, !!rss_delta, executable_code_was_made_non_executable);
   return rc;
 }

@@ -1,4 +1,5 @@
 import createNasm from './wasm/nasm.mjs'
+import { loadDisassembler, type Disassembler } from './disassembler'
 import { selectX86Source, stageX86Project } from './project'
 import { readResourceBytes } from './resources'
 import { parseDependencyList, x86TranslationUnitCandidates } from './translation-units'
@@ -291,27 +292,454 @@ export const nasmWasmAssembler: WasmAssembler = {
     }
 }
 
-/** Assemble one instruction at its runtime address, for a debugger Poke. */
+/** What {@link assembleInstruction} answers: the encoding, or why the text has none. */
+export type AssembledInstruction = { bytes: Uint8Array } | { error: string }
+
+/** A line of NASM and the run-time address its first byte will have. */
+export type InstructionRequest = { text: string; address: bigint }
+
+/**
+ * Assemble one instruction at its run-time address, for a debugger Poke. The text is NASM as the
+ * decoder prints it, with every address written as a number:
+ *
+ * - a direct branch names its absolute target (`je 0x401020`, `call 0x401000+0x10`); it is encoded
+ *   relative to `address`, short whenever the target is in reach of one;
+ * - `[rel 0x404010]`, `[rel 0x404010+0x8]` and `[rel 0x404010-0x8]` name the absolute address a
+ *   RIP-relative operand reaches, with any size keyword and segment around them
+ *   (`qword fs:[rel 0x404010]`, or `[fs:rel 0x404010]`); a name inside `[rel ...]` is an error,
+ *   since labels are the caller's to resolve;
+ * - `[0x404010]` is an absolute address (NASM's `default abs`);
+ * - `notrack` is encoded as the `3e` prefix it stands for, and an ignored segment prefix the
+ *   decoder prints (`nop word cs:[rax+rax*1]`) is encoded too.
+ *
+ * Nothing is silently encoded as something else: a value NASM would truncate is an error, not a
+ * warning, and so is a branch or RIP-relative target out of reach of its displacement (the
+ * encoding is decoded again and must reach the target the text named), a memory operand whose
+ * size NASM 3.00 would guess (`add [rax], 1`), and the few forms NASM 3.00 encodes wrongly.
+ * Errors read without NASM's file, line and severity. NASM's -Ox still chooses the shortest
+ * encoding, which may not be the original's: `mov rax, 0x10` becomes `mov eax, 0x10`, the same
+ * result in five bytes instead of seven, and the bytes never exceed 15.
+ */
 export async function assembleInstruction(
     text: string,
     address: bigint
-): Promise<{ bytes: Uint8Array } | { error: string }> {
-    if (!text.trim() || /[\r\n]/.test(text)) return { error: 'Enter one instruction' }
-    if (address < 0n || address > 0xffffffffffffffffn) return { error: 'Invalid x86-64 address' }
-    // NASM treats an absolute numeric target as near even at -Ox. Prefer the
-    // architectural short encoding when a direct branch's displacement fits.
-    const branch = /^(j(?:mp|[a-z]{1,3}))\s+(0x[\da-f]+|\d+)$/i.exec(text.trim())
-    if (branch) {
-        const delta = BigInt(branch[2]) - address - 2n
-        if (delta >= -128n && delta <= 127n) text = `${branch[1]} short ${branch[2]}`
+): Promise<AssembledInstruction> {
+    const [result] = await assembleInstructions([{ text, address }])
+    return result!
+}
+
+/**
+ * {@link assembleInstruction} for many lines at once, answered in order, through the same code:
+ * each line is rewritten and checked exactly as it is alone, and one NASM instance assembles up
+ * to 200 of them, each in a section of its own that starts at its address, where alone each
+ * would cost an instance. The lines share NASM's names, so one that defines a label (decoder text
+ * never does) makes it visible to the lines after it in its batch.
+ */
+export async function assembleInstructions(
+    requests: readonly InstructionRequest[]
+): Promise<AssembledInstruction[]> {
+    const results: AssembledInstruction[] = new Array(requests.length)
+    const prepared: PreparedInstruction[] = []
+    requests.forEach(({ text, address }, index) => {
+        const item = prepareInstruction(text, address, index)
+        if ('error' in item) results[index] = item
+        else prepared.push(item)
+    })
+    await assembleAll(prepared, results)
+    const assembled = prepared.filter((item) => 'bytes' in results[item.index]!)
+    const targeted = assembled.filter(
+        (item) => item.branchTarget !== undefined || item.memoryTarget !== undefined
+    )
+    const unsized = assembled.filter((item) => item.line.includes('[') && !SIZED.test(item.line))
+    if (!targeted.length && !unsized.length) return results
+    const { disassemble } = await loadDisassembler()
+    for (const item of targeted)
+        results[item.index] = checkTargets(disassemble, item, bytesOf(results[item.index]!))
+    await refuseGuessedSizes(disassemble, unsized, results)
+    return results
+}
+
+async function assembleAll(
+    items: readonly PreparedInstruction[],
+    results: AssembledInstruction[]
+): Promise<void> {
+    for (let from = 0; from < items.length; from += INSTRUCTION_BATCH)
+        await assembleBatch(items.slice(from, from + INSTRUCTION_BATCH), results)
+}
+
+const bytesOf = (result: AssembledInstruction) => ('bytes' in result ? result.bytes : undefined)!
+
+const SIZES = ['byte', 'word', 'dword', 'qword', 'tword', 'oword', 'yword', 'zword']
+/** A memory operand with a size keyword: `qword [rax]`, `dword fs:[rel 0x404010]`. */
+const SIZED = new RegExp(String.raw`\b(${SIZES.join('|')})\s+(?:far\s+)?(?:[c-gs]s\s*:\s*)?\[`, 'i')
+
+/**
+ * NASM 3.00 does not refuse a memory operand whose size nothing gives, as NASM 2 did ("operation
+ * size not specified"): it picks one (`add [rax], 1` assembles as `add word [rax], 1`, and
+ * `idiv [rbp-8]` as a byte division). So when the encoding decodes with a size the text did not
+ * give, the line is assembled again with each other size, and if any of those encodes something
+ * else, the text was ambiguous and is refused. A size only one form has (`sete [rax]`,
+ * `fnstcw [rax]`) or one that changes no byte (`clflush [rax]`) needs no keyword.
+ */
+async function refuseGuessedSizes(
+    disassemble: Disassembler['disassemble'],
+    items: readonly PreparedInstruction[],
+    results: AssembledInstruction[]
+): Promise<void> {
+    const probes: (PreparedInstruction & { size: string })[] = []
+    const guessed: { item: PreparedInstruction; size: string; from: number }[] = []
+    for (const item of items) {
+        const [decoded] = disassemble(bytesOf(results[item.index]!), item.address)
+        const size = decoded && SIZED.exec(decoded.text)?.[1]?.toLowerCase()
+        if (!size) continue
+        const at = item.line.search(/(?:far\s+)?(?:[c-gs]s\s*:\s*)?\[/i)
+        guessed.push({ item, size, from: probes.length })
+        for (const other of SIZES)
+            if (other !== size)
+                probes.push({
+                    ...item,
+                    index: probes.length,
+                    size: other,
+                    line: `${item.line.slice(0, at)}${other} ${item.line.slice(at)}`
+                })
     }
+    if (!probes.length) return
+    const answers: AssembledInstruction[] = new Array(probes.length)
+    await assembleAll(probes, answers)
+    for (const { item, size, from } of guessed) {
+        const chosen = bytesOf(results[item.index]!)
+        const others = probes.slice(from, from + SIZES.length - 1).filter((probe) => {
+            const answer = answers[probe.index]!
+            return 'bytes' in answer && !sameBytes(answer.bytes, chosen)
+        })
+        if (!others.length) continue
+        const sizes = SIZES.filter((s) => s === size || others.some((probe) => probe.size === s))
+        results[item.index] = {
+            error: `The operation size is not specified: write ${sizes.slice(0, -1).join(', ')} or ${sizes.at(-1)} before the memory operand`
+        }
+    }
+}
+
+const sameBytes = (a: Uint8Array, b: Uint8Array) =>
+    a.length === b.length && a.every((byte, k) => byte === b[k])
+
+/** A request rewritten for NASM, and the absolute targets its encoding must reach. */
+type PreparedInstruction = {
+    index: number
+    address: bigint
+    /** The line NASM reads, in a section whose `$$` is `address`. */
+    line: string
+    branchTarget?: bigint
+    memoryTarget?: bigint
+}
+
+/**
+ * `-Werror` because a warning is how NASM reports a value it truncated (`add eax, 0x100000000`
+ * assembles to `83 c0 00` with only a warning). Two warnings are exceptions, as they only say a
+ * prefix is redundant while NASM still encodes it, which is what such text asks for: prefix-seg
+ * (a cs, ds, es or ss override has no effect in 64-bit mode; the decoder prints one as
+ * `nop word cs:[rax+rax*1]`) and prefix-lock-xchg (xchg with memory locks without one).
+ */
+const INSTRUCTION_ARGS = ['-Ox', '-fbin', '-Werror', '-w-prefix-seg', '-w-prefix-lock-xchg']
+const INSTRUCTION_SOURCE = '/instructions.asm'
+const INSTRUCTION_OUTPUT = '/instructions.bin'
+/** How many lines one NASM instance assembles; each is its own section, which NASM looks up by name. */
+const INSTRUCTION_BATCH = 200
+/**
+ * Each line is assembled into a 32-byte record: its encoding, zeros up to byte 29, the encoding's
+ * length, and the line's position in the batch as a word, which is how the output is checked to
+ * be laid out as expected.
+ */
+const RECORD_SIZE = 32
+const RECORD_LENGTH_AT = 29
+/** The longest encoding of one x86 instruction. */
+const MAX_INSTRUCTION_LENGTH = 15
+/** `bits 64` and `default abs` come before the first section. */
+const HEADER_LINES = 2
+/** The lines of one record: section, the text, padding, length, position. */
+const RECORD_LINES = 5
+
+const MAX_ADDRESS = 0xffffffffffffffffn
+const NUMBER = String.raw`(?:0x[\da-f]+|\d+)`
+const ADDRESS_EXPRESSION = new RegExp(
+    String.raw`^\s*(${NUMBER})\s*(?:([+-])\s*(${NUMBER})\s*)?$`,
+    'i'
+)
+/** `$`, `$$`, numbers and arithmetic: an expression NASM resolves itself, inside the section. */
+const HERE_EXPRESSION =
+    /^(?:\s|\$\$?|0x[\da-f]+|\d+|[-+*/()~])*\$(?:\s|\$\$?|0x[\da-f]+|\d+|[-+*/()~])*$/i
+const SEGMENT = String.raw`(?:[c-gs]s\s*:\s*)`
+const RIP_RELATIVE = new RegExp(String.raw`^(\s*${SEGMENT}?)rel\b\s*(${SEGMENT}?)(.*)$`, 'is')
+const BRANCH =
+    /^((?:(?:bnd|notrack)\s+)*)(jmp|call|j[a-z]{1,4}|loop(?:n?[ez])?|xbegin)(\s+(?:(?:short|near)\s+)?)(\S.*)$/i
+const DIRECTIVE =
+    /^\s*(?:[%[]|(?:bits|use16|use32|use64|default|section|segment|absolute|extern|global|common|static|required|cpu|float|org|align|alignb|sectalign|struc|endstruc|istruc|iend|incbin|warning|map|list|debug)\b)/i
+const GPR64 = /^(?:r[abcd]x|r[sd]i|r[sb]p|rip|r(?:8|9|1[0-5]))$/i
+const GPR32 = /^(?:e[abcd]x|e[sd]i|e[sb]p|eip|r(?:8|9|1[0-5])d)$/i
+/**
+ * Text NASM 3.00 assembles to the wrong bytes without a warning, refused instead: kunpckbw comes
+ * out as kunpckwd and kunpckwd as an undefined encoding, bswap of a 16-bit register as xchg, and
+ * smsw into a 16-bit register as the 32-bit form.
+ */
+const MISENCODED: [RegExp, string][] = [
+    [/^kunpck(?:bw|wd)\b/i, 'NASM encodes kunpckbw and kunpckwd wrongly'],
+    [
+        /^bswap\s+(?:[abcd]x|[sd]i|[sb]p|r(?:8|9|1[0-5])w)\s*$/i,
+        'bswap of a 16-bit register is undefined, and NASM encodes it as xchg'
+    ],
+    [
+        /^smsw\s+(?:[abcd]x|[sd]i|[sb]p|r(?:8|9|1[0-5])w)\s*$/i,
+        'NASM encodes smsw into a 16-bit register as its 32-bit form'
+    ]
+]
+const GPR16 = /^(?:[abcd]x|[sd]i|[sb]p|r(?:8|9|1[0-5])w)$/i
+const CMPXCHG = /^((?:(?:lock|xacquire|xrelease)\s+)*)(cmpxchg\s+.*,\s*([a-z0-9]+))\s*$/i
+const VECTOR = /^[xyz]mm(?:\d|[12]\d|3[01])$/i
+
+const hex = (value: bigint) => `0x${value.toString(16)}`
+
+/** An absolute address written as `0xT`, `0xT+0xN` or `0xT-0xN` (or in decimal), wrapped to 64 bits. */
+function parseAddress(expression: string): bigint | undefined | 'overflow' {
+    const match = ADDRESS_EXPRESSION.exec(expression)
+    if (!match) return undefined
+    const base = BigInt(match[1]!)
+    const offset = match[3] === undefined ? 0n : BigInt(match[3])
+    if (base > MAX_ADDRESS || offset > MAX_ADDRESS) return 'overflow'
+    return BigInt.asUintN(64, match[2] === '-' ? base - offset : base + offset)
+}
+
+/**
+ * The target as NASM must read it to encode a displacement: relative to the section, which starts
+ * at the instruction. NASM can only encode `[rel 0x4018]` or `jmp 0x401020` relative to a number
+ * by giving up (absolute addressing for the first, and a displacement it never range-checks for
+ * the second); relative to `$$` it encodes the displacement and checks that it fits.
+ */
+function fromHere(target: bigint, address: bigint): string {
+    const delta = BigInt.asIntN(64, target - address)
+    return delta < 0n ? `$$-${hex(-delta)}` : `$$+${hex(delta)}`
+}
+
+/** The code of a line without its comment: everything before a `;` outside quotes. */
+function withoutComment(text: string): string {
+    let quote = ''
+    for (let i = 0; i < text.length; ++i) {
+        const c = text[i]!
+        if (quote) {
+            if (c === quote) quote = ''
+        } else if (c === "'" || c === '"' || c === '`') quote = c
+        else if (c === ';') return text.slice(0, i)
+    }
+    return text
+}
+
+/**
+ * NASM silently keeps only the low 32 bits of a displacement too large for one when the operand
+ * has a base register and the rest fits a byte (`[rax+0xffffffff]` assembles as `[rax-1]`), so a
+ * 64-bit address whose displacement is plain numbers is checked here. Anything else (names, `$`,
+ * parentheses) is left to NASM's own checks, and 32-bit addressing wraps at 4 GiB as written.
+ */
+function checkDisplacement(inside: string): string | undefined {
+    const expression = inside
+        .replace(new RegExp(String.raw`^\s*${SEGMENT}`, 'i'), '')
+        .replace(/^\s*(?:(?:abs|nosplit|byte|word|dword|qword)\s+)*/i, '')
+    let displacement = 0n
+    let wide = false
+    for (const piece of expression.split(/(?=[+-])/)) {
+        const term = piece.replace(/\s+/g, '')
+        const body = term.replace(/^[+-]/, '')
+        const scaled = /^(\w+)\*\d+$/.exec(body) ?? /^\d+\*(\w+)$/.exec(body)
+        const register = scaled ? scaled[1]! : body
+        if (GPR64.test(register)) wide = true
+        else if (GPR32.test(register)) return undefined
+        else if (VECTOR.test(register)) continue
+        else if (!scaled && new RegExp(`^${NUMBER}$`, 'i').test(body))
+            displacement += term.startsWith('-') ? -BigInt(body) : BigInt(body)
+        else return undefined
+    }
+    if (wide && (displacement < -(1n << 31n) || displacement >= 1n << 31n))
+        return `The displacement ${displacement < 0n ? '-' : ''}${hex(displacement < 0n ? -displacement : displacement)} does not fit in 32 bits`
+    return undefined
+}
+
+/** The text rewritten for NASM, which {@link assembleInstruction} and the batch path share. */
+function prepareInstruction(
+    text: string,
+    address: bigint,
+    index: number
+): PreparedInstruction | { error: string } {
+    if (!text.trim() || /[\r\n]/.test(text)) return { error: 'Enter one instruction' }
+    if (address < 0n || address > MAX_ADDRESS) return { error: 'Invalid x86-64 address' }
+    let line = withoutComment(text).trim()
+    // A trailing backslash would join the next line of the batch to this one.
+    if (!line || line.endsWith('\\')) return { error: 'Enter one instruction' }
+    if (DIRECTIVE.test(line)) return { error: 'Enter an instruction, not an assembler directive' }
+    for (const [form, error] of MISENCODED) if (form.test(line)) return { error }
+
+    let memoryTarget: bigint | undefined
+    let failure: string | undefined
+    line = line.replace(/\[([^\]]*)\]/g, (whole, inside: string) => {
+        const rel = RIP_RELATIVE.exec(inside)
+        if (!rel) {
+            failure ??= checkDisplacement(inside)
+            return whole
+        }
+        const target = parseAddress(rel[3]!)
+        if (target === 'overflow') failure ??= `${rel[3]!.trim()} does not fit in 64 bits`
+        else if (target !== undefined) {
+            memoryTarget = target
+            return `[${rel[1]}rel ${rel[2]}${fromHere(target, address)}]`
+        } else if (!HERE_EXPRESSION.test(rel[3]!))
+            failure ??= `Write the target of [rel ${rel[3]!.trim()}] as an address, such as [rel 0x404010] or [rel 0x404010+0x8]`
+        return whole
+    })
+    if (failure) return { error: failure }
+
+    let branchTarget: bigint | undefined
+    const branch = BRANCH.exec(line)
+    if (branch) {
+        const target = parseAddress(branch[4]!)
+        if (target === 'overflow') return { error: `${branch[4]!.trim()} does not fit in 64 bits` }
+        if (target !== undefined) {
+            branchTarget = target
+            line = `${branch[1]}${branch[2]}${branch[3]}${fromHere(target, address)}`
+        }
+    }
+    // NASM 3.00 encodes cmpxchg with a 64-bit or 16-bit register without its REX.W or 66 prefix
+    // (`cmpxchg [rdx], rbx` assembles as `cmpxchg [rdx], ebx`); o64 and o16 make it write them.
+    const cmpxchg = CMPXCHG.exec(line)
+    if (cmpxchg && (GPR64.test(cmpxchg[3]!) || GPR16.test(cmpxchg[3]!)))
+        line = `${cmpxchg[1]}${GPR64.test(cmpxchg[3]!) ? 'o64' : 'o16'} ${cmpxchg[2]}`
+    // NASM 3.00 accepts `notrack` and encodes nothing for it; `ds` is the 3e prefix it stands for.
+    line = line.replace(
+        /^((?:(?:lock|bnd|rep|repe|repz|repne|repnz|xacquire|xrelease)\s+)*)notrack\b/i,
+        '$1ds'
+    )
+    return { index, address, line, branchTarget, memoryTarget }
+}
+
+/** NASM's diagnostic, worded for a person: no file, line, severity or warning class. */
+function diagnosticMessage(message: string, item: PreparedInstruction, part: number): string {
+    message = message.replace(/\s*\[-w[+-][^\]]*\]\s*$/, '').trim()
+    if (part === 2 || /^TIMES value .* is negative$/i.test(message))
+        return `The text encodes more than ${MAX_INSTRUCTION_LENGTH} bytes, the most one instruction can have`
+    const target = item.branchTarget ?? item.memoryTarget
+    if (target !== undefined && /short jump is out of range/i.test(message))
+        return `${hex(target)} is out of reach of a short jump from ${hex(item.address)}`
+    if (target !== undefined && /^signed (?:byte|dword) exceeds bounds$/i.test(message))
+        return `${hex(target)} is out of reach of a 32-bit displacement from ${hex(item.address)}`
+    const overflow =
+        /^(signed |unsigned )?(byte|word|dword|qword)( displacement)? exceeds bounds$/i.exec(
+            message
+        )
+    if (overflow)
+        return `The ${overflow[3] ? 'displacement' : 'value'} does not fit in a ${overflow[1] ?? ''}${overflow[2]}`
+    if (/label alone on a line without a colon/i.test(message))
+        return `${item.line.split(/\s/)[0]} is not an instruction`
+    return message.charAt(0).toUpperCase() + message.slice(1)
+}
+
+type BatchRun = { output: Uint8Array } | { failed: Map<number, string>; message?: string }
+
+const DIAGNOSTIC = new RegExp(
+    String.raw`^(?:panic: )?${INSTRUCTION_SOURCE.replace(/[.]/g, '\\.')}:(\d+): (?:(?:error|warning|fatal|panic): )?(.*)$`
+)
+
+/** One NASM instance over a batch: its output, or which lines failed and why. */
+async function runBatch(items: readonly PreparedInstruction[]): Promise<BatchRun> {
+    let source = 'bits 64\ndefault abs\n'
+    items.forEach((item, k) => {
+        source +=
+            `section i${k} vstart=${hex(item.address)} align=1\n${item.line}\n` +
+            `..@e${k}: times ${RECORD_LENGTH_AT}-(..@e${k}-$$) db 0\ndb ..@e${k}-$$\ndw ${k}\n`
+    })
     const { module, stderr } = await createNasmModule()
-    module.FS.writeFile('/instruction.asm', `bits 64\norg 0x${address.toString(16)}\n${text}\n`)
-    const status = callNasm(module, ['-Ox', '-fbin', '/instruction.asm', '-o', '/instruction.bin'])
-    if (status !== 0)
-        return { error: stderr().trim().split('\n')[0] || 'The instruction did not assemble' }
-    const bytes = Uint8Array.from(module.FS.readFile('/instruction.bin') as Uint8Array)
-    if (!bytes.length)
-        return { error: stderr().trim().split('\n')[0] || 'The text did not encode an instruction' }
+    module.FS.writeFile(INSTRUCTION_SOURCE, source)
+    const status = callNasm(module, [
+        ...INSTRUCTION_ARGS,
+        INSTRUCTION_SOURCE,
+        '-o',
+        INSTRUCTION_OUTPUT
+    ])
+    const failed = new Map<number, string>()
+    let message: string | undefined
+    for (const diagnostic of stderr().split('\n')) {
+        if (!diagnostic.trim()) continue
+        const match = DIAGNOSTIC.exec(diagnostic)
+        const offset = match ? Number(match[1]) - 1 - HEADER_LINES : -1
+        const k = Math.floor(offset / RECORD_LINES)
+        if (match && offset >= 0 && k < items.length) {
+            if (!failed.has(k))
+                failed.set(k, diagnosticMessage(match[2]!, items[k]!, offset % RECORD_LINES))
+        } else message ??= diagnostic.replace(/^[^:]*: (?:error|warning|fatal|panic): /, '')
+    }
+    if (status !== 0 || failed.size) return { failed, message }
+    const output = module.FS.analyzePath(INSTRUCTION_OUTPUT).exists
+        ? (module.FS.readFile(INSTRUCTION_OUTPUT) as Uint8Array)
+        : undefined
+    const laidOut =
+        output?.length === items.length * RECORD_SIZE &&
+        items.every(
+            (_, k) =>
+                output[k * RECORD_SIZE + RECORD_SIZE - 2]! +
+                    (output[k * RECORD_SIZE + RECORD_SIZE - 1]! << 8) ===
+                k
+        )
+    return laidOut
+        ? { output }
+        : { failed, message: 'The text did not assemble as one instruction' }
+}
+
+/** Assemble a batch, setting aside the lines NASM rejects and assembling the others again. */
+async function assembleBatch(
+    items: readonly PreparedInstruction[],
+    results: AssembledInstruction[]
+): Promise<void> {
+    while (items.length) {
+        const run = await runBatch(items)
+        if ('output' in run) {
+            items.forEach((item, k) => {
+                const at = k * RECORD_SIZE
+                const length = run.output[at + RECORD_LENGTH_AT]!
+                results[item.index] = !length
+                    ? { error: 'The text did not encode an instruction' }
+                    : length > MAX_INSTRUCTION_LENGTH
+                      ? { error: diagnosticMessage('TIMES value is negative', item, 2) }
+                      : { bytes: run.output.slice(at, at + length) }
+            })
+            return
+        }
+        if (run.failed.size) {
+            for (const [k, error] of run.failed) results[items[k]!.index] = { error }
+            items = items.filter((_, k) => !run.failed.has(k))
+            continue
+        }
+        // NASM failed without naming a line of the batch: assemble each half alone to find which.
+        if (items.length === 1) {
+            results[items[0]!.index] = { error: run.message || 'The instruction did not assemble' }
+            return
+        }
+        const half = items.length >> 1
+        await assembleBatch(items.slice(0, half), results)
+        await assembleBatch(items.slice(half), results)
+        return
+    }
+}
+
+/** The encoding must reach the targets the text named, which NASM only checks for range. */
+function checkTargets(
+    disassemble: Disassembler['disassemble'],
+    item: PreparedInstruction,
+    bytes: Uint8Array
+): AssembledInstruction {
+    const [decoded] = disassemble(bytes, item.address)
+    const reached = (target: bigint | undefined, key: 'branchTarget' | 'memoryTarget') => {
+        if (target === undefined) return true
+        const operand = decoded?.operands.find((o) => o[key] !== undefined)
+        return !operand || operand[key] === target
+    }
+    if (!reached(item.branchTarget, 'branchTarget'))
+        return { error: `${hex(item.branchTarget!)} is out of reach from ${hex(item.address)}` }
+    if (!reached(item.memoryTarget, 'memoryTarget'))
+        return { error: `${hex(item.memoryTarget!)} is out of reach from ${hex(item.address)}` }
     return { bytes }
 }

@@ -227,4 +227,20 @@ export type X86ExecutableOptions = {
     protectedPath?: string | null
 }
 
-export type X86LoadedObject = { path: string; soname?: string; base: bigint; end: bigint }
+/** An ELF the loader mapped from a file: the program, the dynamic linker or a shared library. */
+export type X86LoadedObject = {
+    /**
+     * Where the loader opened it. The program is `/program`, a path that exists only while the
+     * loader reads it (it is removed before the first instruction); libraries are at their
+     * Linux paths, such as `/lib/x86_64-linux-gnu/libc.so.6`.
+     */
+    path: string
+    /** `DT_SONAME`, for a shared library that has one. */
+    soname?: string
+    /** The load bias: what is added to the ELF's link-time addresses. */
+    base: bigint
+    /** The end of its highest segment, page-aligned, as a runtime address. */
+    end: bigint
+    /** True for the program itself, false for the dynamic linker and libraries. */
+    main: boolean
+}

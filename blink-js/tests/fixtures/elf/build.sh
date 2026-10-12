@@ -12,11 +12,11 @@ cp crackme crackme-stripped
 strip crackme-stripped
 gcc -O0 -fPIE -pie math.c -lm -o math
 g++ -O0 -fPIE -pie cpp.cpp -o cpp
-for name in argv-env ptrace self-write crackme-argv overflow; do
+for name in argv-env ptrace self-write crackme-argv overflow timedwait; do
   gcc -O0 -fno-builtin -fPIE -pie "$name.c" -o "$name"
 done
 gcc -O2 -fPIE -pie avx.c -o avx
 if command -v go >/dev/null 2>&1; then
   CGO_ENABLED=0 go build -o hello-go hello.go
 fi
-sha256sum crackme crackme-stripped crackme-static* hello-atexit hello-atexit-static hello-atexit-static-pie math cpp argv-env ptrace self-write crackme-argv overflow avx
+sha256sum crackme crackme-stripped crackme-static* hello-atexit hello-atexit-static hello-atexit-static-pie math cpp argv-env ptrace self-write crackme-argv overflow timedwait avx

@@ -26,6 +26,11 @@
             "import": "./dist/disassembler.mjs",
             "default": "./dist/disassembler.mjs"
         },
+        "./elf": {
+            "types": "./dist/elf.d.mts",
+            "import": "./dist/elf.mjs",
+            "default": "./dist/elf.mjs"
+        },
         "./package.json": "./package.json"
     },
     "files": ["dist"],
