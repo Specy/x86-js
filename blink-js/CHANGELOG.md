@@ -21,10 +21,15 @@ Debugger reads and Undo work throughout the guest address space.
   mappings no longer takes quadratic time.
 - A native exit inside the wasm no longer leaves the runtime unusable: it
   becomes a `host-error` stop, and Node's `process.exitCode` is left alone.
+  When Blink's loader ends the process for a program it cannot load, the stop
+  is `load-fail` with exit code 127 and the loader's message (such as
+  "program headers aren't ordered").
 - Load ELF programs with loadExecutable, resolving the five bundled Ubuntu
   libraries on demand: ld-linux, libc, libm, libstdc++ and libgcc_s. A load
   copies its bytes, checks its options before replacing the program, and
-  throws when a later load or build supersedes it.
+  throws when a later load or build supersedes it; a build started before a
+  load throws the same way, leaving the later program loaded. A load or build
+  its own checks refuse supersedes nothing.
 - Pass lossless UTF-8 Arguments and the fixed Linux environment.
 - Protect a mounted running Executable from writes/truncation with ETXTBSY
   and from unlink/rename with EBUSY.
@@ -36,7 +41,8 @@ Debugger reads and Undo work throughout the guest address space.
   TCSETS2, TCSETSW2 and TCSETSF2 as it answers TCGETS and TCSETS, with
   38400 bits per second, so glibc 2.42 and later find a tty: isatty() is
   true, and standard output is line-buffered, which writes a prompt
-  without a newline before the read that waits for its answer.
+  without a newline before the read that waits for its answer. Setting the
+  terminal through termios2 is an Undo boundary, as through TCSETS.
 - A Call stack frame has `target`, where its call went, beside `address`, where
   the symbol covering it starts: a call into a PLT stub, which no symbol names,
   goes to the stub, not to `_init` before it.
@@ -53,7 +59,10 @@ Debugger reads and Undo work throughout the guest address space.
   symbols, dependencies, relocations (RELR and static `.rela.plt` included,
   each naming its table), symbol versions and PLT stub names read through
   PT_DYNAMIC when they are not, and a reason naming the machine of a program
-  for another one. analyze never throws.
+  for another one. A program Blink's loader would refuse is unsupported, with
+  a reason: load segments out of address order, a segment whose address and
+  file offset are at different places in a page, an ET_EXEC program in page 0,
+  an interpreter path whose last byte is not NUL. analyze never throws.
 - Add @specy/x86/disassembler with Zydis 4.1.1 batch decoding behind
   loadDisassembler(); importing the package or a subpath no longer
   instantiates wasm or awaits at the top level. Instruction queries use its
@@ -75,7 +84,10 @@ Debugger reads and Undo work throughout the guest address space.
   inside `[rel ...]` is refused, and NASM runs with -Werror, so a value it
   would truncate, a target out of reach, a memory operand whose size it would
   guess or a form NASM 3.00 encodes wrongly is an error rather than other
-  bytes.
+  bytes. A branch or `[rel ...]` target and a 64-bit displacement may be any
+  constant expression of numbers, `$`, `+ - * / ~` and parentheses: it is
+  computed and checked before NASM encodes it, and one written otherwise is
+  refused.
 - Remove Blink's own disassembly listing (getDisassemblyLines,
   getDisassemblyCurrentLine and its native bindings), which nothing used.
 

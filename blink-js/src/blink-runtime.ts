@@ -168,6 +168,8 @@ export class BlinkRuntime {
     private generation = 0
     /** Counts every replacement of the program: a load, a build or a cleared session. */
     private programReplacements = 0
+    /** What Blink writes to stderr while it loads the program: why, when the load fails. */
+    private loaderOutput: number[] | null = null
     private readonly callbacks: Required<BlinkRuntimeCallbacks>
     private readonly scheduler: (callback: () => void) => void
     /**
@@ -357,7 +359,9 @@ export class BlinkRuntime {
         // Before anything changes, so that a Project the build cannot take leaves the previous
         // program, and the state it is in, exactly as they were.
         validateX86Project(project)
-        ++this.programReplacements
+        // A later load or build supersedes this one: it stops at its next await (see
+        // `throwIfSuperseded`), leaving the newer program as it is.
+        const replacement = ++this.programReplacements
         this.detachProjectFileSystem()
         const sourceProject = copyX86Project(project)
         this.layoutUnits = []
@@ -384,12 +388,12 @@ export class BlinkRuntime {
 
         try {
             if (this.mode.wasmAssembler) {
-                await this.assembleWithWasmAssembler(sourceProject, options)
+                await this.assembleWithWasmAssembler(sourceProject, options, replacement)
             } else {
-                await this.assembleInBlink(sourceProject)
+                await this.assembleInBlink(sourceProject, replacement)
             }
         } finally {
-            this.assembleOnly = false
+            if (replacement === this.programReplacements) this.assembleOnly = false
             this.module.FS.chdir('/')
         }
 
@@ -564,14 +568,16 @@ export class BlinkRuntime {
         ]
     }
 
-    private async assembleInBlink(sourceProject: X86Project): Promise<void> {
+    private async assembleInBlink(sourceProject: X86Project, replacement: number): Promise<void> {
         stageX86Project(this.module.FS, sourceProject)
         this.setState(BlinkState.Assembling)
         await defer()
+        this.throwIfSuperseded(replacement)
         this.runTool('/assembler', this.mode.binaries.assembler!.commands)
         await this.waitForState(
             (state) => state !== BlinkState.Assembling && state !== BlinkState.Linking
         )
+        this.throwIfSuperseded(replacement)
         if (this.assemblerErrors.length === 0) {
             try {
                 this.assembledObjects = [this.module.FS.readFile('/program.o') as Uint8Array]
@@ -589,10 +595,12 @@ export class BlinkRuntime {
      */
     private async assembleWithWasmAssembler(
         sourceProject: X86Project,
-        options: { link: boolean }
+        options: { link: boolean },
+        replacement: number
     ): Promise<void> {
         this.setState(BlinkState.Assembling)
         const assembled = await this.mode.wasmAssembler!.assemble(sourceProject)
+        this.throwIfSuperseded(replacement)
 
         // What the assembler said goes into the report, as a blink-hosted tool's does.
         this.assemblerLogs += assembled.stdout + assembled.stderr
@@ -657,6 +665,7 @@ export class BlinkRuntime {
         const mapped = userMembers.length > 0
         this.beginLinking()
         await defer()
+        this.throwIfSuperseded(replacement)
         this.runTool(
             '/linker',
             this.mode.binaries.linker
@@ -665,6 +674,7 @@ export class BlinkRuntime {
                 (mapped ? ' -Map /program.map' : '')
         )
         await this.waitForState((state) => state !== BlinkState.Linking)
+        this.throwIfSuperseded(replacement)
         if (mapped && this.state === BlinkState.ProgramLoaded) {
             const map = this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string
             for (const unit of userMembers) {
@@ -679,6 +689,14 @@ export class BlinkRuntime {
                     })
             }
         }
+    }
+
+    /** A build stops where it resumes once a later load or build has replaced its program. */
+    private throwIfSuperseded(replacement: number): void {
+        if (replacement !== this.programReplacements)
+            throw new Error(
+                'This build was superseded: another program was loaded or built before it finished'
+            )
     }
 
     /**
@@ -712,20 +730,20 @@ export class BlinkRuntime {
         data: ArrayBuffer | Uint8Array,
         options: X86ExecutableOptions = {}
     ): Promise<X86ExecutableInfo> {
-        // Taken before anything is awaited: a later load or build supersedes this one, whichever
-        // finishes first.
-        const replacement = ++this.programReplacements
         const bytes = copyBytes(data)
         const info = analyze(bytes)
         if (!info.supported) throw new Error(info.reason)
         // Everything the options ask for is checked before the program is replaced, so a load
-        // that throws leaves the previous program as it was.
+        // that throws leaves the previous program as it was, and an earlier load or build going on.
         if (options.argv0 !== undefined || options.arguments !== undefined)
             validateProgramArguments(options.argv0 ?? '/program', options.arguments ?? [])
         const protectedPath =
             options.protectedPath === undefined
                 ? undefined
                 : normalizeProtectedPath(options.protectedPath)
+        // Taken once the load's own checks pass and before anything is awaited: a later load or
+        // build supersedes this one, whichever finishes first.
+        const replacement = ++this.programReplacements
         const libraries = await resolveLinuxLibraries(info.needed, info.interpreter)
         if (replacement !== this.programReplacements)
             throw new Error(
@@ -1377,25 +1395,37 @@ export class BlinkRuntime {
                 ])
             )
                 throw new Error('Arguments exceed the native process limits')
+            this.loaderOutput = []
             this.module._blinkenlib_starti()
+            this.loaderOutput = null
             this.checkHostError()
             this.module.FS.unlink(PROGRAM)
             if (method === '_blinkenlib_run') {
                 this.callNative(() => this.module._blinkenlib_continue())
             }
         } catch (error) {
-            // The loader ends the process with exit(127) when it cannot load the program.
-            if (nativeExitStatus(error) !== null) {
+            // The loader ends the process with exit(127) when it cannot load the program, after
+            // writing why to stderr.
+            const status = nativeExitStatus(error)
+            const loaderOutput = new TextDecoder().decode(Uint8Array.from(this.loaderOutput ?? []))
+            this.loaderOutput = null
+            if (status !== null) {
                 restoreNodeExitCode(exitCode)
                 if (stack !== undefined) this.module.stackRestore?.(stack)
                 this.module._blinkenlib_recover_native_exit?.()
             }
-            const cause = this.module.blinkHostError ?? error
+            const hostError = this.module.blinkHostError
             this.module.blinkHostError = undefined
+            const cause = hostError ?? error
             this.stopReason = {
                 loadFail: true,
-                exitCode: 0,
-                details: cause instanceof Error ? cause.message : String(cause),
+                exitCode: status ?? 0,
+                details:
+                    hostError === undefined && status !== null
+                        ? loaderFailure(loaderOutput, status)
+                        : cause instanceof Error
+                          ? cause.message
+                          : String(cause),
                 kind: 'load-fail'
             }
             this.setState(BlinkState.ProgramStopped)
@@ -1481,6 +1511,8 @@ export class BlinkRuntime {
             this.collectToolOutput(bytes)
             return
         }
+        if (channel === STDERR_CHANNEL && this.loaderOutput && this.loaderOutput.length < 4096)
+            this.loaderOutput.push(...bytes.subarray(0, 4096 - this.loaderOutput.length))
         const callback = channel === STDERR_CHANNEL ? this.callbacks.stderr : this.callbacks.stdout
         // A handler that throws must not unwind the wasm in the middle of a system call; it is
         // reported as an asynchronous callback's failure is.
@@ -1677,9 +1709,12 @@ export class BlinkRuntime {
         }
 
         this.beginLinking()
-        this.scheduler(() =>
-            this.runTool('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '')
-        )
+        // Not once a load or build has replaced the program while the link waited to start.
+        const replacement = this.programReplacements
+        this.scheduler(() => {
+            if (replacement === this.programReplacements)
+                this.runTool('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '')
+        })
     }
 
     private handleLinkerExit(code: number): void {
@@ -1837,6 +1872,18 @@ function toCompileResult(
     const errors = diagnostics.filter((diagnostic) => diagnostic.severity === 'error')
     if (errors.length === 0) return { ok: true, report, diagnostics }
     return { ok: false, errors, report, diagnostics }
+}
+
+/**
+ * Why Blink's loader ended the process: what it wrote to stderr, without the log prefix
+ * (`E2026-10-12T09:47:29.836000:blink/loader.c:143:42 `) its messages start with.
+ */
+function loaderFailure(output: string, status: number): string {
+    const message = output
+        .replace(/^[EI][\d-]+T[\d:.]+:[^\s:]+:\d+:\d+ /gm, '')
+        .trim()
+        .replace(/\s*\n\s*/g, '; ')
+    return `The emulator could not load the program${message ? `: ${message}` : ''} (native exit ${status})`
 }
 
 /** The status of Emscripten's `ExitStatus`, which a native `exit()` throws; null for anything else. */

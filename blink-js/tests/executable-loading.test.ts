@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest'
 import { createX86Emulator } from '../src/x86-emulator'
 import { X86_PROGRAM_ENVIRONMENT } from '../src/linux-runtime'
-import { elfFixture } from './elf-fixtures'
+import { elfFixture, swappedLoadsFixture } from './elf-fixtures'
 
 it('preserves UTF-8, empty and spaced words and supplies the fixed environment', async () => {
     const emulator = await createX86Emulator()
@@ -160,6 +160,73 @@ it('lets the latest of overlapping loads win, and fails the superseded one', asy
         expect((await emulator.compile('global _start\nsection .text\n_start: nop')).ok).toBe(true)
         await superseded
         expect(emulator.getCompiledCode().code).toContain('_start')
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('lets a load started during a build win, and fails the superseded build', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        const build = emulator.compile('global _start\nsection .text\n_start: nop')
+        const settled = Promise.allSettled([build])
+        await emulator.loadExecutable(elfFixture('crackme'))
+        const [result] = await settled
+        expect(result).toMatchObject({ status: 'rejected' })
+        expect(String((result as PromiseRejectedResult).reason)).toMatch(
+            /This build was superseded/
+        )
+        expect(emulator.getExecutable()).toEqual(elfFixture('crackme'))
+        expect(emulator.getCompiledCode().code).toBe('')
+        emulator.initialize(0)
+        await emulator.run(2_000_000)
+        expect(emulator.stopReason?.kind).toBe('input')
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('lets a load or build refused by its own checks leave one in flight alone', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        const crackme = emulator.loadExecutable(elfFixture('crackme'))
+        await expect(
+            emulator.loadExecutable(elfFixture('cpp'), { protectedPath: '/tmp/cpp' })
+        ).rejects.toThrow(/project/)
+        await expect(
+            emulator.loadExecutable(elfFixture('cpp'), { arguments: ['bad\0word'] })
+        ).rejects.toThrow(/NUL/)
+        await expect(emulator.loadExecutable(new Uint8Array(16))).rejects.toThrow()
+        await expect(emulator.compileProject({ entry: 'missing.asm', files: {} })).rejects.toThrow(
+            /not found/
+        )
+        await crackme
+        expect(emulator.getExecutable()).toEqual(elfFixture('crackme'))
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it("reports why Blink's loader refused a program, with exit status 127", async () => {
+    const emulator = await createX86Emulator()
+    try {
+        await expect(emulator.loadExecutable(swappedLoadsFixture())).rejects.toThrow(
+            'an ELF program whose load segments are out of address order'
+        )
+        // loadElf takes the bytes as they are, and the loader ends the process with exit(127).
+        emulator.loadElf(swappedLoadsFixture())
+        emulator.initialize(0)
+        await emulator.run(1_000_000)
+        expect(emulator.stopReason).toMatchObject({
+            kind: 'load-fail',
+            exitCode: 127,
+            details:
+                "The emulator could not load the program: program headers aren't ordered, expected 555555556000 >= 555555557000 (native exit 127)"
+        })
+        await emulator.loadExecutable(elfFixture('crackme'))
+        emulator.initialize(0)
+        await emulator.run(2_000_000)
+        expect(emulator.stopReason?.kind).toBe('input')
     } finally {
         emulator.dispose()
     }

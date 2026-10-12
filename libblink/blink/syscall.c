@@ -6527,7 +6527,8 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
     case 0x010: /* ioctl: only mutating terminal/descriptor operations */
       switch (arg2) {
         case TIOCSWINSZ_LINUX: case TCSETS_LINUX: case TCSETSW_LINUX:
-        case TCSETSF_LINUX: case TIOCSPGRP_LINUX: case FIONBIO_LINUX:
+        case TCSETSF_LINUX: case TCSETS2_LINUX: case TCSETSW2_LINUX:
+        case TCSETSF2_LINUX: case TIOCSPGRP_LINUX: case FIONBIO_LINUX:
         case FIOCLEX_LINUX: case FIONCLEX_LINUX:
           DebugHistoryMarkIrreversible();
       }

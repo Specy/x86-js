@@ -56,6 +56,18 @@ describe('RIP-relative operands', () => {
         expect(disassemble(ignored, at)[0]!.text).toBe('mov eax, cs:[rel 0x401100]')
     })
 
+    it('take a target written as any constant expression, also relative to $', async () => {
+        const at = 0x401000n
+        const expected = await bytesOf('mov eax, [rel 0x401100]', at)
+        expect(await bytesOf('mov eax, [rel 0x401000+0x80+0x80]', at)).toEqual(expected)
+        expect(await bytesOf('mov eax, [rel 401100h]', at)).toEqual(expected)
+        expect(await bytesOf('mov eax, [rel $+0x100]', at)).toEqual(expected)
+        // Absolute, though written with $: NASM itself refuses it as "can not be RIP-relative".
+        expect(await errorOf('mov eax, [rel $-$$+0x90000000]', at)).toBe(
+            '0x90000000 is out of reach of a 32-bit displacement from 0x401000'
+        )
+    })
+
     it('refuse a name, which the caller resolves, and a target out of reach', async () => {
         expect(await errorOf('mov rax, [rel counter]')).toBe(
             'Write the target of [rel counter] as an address, such as [rel 0x404010] or [rel 0x404010+0x8]'
@@ -83,6 +95,63 @@ describe('direct branches', () => {
             '0x401200 is out of reach of a short jump from 0x401000'
         )
     })
+
+    it('encode a target written as any constant expression relative to the instruction', async () => {
+        const at = 0x401000n
+        expect(await bytesOf('jmp 0x401000+0x10+0x8', at)).toEqual(hex('eb 16'))
+        expect(await bytesOf('jmp (0x401018)', at)).toEqual(hex('eb 16'))
+        expect(await bytesOf('jmp 0x40100c*2-0x401000', at)).toEqual(hex('eb 16'))
+        expect(await bytesOf('jmp 401018h', at)).toEqual(hex('eb 16'))
+        expect(await bytesOf('jmp 0x40_10_18', at)).toEqual(hex('eb 16'))
+        expect(await bytesOf('jmp $+0x18', at)).toEqual(hex('eb 16'))
+        expect(await bytesOf('je 0x401000+1+1', at)).toEqual(hex('74 00'))
+        expect(await bytesOf('call (0x401000+0x20)', at)).toEqual(hex('e8 1b 00 00 00'))
+        expect(await bytesOf('call qword 0x401020', at)).toEqual(hex('e8 1b 00 00 00'))
+        expect(await bytesOf('call(0x401020)', at)).toEqual(hex('e8 1b 00 00 00'))
+        expect(await bytesOf('jmp -0x10', 0n)).toEqual(hex('eb ee'))
+    })
+
+    it('refuse a constant target out of reach however it is written', async () => {
+        // NASM encodes each of these from 0x401000 as a jump to 0xffffffff90000002, unchecked.
+        for (const text of [
+            'jmp 0x90000000+0x1+0x1',
+            'jmp (0x90000002)',
+            'je 0x90000000+1+1',
+            'jmp 90000002h',
+            'jmp 0x9000_0002',
+            'jmp(0x90000002)',
+            'call qword 0x90000002',
+            'jmp strict near 0x90000002',
+            'o64 jmp 0x90000002',
+            'ds jmp 0x90000002'
+        ])
+            expect(await errorOf(text)).toBe(
+                '0x90000002 is out of reach of a 32-bit displacement from 0x401000'
+            )
+        expect(await errorOf('call 0x48000000*2')).toBe(
+            '0x90000000 is out of reach of a 32-bit displacement from 0x401000'
+        )
+        expect(await errorOf('jmp $-$$+0x90000000')).toBe(
+            '0x90000000 is out of reach of a 32-bit displacement from 0x401000'
+        )
+        expect(await errorOf('a32 loop 0x90000002')).toBe(
+            '0x90000002 is out of reach of a short jump from 0x401000'
+        )
+    })
+
+    it('refuse a target written with what is not computed here, and leave a name to NASM', async () => {
+        expect(await errorOf('jmp 0x90000002 >> 0')).toBe(
+            'Write the target of jmp 0x90000002 >> 0 as an address, such as 0x401020 or 0x401020+0x8'
+        )
+        expect(await errorOf("jmp 'ab'")).toBe(
+            "Write the target of jmp 'ab' as an address, such as 0x401020 or 0x401020+0x8"
+        )
+        expect(await errorOf('jmp 0x1ffffffffffffffff')).toBe(
+            '0x1ffffffffffffffff does not fit in 64 bits'
+        )
+        expect(await errorOf('jmp main')).toBe("Symbol `main' not defined")
+        expect(await bytesOf('jmp rax', 0n)).toEqual(hex('ff e0'))
+    })
 })
 
 describe('values NASM would truncate', () => {
@@ -97,6 +166,28 @@ describe('values NASM would truncate', () => {
         expect(await errorOf('mov eax, [rax+rbx*4-0x80000001]')).toBe(
             'The displacement -0x80000001 does not fit in 32 bits'
         )
+    })
+
+    it('are errors however the displacement is written', async () => {
+        // NASM assembles the first two as [rax-0x01] and the next as [rax].
+        expect(await errorOf('mov eax, [rax + 2*0x7fffffff + 1]')).toBe(
+            'The displacement 0xffffffff does not fit in 32 bits'
+        )
+        expect(await errorOf('mov eax, [rax + (2*0x7fffffff + 1)]')).toBe(
+            'The displacement 0xffffffff does not fit in 32 bits'
+        )
+        expect(await errorOf('mov eax, [rax + 1_0000_0000h]')).toBe(
+            'The displacement 0x100000000 does not fit in 32 bits'
+        )
+        expect(await errorOf('mov eax, [rax+$]', 0x555555555000n)).toBe(
+            'The displacement 0x555555555000 does not fit in 32 bits'
+        )
+        expect(await errorOf('mov eax, [rax + (1 << 40)]')).toBe(
+            'Write the displacement in [rax + (1 << 40)] with numbers, + - * / ~ and parentheses, such as [rax+0x10]'
+        )
+        expect(await bytesOf('mov eax, [rax + 0x10*2]', 0n)).toEqual(hex('8b 40 20'))
+        expect(await bytesOf('mov eax, [rax + 10h]', 0n)).toEqual(hex('8b 40 10'))
+        expect(await bytesOf('mov eax, [rax + ~0x7fffffff]', 0n)).toEqual(hex('8b 80 00 00 00 80'))
     })
 
     it('leave in range values alone', async () => {
@@ -191,9 +282,23 @@ it('assembles a batch exactly as it assembles each line alone', async () => {
         { text: 'not_an_instruction', address: 0n },
         { text: 'call 0x7ffff7c80000', address: 0x555555555000n },
         { text: 'nop word cs:[rax+rax*1]', address: 0n },
-        { text: 'lock cmpxchg [rdx], rbx', address: 0n }
+        { text: 'lock cmpxchg [rdx], rbx', address: 0n },
+        { text: 'jmp 0x90000000+0x1+0x1', address: 0x401000n },
+        { text: 'jmp 0x401000+0x10+0x8', address: 0x401000n },
+        { text: 'mov eax, [rax + 2*0x7fffffff + 1]', address: 0n }
     ]
     const alone = await Promise.all(requests.map((r) => assembleInstruction(r.text, r.address)))
     expect(await assembleInstructions(requests)).toEqual(alone)
-    expect(alone.map((r) => 'bytes' in r)).toEqual([true, false, true, false, false, true, true])
+    expect(alone.map((r) => 'bytes' in r)).toEqual([
+        true,
+        false,
+        true,
+        false,
+        false,
+        true,
+        true,
+        false,
+        true,
+        false
+    ])
 })

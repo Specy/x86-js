@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { analyze, type ElfAnalysis, type ElfPltStub } from '../src/elf'
 import { readElfSymbolTable } from '../src/elf-symbols'
-import { elfFixture } from './elf-fixtures'
+import { elfFixture, swappedLoadsFixture } from './elf-fixtures'
 
 const library = (name: string) =>
     new Uint8Array(readFileSync(new URL(`../src/assets/linux/${name}`, import.meta.url)))
@@ -144,6 +144,35 @@ it('explains unsupported and truncated files without throwing', () => {
         expect(() => analyze(bytes.subarray(0, length))).not.toThrow()
         expect(analyze(bytes.subarray(0, length)).supported, `${length}`).toBe(length >= loaded)
     }
+})
+
+it("refuses what Blink's loader ends the process for", () => {
+    const swapped = swappedLoadsFixture()
+    expect(analyze(swapped).programHeaders.slice(3, 5)).toMatchObject([
+        { type: 1, address: 0x2000n },
+        { type: 1, address: 0x1000n }
+    ])
+    expect(analyze(swapped).reason).toBe(
+        'an ELF program whose load segments are out of address order'
+    )
+    // The read-only segment's offset one byte past its address's place in the page.
+    const misaligned = patched(elfFixture('crackme'), (view) =>
+        view.setBigUint64(64 + 56 * 4 + 8, 0x2001n, true)
+    )
+    expect(analyze(misaligned).reason).toBe(
+        'an ELF load segment whose address and file offset differ within a page'
+    )
+    // A static program whose first segment moved from 0x400000 to page 0.
+    const atZero = patched(elfFixture('crackme-static'), (view) =>
+        view.setBigUint64(64 + 16, 0n, true)
+    )
+    expect(analyze(atZero).reason).toBe('an ELF program that loads at address 0')
+    // The interpreter's path ends early, and its last byte is not the NUL that must end it.
+    const interpreter = patched(elfFixture('crackme'), (_, copy) => {
+        copy[0x374 + 5] = 0
+        copy[0x374 + 0x1b] = 0x78
+    })
+    expect(analyze(interpreter).reason).toBe('an unterminated ELF string')
 })
 
 describe('unsupported machines', () => {

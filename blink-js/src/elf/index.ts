@@ -418,7 +418,12 @@ function readProgram(
             interpreter.offset,
             interpreter.offset + interpreter.fileSize
         )
-        if (result.interpreter === undefined) return 'an unterminated ELF string'
+        // Linux and Blink read the path up to its last byte, which must end it.
+        if (
+            result.interpreter === undefined ||
+            reader.bytes[interpreter.offset + interpreter.fileSize - 1] !== 0
+        )
+            return 'an unterminated ELF string'
     }
     const segment = result.programHeaders.find((header) => header.type === PT_DYNAMIC)
     if (segment) {
@@ -458,6 +463,35 @@ function readProgram(
         )
     )
         return 'an ELF program with an unmapped entry point'
+    return loaderProblem(reader, result)
+}
+
+const PAGE = 4096n
+
+/**
+ * What Blink's loader (loader.c) ends the process for with exit status 127, so that analyze refuses
+ * such a program with a reason rather than letting it fail to start: a load segment whose address
+ * and file offset are at different places in a page, one whose end, rounded up to a page, is below
+ * the one before it (segments in address order), and an ET_EXEC program whose lowest load segment
+ * is in page 0. Segments with no memory are skipped, as Blink skips them.
+ */
+function loaderProblem(reader: ElfReader, result: ElfAnalysis): string | undefined {
+    let end: bigint | undefined
+    for (const header of reader.loads) {
+        if (!header.memorySize) continue
+        if (header.address % PAGE !== BigInt(header.offset) % PAGE)
+            return 'an ELF load segment whose address and file offset differ within a page'
+        const segmentEnd = ((header.address + header.memorySize + PAGE - 1n) / PAGE) * PAGE
+        if (end !== undefined && segmentEnd < end)
+            return 'an ELF program whose load segments are out of address order'
+        end = segmentEnd
+    }
+    const lowest = reader.loads.reduce<bigint | undefined>(
+        (low, header) => (low === undefined || header.address < low ? header.address : low),
+        undefined
+    )
+    if (result.type === 2 && lowest !== undefined && lowest < PAGE)
+        return 'an ELF program that loads at address 0'
     return undefined
 }
 

@@ -308,6 +308,10 @@ export type InstructionRequest = { text: string; address: bigint }
  *   RIP-relative operand reaches, with any size keyword and segment around them
  *   (`qword fs:[rel 0x404010]`, or `[fs:rel 0x404010]`); a name inside `[rel ...]` is an error,
  *   since labels are the caller's to resolve;
+ * - such a target, and a displacement beside a 64-bit register, may be any expression of numbers
+ *   (in NASM's notations), `$` (the instruction's address), `+ - * / ~` and parentheses
+ *   (`jmp 0x401000+2*0x10`, `[rax+(0x10-0x8)]`); one written with anything else (`'ab'`,
+ *   `1 << 4`) is an error, since only a value known here can be checked;
  * - `[0x404010]` is an absolute address (NASM's `default abs`);
  * - `notrack` is encoded as the `3e` prefix it stands for, and an ignored segment prefix the
  *   decoder prints (`nop word cs:[rax+rax*1]`) is encoded too.
@@ -460,18 +464,22 @@ const HEADER_LINES = 2
 const RECORD_LINES = 5
 
 const MAX_ADDRESS = 0xffffffffffffffffn
-const NUMBER = String.raw`(?:0x[\da-f]+|\d+)`
-const ADDRESS_EXPRESSION = new RegExp(
-    String.raw`^\s*(${NUMBER})\s*(?:([+-])\s*(${NUMBER})\s*)?$`,
-    'i'
-)
-/** `$`, `$$`, numbers and arithmetic: an expression NASM resolves itself, inside the section. */
-const HERE_EXPRESSION =
-    /^(?:\s|\$\$?|0x[\da-f]+|\d+|[-+*/()~])*\$(?:\s|\$\$?|0x[\da-f]+|\d+|[-+*/()~])*$/i
+/** A number in any of NASM's notations, a `$` or `$$`, a name, or an operator {@link evaluate} knows. */
+const TOKEN = /\s*(?:(\d[\w.$]*)|(\$\$?)(?![\w$#@~.?])|([a-z_.?][\w$#@~.?]*)|([-+*/~()]))/iy
+/** A name in NASM: not preceded by anything a name or number continues with. */
+const NAME = /(?<![\w$#@~.?])[a-z_.?][\w$#@~.?]*/gi
+/** NASM's radix letters, after a leading 0 (`0x1f`) or at the end (`1fh`). */
+const RADIX: Record<string, number> = { b: 2, y: 2, o: 8, q: 8, d: 10, t: 10, h: 16, x: 16 }
+const DIGITS: Record<number, RegExp> = {
+    2: /^[01]+$/,
+    8: /^[0-7]+$/,
+    10: /^\d+$/,
+    16: /^[\da-f]+$/i
+}
 const SEGMENT = String.raw`(?:[c-gs]s\s*:\s*)`
 const RIP_RELATIVE = new RegExp(String.raw`^(\s*${SEGMENT}?)rel\b\s*(${SEGMENT}?)(.*)$`, 'is')
 const BRANCH =
-    /^((?:(?:bnd|notrack)\s+)*)(jmp|call|j[a-z]{1,4}|loop(?:n?[ez])?|xbegin)(\s+(?:(?:short|near)\s+)?)(\S.*)$/i
+    /^((?:(?:bnd|nobnd|notrack|[ao](?:16|32|64)|rep(?:n?[ez])?|[c-gs]s)\s+)*)(jmp|call|j[a-z]{1,4}|loop(?:n?[ez])?|xbegin)\b(\s*(?:(?:strict|short|near|word|dword|qword)\b\s*)*)(\S.*)$/i
 const DIRECTIVE =
     /^\s*(?:[%[]|(?:bits|use16|use32|use64|default|section|segment|absolute|extern|global|common|static|required|cpu|float|org|align|alignb|sectalign|struc|endstruc|istruc|iend|incbin|warning|map|list|debug)\b)/i
 const GPR64 = /^(?:r[abcd]x|r[sd]i|r[sb]p|rip|r(?:8|9|1[0-5]))$/i
@@ -498,14 +506,89 @@ const VECTOR = /^[xyz]mm(?:\d|[12]\d|3[01])$/i
 
 const hex = (value: bigint) => `0x${value.toString(16)}`
 
-/** An absolute address written as `0xT`, `0xT+0xN` or `0xT-0xN` (or in decimal), wrapped to 64 bits. */
-function parseAddress(expression: string): bigint | undefined | 'overflow' {
-    const match = ADDRESS_EXPRESSION.exec(expression)
-    if (!match) return undefined
-    const base = BigInt(match[1]!)
-    const offset = match[3] === undefined ? 0n : BigInt(match[3])
-    if (base > MAX_ADDRESS || offset > MAX_ADDRESS) return 'overflow'
-    return BigInt.asUintN(64, match[2] === '-' ? base - offset : base + offset)
+/**
+ * A number as NASM reads one: `0x1f`, `1fh`, `0b101`, `101b`, `17q`, `0d17` or `17`, with any
+ * `_` between digits; when it has a radix letter both before and after, the larger radix wins.
+ */
+function readNumber(token: string): bigint | undefined {
+    const prefix = token.length > 2 && token[0] === '0' ? (RADIX[token[1]!.toLowerCase()] ?? 0) : 0
+    const suffix = token.length > 1 ? (RADIX[token.at(-1)!.toLowerCase()] ?? 0) : 0
+    const radix = prefix > suffix ? prefix : suffix > prefix ? suffix : 10
+    let digits = prefix > suffix ? token.slice(2) : suffix > prefix ? token.slice(0, -1) : token
+    digits = digits.replace(/_/g, '')
+    if (!DIGITS[radix]!.test(digits)) return undefined
+    return BigInt(radix === 10 ? digits : `0${{ 2: 'b', 8: 'o', 16: 'x' }[radix]}${digits}`)
+}
+
+/**
+ * The value of an expression NASM computes as a constant, so that a target or displacement is
+ * known before NASM encodes it: numbers, `$` and `$$` (both `here`, as each line is the first in
+ * its section), `+ - * / ~` and parentheses, `/` dividing as NASM does, unsigned. Names have the
+ * value `valueOf` gives them; the result is not wrapped to 64 bits. Otherwise the reason: a name
+ * without a value, which NASM resolves or refuses itself; text NASM may read as a constant this
+ * does not (`'ab'`, `1 << 40`); a number past 64 bits.
+ */
+function evaluate(
+    expression: string,
+    here: bigint,
+    valueOf: (name: string) => bigint | undefined = () => undefined
+): bigint | 'name' | 'invalid' | 'overflow' {
+    const tokens: (bigint | string)[] = []
+    let named = false
+    let overflow = false
+    for (let at = 0; !/^\s*$/.test(expression.slice(at)); at = TOKEN.lastIndex) {
+        TOKEN.lastIndex = at
+        const match = TOKEN.exec(expression)
+        if (!match) return 'invalid'
+        const [, number, dollar, name, operator] = match
+        if (number !== undefined) {
+            const value = readNumber(number)
+            if (value === undefined) return 'invalid'
+            overflow ||= value > MAX_ADDRESS
+            tokens.push(value)
+        } else if (dollar !== undefined) tokens.push(here)
+        else if (name !== undefined) {
+            const value = valueOf(name)
+            named ||= value === undefined
+            tokens.push(value ?? 0n)
+        } else tokens.push(operator!)
+    }
+    if (named) return 'name'
+    let k = 0
+    const operand = (): bigint | undefined => {
+        const token = tokens[k++]
+        if (typeof token === 'bigint') return token
+        if (token === '(') {
+            const value = sum()
+            return tokens[k++] === ')' ? value : undefined
+        }
+        if (token !== '-' && token !== '+' && token !== '~') return undefined
+        const value = operand()
+        if (value === undefined) return undefined
+        return token === '-' ? -value : token === '~' ? ~value : value
+    }
+    const product = (): bigint | undefined => {
+        let value = operand()
+        while (value !== undefined && (tokens[k] === '*' || tokens[k] === '/')) {
+            const times = tokens[k++] === '*'
+            const right = operand()
+            if (right === undefined || (!times && !BigInt.asUintN(64, right))) return undefined
+            value = times ? value * right : BigInt.asUintN(64, value) / BigInt.asUintN(64, right)
+        }
+        return value
+    }
+    const sum = (): bigint | undefined => {
+        let value = product()
+        while (value !== undefined && (tokens[k] === '+' || tokens[k] === '-')) {
+            const plus = tokens[k++] === '+'
+            const right = product()
+            value = right === undefined ? undefined : plus ? value + right : value - right
+        }
+        return value
+    }
+    const value = sum()
+    if (value === undefined || k !== tokens.length) return 'invalid'
+    return overflow ? 'overflow' : value
 }
 
 /**
@@ -534,29 +617,26 @@ function withoutComment(text: string): string {
 
 /**
  * NASM silently keeps only the low 32 bits of a displacement too large for one when the operand
- * has a base register and the rest fits a byte (`[rax+0xffffffff]` assembles as `[rax-1]`), so a
- * 64-bit address whose displacement is plain numbers is checked here. Anything else (names, `$`,
- * parentheses) is left to NASM's own checks, and 32-bit addressing wraps at 4 GiB as written.
+ * has a base register and the rest fits a byte (`[rax+0xffffffff]` assembles as `[rax-1]`, and
+ * `[rax+2*0x7fffffff+1]` too), so a 64-bit address's displacement is computed here, with the
+ * registers as 0, and checked; one written with what {@link evaluate} cannot compute is refused.
+ * A name is left to NASM's own checks, and 32-bit addressing wraps at 4 GiB as written.
  */
-function checkDisplacement(inside: string): string | undefined {
+function checkDisplacement(inside: string, address: bigint): string | undefined {
     const expression = inside
         .replace(new RegExp(String.raw`^\s*${SEGMENT}`, 'i'), '')
         .replace(/^\s*(?:(?:abs|nosplit|byte|word|dword|qword)\s+)*/i, '')
-    let displacement = 0n
-    let wide = false
-    for (const piece of expression.split(/(?=[+-])/)) {
-        const term = piece.replace(/\s+/g, '')
-        const body = term.replace(/^[+-]/, '')
-        const scaled = /^(\w+)\*\d+$/.exec(body) ?? /^\d+\*(\w+)$/.exec(body)
-        const register = scaled ? scaled[1]! : body
-        if (GPR64.test(register)) wide = true
-        else if (GPR32.test(register)) return undefined
-        else if (VECTOR.test(register)) continue
-        else if (!scaled && new RegExp(`^${NUMBER}$`, 'i').test(body))
-            displacement += term.startsWith('-') ? -BigInt(body) : BigInt(body)
-        else return undefined
-    }
-    if (wide && (displacement < -(1n << 31n) || displacement >= 1n << 31n))
+    const names = expression.match(NAME) ?? []
+    if (!names.some((name) => GPR64.test(name))) return undefined
+    if (names.some((name) => GPR32.test(name) || GPR16.test(name))) return undefined
+    const displacement = evaluate(expression, address, (name) =>
+        GPR64.test(name) || VECTOR.test(name) ? 0n : undefined
+    )
+    if (displacement === 'name') return undefined
+    if (displacement === 'overflow') return `A number in [${inside.trim()}] does not fit in 64 bits`
+    if (displacement === 'invalid')
+        return `Write the displacement in [${inside.trim()}] with numbers, + - * / ~ and parentheses, such as [rax+0x10]`
+    if (displacement < -(1n << 31n) || displacement >= 1n << 31n)
         return `The displacement ${displacement < 0n ? '-' : ''}${hex(displacement < 0n ? -displacement : displacement)} does not fit in 32 bits`
     return undefined
 }
@@ -580,15 +660,15 @@ function prepareInstruction(
     line = line.replace(/\[([^\]]*)\]/g, (whole, inside: string) => {
         const rel = RIP_RELATIVE.exec(inside)
         if (!rel) {
-            failure ??= checkDisplacement(inside)
+            failure ??= checkDisplacement(inside, address)
             return whole
         }
-        const target = parseAddress(rel[3]!)
+        const target = evaluate(rel[3]!, address)
         if (target === 'overflow') failure ??= `${rel[3]!.trim()} does not fit in 64 bits`
-        else if (target !== undefined) {
-            memoryTarget = target
-            return `[${rel[1]}rel ${rel[2]}${fromHere(target, address)}]`
-        } else if (!HERE_EXPRESSION.test(rel[3]!))
+        else if (typeof target === 'bigint') {
+            memoryTarget = BigInt.asUintN(64, target)
+            return `[${rel[1]}rel ${rel[2]}${fromHere(memoryTarget, address)}]`
+        } else
             failure ??= `Write the target of [rel ${rel[3]!.trim()}] as an address, such as [rel 0x404010] or [rel 0x404010+0x8]`
         return whole
     })
@@ -596,12 +676,20 @@ function prepareInstruction(
 
     let branchTarget: bigint | undefined
     const branch = BRANCH.exec(line)
-    if (branch) {
-        const target = parseAddress(branch[4]!)
+    // A constant target, however it is written, is rewritten relative to the section, or NASM
+    // encodes a displacement it never range-checks (`jmp 0x90000000+0x1+0x1` from 0x401000 jumps
+    // to 0xffffffff90000002). A register, a memory operand, a name and a far pointer (`0x10:0x0`)
+    // are NASM's to encode or refuse.
+    if (branch && !/[[:]/.test(branch[4]!)) {
+        const target = evaluate(branch[4]!, address)
         if (target === 'overflow') return { error: `${branch[4]!.trim()} does not fit in 64 bits` }
-        if (target !== undefined) {
-            branchTarget = target
-            line = `${branch[1]}${branch[2]}${branch[3]}${fromHere(target, address)}`
+        if (target === 'invalid')
+            return {
+                error: `Write the target of ${branch[2]} ${branch[4]!.trim()} as an address, such as 0x401020 or 0x401020+0x8`
+            }
+        if (target !== 'name') {
+            branchTarget = BigInt.asUintN(64, target)
+            line = `${branch[1]}${branch[2]}${branch[3] || ' '}${fromHere(branchTarget, address)}`
         }
     }
     // NASM 3.00 encodes cmpxchg with a 64-bit or 16-bit register without its REX.W or 66 prefix

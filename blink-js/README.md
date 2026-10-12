@@ -586,7 +586,13 @@ returns a copy for inspection, which can be changed freely. Debugger addresses,
 `loadExecutable` copies the bytes it is given (a Node `Buffer` too) and checks its
 options before it replaces the loaded program, so a load that throws leaves the
 previous one in place. A load is superseded by any later load or build that starts
-while it fetches libraries: it then throws, and the later one wins.
+while it fetches libraries: it then throws, and the later one wins. A build is
+superseded the same way by a load or build that starts before it finishes. A load
+or build that its own checks refuse supersedes nothing.
+
+A program that `analyze` accepts but Blink's loader cannot load (only possible
+through `loadElf`, which takes the bytes as they are) stops at its start with
+`kind: 'load-fail'`, exit code 127 and the loader's message in `details`.
 
 ## Arguments and the executable's File
 
@@ -613,8 +619,11 @@ if (!elf.supported) console.log(`This is ${elf.reason}`)
 reads an ELF without running it and never throws: a file it cannot run, or cannot
 read, comes back with `supported: false` and a `reason` naming what it is ("an ARM
 program; only x86-64 programs run", "a shared library, not a program"). Whether a
-program runs is decided as Linux decides it, from the ELF header and the
-`PT_LOAD`, `PT_INTERP` and `PT_DYNAMIC` program headers; section headers, which
+program runs is decided as Linux and Blink's loader decide it, from the ELF header
+and the `PT_LOAD`, `PT_INTERP` and `PT_DYNAMIC` program headers (load segments in
+address order, each at the same place in a page in the file as in memory, none of
+an ET_EXEC program in page 0, an interpreter path ended by its last byte); section
+headers, which
 Linux ignores and a stripped or protected binary may lack or corrupt, are read
 when they are usable. Without them, dynamic symbols, `needed`, `soname`,
 relocations and symbol versions are read through `PT_DYNAMIC`, and PLT stubs are
@@ -686,6 +695,12 @@ number:
   instruction's address, which NASM encodes RIP-relative. A name inside
   `[rel ...]` is an error: labels are the caller's to resolve. `[0x404010]` is
   an absolute address.
+- Such a target, and a displacement beside a 64-bit register, may be any
+  constant expression of numbers in NASM's notations, `$` (the instruction's
+  address), `+ - * / ~` and parentheses (`jmp 0x401000+2*0x10`,
+  `[rax+(0x10-0x8)]`). It is computed and checked here, since NASM encodes a
+  branch to an absolute number with a displacement it never range-checks; one
+  written with anything else (`'ab'`, `1 << 4`) is an error.
 - Nothing is silently encoded as something else. NASM runs with `-Werror`, so a
   value it would truncate is an error and not a warning; so are a branch or
   RIP-relative target out of reach of its displacement, a 64-bit displacement
