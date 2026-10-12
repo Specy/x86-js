@@ -690,7 +690,7 @@ it('touches nanosleep rem only on interruption and reports EFAULT if the interru
     expect(quadwords(Uint8Array.from(bytes))).toEqual([-14n])
     emulator.dispose()
 })
-it('reports pipe fstat as FIFO, and ioctl TCGETS as ENOTTY', async () => {
+it('reports pipe fstat as FIFO, and ioctl TCGETS and TCGETS2 as ENOTTY', async () => {
     await expectLinux(
         [
             'sys 22,buf2',
@@ -701,9 +701,11 @@ it('reports pipe fstat as FIFO, and ioctl TCGETS as ENOTTY', async () => {
             'and eax,0xf000',
             'save',
             'sys 16,r12,0x5401,buf',
+            'save',
+            'sys 16,r12,0x802c542a,buf',
             'save'
         ],
-        [0, 0x1000, -25]
+        [0, 0x1000, -25, -25]
     )
 })
 it.each([

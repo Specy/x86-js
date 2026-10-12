@@ -127,6 +127,8 @@ const frames = emulator.getCallStack()
 console.log(frames.map((frame) => frame.name))
 ```
 
+A frame names the symbol its call went into (`name`, starting at `address`), where the call went (`target`, which differs from `address` when no symbol starts there, such as a PLT stub) and where it returns (`destination`).
+
 When history is enabled, every instruction `run()` or `step()` executes is recorded inside the wasm. CPU instructions and queries can be undone; an instruction with unjournaled input, File, descriptor, pipe, mapping or process-state effects forms an irreversible boundary. If history is disabled with `initialize(0)` or by never calling `initialize`, nothing is recorded and `canUndo()` returns `false`.
 
 Very large or truncated memory writes may not be reversible. In that case `canUndo()` returns `false` for the latest step, and calling `undo()` throws instead of restoring a partial state.
@@ -252,7 +254,7 @@ Every capability mutation runs inside `performInstruction(exactSerial, operation
 
 The capability owns content and File-count limits (the editor uses 16 MiB / 4,096 Files), and checks expected guest errors before changes. Open/create/truncate are deferred into its atomic `open`; both the guest descriptor limit and a capability refusal leave Files unchanged. Seeking past the content limit is allowed and a later write enforces capacity. A capability must return a Uint8Array of at most the requested read length and an integer write count between zero and the request length. Unexpected exceptions or malformed results stop with `X86EnvironmentError` and the original useful message, after native syscall cleanup. Any potentially partial mutation remains a barrier. If a later readv callback raises a guest error, Emscripten may return that errno rather than Linux's earlier partial byte count; earlier bytes and cursor changes remain irreversible. writev/pwritev gather their payload into one capability write, whose capacity check is atomic. sendfile commits source cursors and explicit offsets only for bytes actually transferred, and a rejected first write leaves them unchanged.
 
-Directories are implicit path prefixes, listed through `stat`/`list` without opening a capability handle. Parent Directories must exist when creating or renaming a File through Linux paths. Empty Directory creation/removal, Directory moves, replacement rename, links and persistent permission/owner/time changes have no session representation. Directory creation/removal and persistent metadata changes return EOPNOTSUPP; links fail because the mount supplies no link operations, and replacement rename returns EEXIST. Mounted nodes expose synthetic mode 0777, uid/gid zero and epoch timestamps; unlink reports link count zero through retained File handles. A Directory disappears with its last File; open Directory lifetime consequently follows the capability's implicit-Directory model. Regular-File mmap returns ENODEV on this mount before replacing any prior map; anonymous mappings remain available.
+Directories are implicit path prefixes, listed through `stat`/`list` without opening a capability handle. Parent Directories must exist when creating or renaming a File through Linux paths. Empty Directory creation/removal, Directory moves, replacement rename, links and persistent permission/owner/time changes have no session representation. Directory creation/removal and persistent metadata changes return EOPNOTSUPP; links fail because the mount supplies no link operations, and replacement rename returns EEXIST. Mounted nodes expose synthetic mode 0777, uid/gid zero and epoch timestamps; unlink reports link count zero through retained File handles. A Directory disappears with its last File; open Directory lifetime consequently follows the capability's implicit-Directory model. A private mapping of a regular File on this mount is a copy read through the capability's `pread`, as any read of the File is; a shared one returns ENODEV before replacing any prior map.
 
 Attach a fresh capability after each successful Build/loadElf and before the first process load. The compiler stages under `/__x86_project`, outside the mounted `/project`; builds detach the old capability first and do not write compiler artifacts into it. Build, loadElf, clearExecution and dispose detach before old native descriptors are cleaned up, so cleanup never calls an ended session. Reusing a completed process start without a new Build/loadElf drops the old mount; use a fresh Build/loadElf and capability per interactive run or Testcase.
 
@@ -532,3 +534,206 @@ uses Linux `brk`. The stack top begins at the initialized RSP; an instruction mo
 RSP by more than 4096 bytes starts a new stack, and raising RSP above its top raises
 the top. Native history restores the previous top on Undo. Linux `brk` retains its
 existing irreversible-history boundary.
+
+The Linux process also answers `set_robust_list`, `get_robust_list` and `rseq` for a
+single thread on CPU 0. `ptrace(PTRACE_TRACEME)` succeeds once and then returns
+`EPERM`, as attaching to the process itself does (`PTRACE_ATTACH`, `PTRACE_SEIZE`);
+other requests return `ESRCH`.
+
+`futex` waits for one thread: nothing else can wake a waiter, so a wait whose word
+matches ends when its timeout does, with `ETIMEDOUT`. `FUTEX_WAIT` takes a relative
+timeout on `CLOCK_MONOTONIC` and `FUTEX_WAIT_BITSET` an absolute one, on
+`CLOCK_REALTIME` with `FUTEX_CLOCK_REALTIME`; the wait reaches the host as a wait
+request, like `nanosleep`, so an `environment` clock decides when it ends. A wait
+without a timeout returns 0 at once, as a spurious wakeup would. glibc's
+`sem_timedwait` and `pthread_cond_timedwait` therefore time out as they do on Linux.
+
+`mmap` maps regular files only (anything else answers `ENODEV`, as Linux does). A
+private file mapping is a copy of the file's pages; pages wholly past the end of
+the file are zero pages allocated on first touch (Linux raises `SIGBUS` there), so
+a large mapping of a small file costs nothing up front. When the host runs out of
+memory for a mapping, `mmap` answers `ENOMEM`. Without `MAP_FIXED` an address is a
+hint, rounded down to its page and raised to `mmap_min_addr` (`0x10000`), and
+ignored when its range does not fit the address space.
+
+## Loading an executable
+
+`loadExecutable(bytes)` accepts a little-endian x86-64 Linux ELF executable,
+including a PIE. It loads its interpreter and recursively resolves dependencies
+from five bundled Ubuntu libraries: `ld-linux-x86-64.so.2`, `libc.so.6`,
+`libm.so.6`, `libstdc++.so.6` and `libgcc_s.so.1`. They are fetched only when
+needed and cached. The result includes `pie`, `interpreter`, `needed` and
+`missing`; missing libraries still reach the dynamic linker, whose error is
+written to stderr. `loadElf(bytes)` remains available without library resolution.
+
+```ts
+const emulator = await createX86Emulator()
+const info = await emulator.loadExecutable(bytes)
+emulator.setProgramArguments('./crackme', ['hunter2'])
+emulator.initialize(200_000)
+await emulator.run(1_000_000, [{ address: 0x555555555170n }])
+```
+
+The fixed Linux layout places PIEs at `0x555555554000`, maps downwards below
+`0x7ffff7fff000`, and reserves the stack below `0x7ffffffff000`. Non-PIE
+executables use their ELF addresses; the heap starts after the main executable.
+`getLoadedObjects()` reports each object's path, soname, load bias and end, with
+`main: true` on the program itself. Its path, `/program`, is where the loader
+read it, and is removed before the first instruction. `getLoadedObjectBytes(path)`
+returns a copy for inspection, which can be changed freely. Debugger addresses,
+`getMemoryLayout()` and `resolveMemoryLabel()` include the main program's bias.
+
+`loadExecutable` copies the bytes it is given (a Node `Buffer` too) and checks its
+options before it replaces the loaded program, so a load that throws leaves the
+previous one in place. A load is superseded by any later load or build that starts
+while it fetches libraries: it then throws, and the later one wins. A build is
+superseded the same way by a load or build that starts before it finishes. A load
+or build that its own checks refuse supersedes nothing.
+
+A program that `analyze` accepts but Blink's loader cannot load (only possible
+through `loadElf`, which takes the bytes as they are) stops at its start with
+`kind: 'load-fail'`, exit code 127 and the loader's message in `details`.
+
+## Arguments and the executable's File
+
+`setProgramArguments(argv0, words)` supplies UTF-8 words as an array, preserving
+empty strings and spaces. NUL is refused, with limits of 1,024 argument words
+and 128 KiB including argv0 and terminators. A start supplies PATH, HOME, PWD,
+LANG, TERM, SHELL, USER and LOGNAME with fixed Linux values. AT_EXECFN continues
+to name the actual executable path. Arguments apply at the next start.
+
+`getProcessStart()` says where the loader put them, for a debugger to name the
+bytes above the initial stack pointer. Each start reads the block back once,
+before the first instruction, and keeps it until the next start, after the
+program ends too; it is `null` before a program's first start, after a build, a
+load or `clearExecution()`, and when the loader failed. Addresses are `bigint`;
+each string's `length` counts its NUL.
+
+```ts
+emulator.setProgramArguments('./main', ['hello'])
+emulator.initialize(0)
+emulator.getNextInstruction() // starts the program
+const start = emulator.getProcessStart()!
+// start.start: the initial rsp, where argc is; start.end: the top of the stack
+// start.argv, start.envp, start.auxv (to start.auxvEnd): the vectors, in that order
+// start.arguments[i], start.environment[i]: { address, length } of each string
+// start.execfn, start.random: what AT_EXECFN and AT_RANDOM point at
+// start.path: the program's path the loader writes first, at the very top
+```
+
+The strings follow the vectors, past at most 15 bytes of alignment padding, in
+this order: the arguments, the environment, AT_EXECFN's path, the 16 AT_RANDOM
+bytes and the path at the top.
+
+With a mounted Project FileSystem, `setProtectedPath('/project/crackme')`
+protects the executable from writes and truncation (`ETXTBSY`). Reads remain
+available. Unlinking or renaming it, including replacing its name, returns
+`EBUSY`; this deliberately differs from Linux to preserve the original File.
+
+## Reading an ELF
+
+```ts
+import { analyze } from '@specy/x86/elf'
+const elf = analyze(bytes)
+if (!elf.supported) console.log(`This is ${elf.reason}`)
+```
+
+`@specy/x86/elf` is plain TypeScript: importing it loads no WebAssembly. `analyze`
+reads an ELF without running it and never throws: a file it cannot run, or cannot
+read, comes back with `supported: false` and a `reason` naming what it is ("an ARM
+program; only x86-64 programs run", "a shared library, not a program"). Whether a
+program runs is decided as Linux and Blink's loader decide it, from the ELF header
+and the `PT_LOAD`, `PT_INTERP` and `PT_DYNAMIC` program headers (load segments in
+address order, each at the same place in a page in the file as in memory, none of
+an ET_EXEC program in page 0, an interpreter path ended by its last byte); section
+headers, which
+Linux ignores and a stripped or protected binary may lack or corrupt, are read
+when they are usable. Without them, dynamic symbols, `needed`, `soname`,
+relocations and symbol versions are read through `PT_DYNAMIC`, and PLT stubs are
+found by their shape in the executable segments.
+
+The result has the headers, `sections`, `symbols` (`.symtab`) and `dynamicSymbols`,
+each symbol with its `version` and `defaultVersion` when it has one (a `.symtab`
+name loses a `@VERSION` or `@@VERSION` suffix only for a version the file defines
+or needs, so an assembled `foo@bar` keeps its name). `relocations` covers every
+table the loader applies, RELR included, each entry naming its `table`. `plt`
+names each stub after the slot its `jmp [rel slot]` goes through: `strcmp@plt`,
+or `strcmp@plt_resolver` for a lazy stub of `.plt` beside `.plt.sec`.
+
+## Disassembly and address Breakpoints
+
+```ts
+import { loadDisassembler } from '@specy/x86/disassembler'
+const { disassemble } = await loadDisassembler()
+const instructions = disassemble(codeBytes, 0x401000n)
+```
+
+The subpath needs no Blink instance, and importing it instantiates nothing:
+`loadDisassembler()` instantiates Zydis's wasm on its first call and answers the
+same decoder after that. `disassemble` uses Zydis 4.1.1, including CET and
+AVX-512, and prints NASM that `assembleInstruction` reads back to the same
+instruction, apart from the few forms NASM 3.00 cannot encode. It exposes instruction lengths, flow kinds, direct branch targets
+and RIP-relative targets with text spans.
+
+- Memory operands carry NASM's size keywords, without `ptr`, unless another
+  operand implies the size: `idiv qword [rbp-0x08]`, `call far dword [rax]`;
+  `push word 0x10` is the 16-bit push.
+- Each condition has one spelling, in `text` and `mnemonic` alike: `je`, `jne`,
+  `jae`, `ja`, `jge` and `jg`, and the same for `setcc` and `cmovcc` (loops and
+  `jrcxz` keep theirs). The 16-bit and far forms NASM names apart are `pushfw`,
+  `popfw`, `iretw`, `retf`, `retfq` and `retfw`.
+- RIP-relative operands print the address they reach, `[rel 0x404010]`.
+  Multi-byte nops print their memory operand only, with any segment prefix the
+  CPU ignores (`nop word cs:[rax+rax*1]`); x87 register forms name the register
+  encoded (`fadd st1`, `fadd to st1`); a rounding mode is an operand of its own
+  (`vaddps zmm0, zmm1, zmm2, {rn-sae}`); and VEX forms NASM would encode as EVEX
+  start with `{vex}`.
+- Invalid bytes become one-byte `db` instructions with `isInvalid`. When the
+  bytes given end before the instruction does, `isTruncated` is set too: more
+  bytes might decode as a valid instruction.
+
+The Core's instruction queries use the same text (`createX86Emulator` loads the
+decoder itself, so `getInstructionAt` stays synchronous); Blink executes the
+instructions and may reject extensions it lacks. `getInstructionAt` answers null
+where nothing is mapped and for an instruction that runs into unmapped memory.
+
+`run(limit, [{ address }])` stops before the instruction at that runtime
+address, with the same continue semantics as source Breakpoints.
+`unimplementedSyscall` emits `{ number, name }` on each unimplemented call,
+without pausing or changing the program's ENOSYS result.
+
+## Assembling an instruction
+
+`assembleInstruction(text, address)` uses NASM 3.00 in its own wasm module and
+returns `{ bytes }`, or `{ error }` with a message that names no NASM file, line
+or severity. It reads the disassembler's text, with every address written as a
+number:
+
+- A direct branch names its absolute target (`je 0x401020`,
+  `call 0x401000+0x10`) and is encoded relative to `address`, short whenever
+  the target is in reach of one.
+- `[rel 0x404010]`, `[rel 0x404010+0x8]` and `[rel 0x404010-0x8]` name the
+  address a RIP-relative operand reaches. NASM encodes `[rel <number>]` as an
+  absolute address, so the operand is rewritten as `[rel $$+delta]` from the
+  instruction's address, which NASM encodes RIP-relative. A name inside
+  `[rel ...]` is an error: labels are the caller's to resolve. `[0x404010]` is
+  an absolute address.
+- Such a target, and a displacement beside a 64-bit register, may be any
+  constant expression of numbers in NASM's notations, `$` (the instruction's
+  address), `+ - * / ~` and parentheses (`jmp 0x401000+2*0x10`,
+  `[rax+(0x10-0x8)]`). It is computed and checked here, since NASM encodes a
+  branch to an absolute number with a displacement it never range-checks; one
+  written with anything else (`'ab'`, `1 << 4`) is an error.
+- Nothing is silently encoded as something else. NASM runs with `-Werror`, so a
+  value it would truncate is an error and not a warning; so are a branch or
+  RIP-relative target out of reach of its displacement, a 64-bit displacement
+  that does not fit in 32 bits, a memory operand whose size NASM 3.00 would
+  guess (`add [rax], 1`), and the forms NASM 3.00 encodes wrongly (`kunpckbw`,
+  `kunpckwd`, and `bswap` or `smsw` of a 16-bit register). `notrack` and
+  `cmpxchg` with a 64-bit or 16-bit register, which NASM 3.00 drops or encodes
+  as 32-bit, are encoded as written.
+
+NASM's `-Ox` still chooses the shortest encoding, which may not be the
+original's: `mov rax, 0x10` becomes `mov eax, 0x10`. To apply a temporary
+patch, check its length, pad shorter replacements with `0x90`, and write the
+bytes between `beginPoke()` and `endPoke()`. Undo restores the original bytes.

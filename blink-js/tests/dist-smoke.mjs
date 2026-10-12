@@ -343,6 +343,62 @@ assert.deepEqual(webAssemblyUses, [], 'the compiler-output subpath never touched
 assert.deepEqual(resolvedModules, [compilerOutputDist.href], 'translating loaded no module either')
 
 // ---------------------------------------------------------------------------
+// The elf subpath, without WebAssembly
+// ---------------------------------------------------------------------------
+
+// Recognising a program must not load a decoder or the emulator: @specy/x86/elf is
+// imported, and a fixture analysed, with the same WebAssembly stub in place, and
+// nothing it loads may carry or name a wasm module.
+const elfDist = new URL('../dist/elf.mjs', import.meta.url)
+assert.equal(import.meta.resolve('@specy/x86/elf'), elfDist.href)
+const elfModules = []
+Object.defineProperty(globalThis, 'WebAssembly', {
+    ...realWebAssembly,
+    value: forbiddenWebAssembly
+})
+const elfHooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+        const resolved = nextResolve(specifier, context)
+        elfModules.push(resolved.url)
+        return resolved
+    }
+})
+try {
+    const elf = await import('@specy/x86/elf')
+    assert.deepEqual(Object.keys(elf), ['analyze'], 'the elf subpath exports the analyser')
+    const analysis = elf.analyze(readFileSync(new URL('./fixtures/elf/crackme', import.meta.url)))
+    assert.equal(analysis.supported, true)
+    assert.deepEqual(analysis.needed, ['libc.so.6'])
+} finally {
+    elfHooks.deregister()
+    Object.defineProperty(globalThis, 'WebAssembly', realWebAssembly)
+}
+assert.deepEqual(webAssemblyUses, [], 'the elf subpath never touched WebAssembly')
+assert.equal(elfModules[0], elfDist.href)
+for (const url of elfModules) {
+    const source = readFileSync(new URL(url), 'utf8')
+    for (const marker of ['AGFzbQ', '.wasm', 'blinkenlib', 'nasm.mjs', 'zydis'])
+        assert.equal(source.includes(marker), false, `${url} carries no ${marker}`)
+}
+
+// No module of the package awaits at its top level, so each entry can be loaded with
+// require() too (Node refuses require(esm) of a module graph that does).
+{
+    const { createRequire } = await import('node:module')
+    const require = createRequire(import.meta.url)
+    for (const specifier of [
+        '@specy/x86',
+        '@specy/x86/disassembler',
+        '@specy/x86/elf',
+        '@specy/x86/compiler-output'
+    ])
+        assert.equal(typeof require(specifier), 'object', `require('${specifier}') loads it`)
+}
+console.log(
+    'ok - analysed an ELF through @specy/x86/elf without WebAssembly, and required every entry'
+)
+
+// ---------------------------------------------------------------------------
 // The root export
 // ---------------------------------------------------------------------------
 
@@ -400,7 +456,7 @@ const ROOT_EXPORTS_2_8_0 = [
 ]
 // The token provideInput() takes for End of input, and where programs start.
 const ROOT_EXPORTS_5_0_0 = ['END_OF_INPUT', 'X86_WORKING_DIRECTORY', 'X86EnvironmentError']
-const ROOT_EXPORTS = [...ROOT_EXPORTS_2_8_0, ...ROOT_EXPORTS_5_0_0]
+const ROOT_EXPORTS = [...ROOT_EXPORTS_2_8_0, ...ROOT_EXPORTS_5_0_0, 'assembleInstruction']
 
 const root = await import(dist)
 const rootNames = Object.keys(root)
@@ -995,5 +1051,44 @@ console.log(
     `ok - ran a program to exit code 7, a two-file project to a breakpoint, the SSE and x87 register files through undo, checked both sides of a store, and read ${failed.errors.length} diagnostic(s)`
 )
 console.log(
-    `ok - translated GCC output through @specy/x86/compiler-output without WebAssembly, built and ran ${fixture ? `ctor-O2 and ${fixture.name}` : 'ctor-O2'} with a start unit, read standard input, and the root exports the ${ROOT_EXPORTS_2_8_0.length} names of 2.8.0 and the ${ROOT_EXPORTS_5_0_0.length} of 5.0.0`
+    `ok - translated GCC output through @specy/x86/compiler-output without WebAssembly, built and ran ${fixture ? `ctor-O2 and ${fixture.name}` : 'ctor-O2'} with a start unit, read standard input, and the root exports the ${ROOT_EXPORTS_2_8_0.length} names of 2.8.0 and the ${ROOT_EXPORTS_5_0_0.length} of 5.0.0, plus assembleInstruction in 7.0.0`
+)
+
+// Bundled Linux assets must resolve from dist too, without the source tree.
+const imported = await createX86Emulator()
+try {
+    const info = await imported.loadExecutable(
+        readFileSync(new URL('./fixtures/elf/cpp', import.meta.url))
+    )
+    assert.deepEqual(info.missing, [])
+    imported.setProgramArguments('./cpp', ['two words', '猫'])
+    imported.initialize(0)
+    let output = ''
+    imported.on('stdout', (bytes) => {
+        output += new TextDecoder().decode(bytes)
+    })
+    await imported.run(2_000_000)
+    assert.equal(imported.stopReason?.kind, 'exit')
+    assert.equal(output, 'hello\nC++\ncaught exception\n')
+    console.log('ok - loaded a dynamic C++ executable using only dist Linux assets')
+} finally {
+    imported.dispose()
+}
+
+assert.equal(
+    import.meta.resolve('@specy/x86/disassembler'),
+    new URL('../dist/disassembler.mjs', import.meta.url).href
+)
+const decoderModule = await import('@specy/x86/disassembler')
+assert.deepEqual(Object.keys(decoderModule), ['loadDisassembler'])
+const decoder = await decoderModule.loadDisassembler()
+assert.equal(await decoderModule.loadDisassembler(), decoder, 'one decoder per module')
+assert.equal(
+    decoder.disassemble(Uint8Array.of(0xf3, 0x0f, 0x1e, 0xfa), 0x401000n)[0].text,
+    'endbr64'
+)
+const patch = await root.assembleInstruction('je 0x555555555170', 0x555555555160n)
+assert.deepEqual([...patch.bytes], [0x74, 0x0e])
+console.log(
+    'ok - imported the independent disassembler subpath and assembled a short address branch'
 )

@@ -37,7 +37,14 @@ export enum BlinkState {
 }
 
 export type StopReasonKind =
-    'exit' | 'signal' | 'input' | 'wait' | 'limit' | 'breakpoint' | 'load-fail' | 'host-error'
+    | 'exit'
+    | 'signal'
+    | 'input'
+    | 'wait'
+    | 'limit'
+    | 'breakpoint'
+    | 'load-fail'
+    | 'host-error'
 
 /** A signal that ended the program, as Linux describes it. */
 export type X86SignalInfo = {
@@ -129,7 +136,7 @@ export type X86SourceLocation = {
     line: number
 }
 
-export type X86Breakpoint = number | X86SourceLocation
+export type X86Breakpoint = number | X86SourceLocation | { address: bigint }
 
 /**
  * `diagnostics` carries everything the assembler said, warnings included - a
@@ -172,6 +179,7 @@ export type X86EmulatorEventMap = {
     signal: { signal: number; code: number }
     inputRequest: X86InputRequest
     waitRequest: X86WaitRequest
+    unimplementedSyscall: { number: number; name: string }
 }
 
 export type X86EmulatorEventName = keyof X86EmulatorEventMap
@@ -204,4 +212,74 @@ export class X86EnvironmentError extends Error {
         super(cause instanceof Error ? cause.message : String(cause), { cause })
         this.name = 'X86EnvironmentError'
     }
+}
+
+/** What an executable needs and which libraries could not be bundled. */
+export type X86ExecutableInfo = {
+    pie: boolean
+    interpreter?: string
+    needed: string[]
+    missing: string[]
+}
+/** Bytes of the process-start block: where they start and how many, a string's NUL included. */
+export type X86ProcessStartBytes = { address: bigint; length: number }
+
+/**
+ * What a Linux process starts with, as the loader wrote it above the initial stack pointer at the
+ * program's last start (`getProcessStart()`): `argc`, the `argv[]`, `envp[]` and auxiliary vectors,
+ * and the strings and bytes they point at. Addresses are the program's own; the facts are what the
+ * loader wrote, whatever the program does to that memory afterwards.
+ */
+export type X86ProcessStart = {
+    /** The initial `rsp`, where `argc` is: the block's first byte. */
+    start: bigint
+    /** One past its last byte, the end of the strings above it: the top of the stack. */
+    end: bigint
+    /** The number of arguments, `argv[0]` included, which the eight bytes at `start` hold. */
+    argc: number
+    /** The NULL-terminated array of pointers to the arguments, right after `argc`. */
+    argv: bigint
+    /** The NULL-terminated array of pointers to the environment's strings, after `argv`'s NULL. */
+    envp: bigint
+    /** The auxiliary vector, type and value pairs after `envp`'s NULL. */
+    auxv: bigint
+    /** One past the auxiliary vector's `AT_NULL` pair: the end of the vectors. */
+    auxvEnd: bigint
+    /** Each argument's string, `argv[0]` first. */
+    arguments: X86ProcessStartBytes[]
+    /** Each environment string, `NAME=value`, in `envp`'s order. */
+    environment: X86ProcessStartBytes[]
+    /** The program's path that `AT_EXECFN` points at. */
+    execfn?: X86ProcessStartBytes
+    /** The 16 random bytes `AT_RANDOM` points at, which seed the C library's stack guard. */
+    random?: X86ProcessStartBytes
+    /**
+     * The program's path the loader writes first, at the very top, where Linux puts the file name
+     * `AT_EXECFN` points at; this loader points `AT_EXECFN` at a copy of it below.
+     */
+    path?: X86ProcessStartBytes
+}
+
+export type X86ExecutableOptions = {
+    argv0?: string
+    arguments?: string[]
+    protectedPath?: string | null
+}
+
+/** An ELF the loader mapped from a file: the program, the dynamic linker or a shared library. */
+export type X86LoadedObject = {
+    /**
+     * Where the loader opened it. The program is `/program`, a path that exists only while the
+     * loader reads it (it is removed before the first instruction); libraries are at their
+     * Linux paths, such as `/lib/x86_64-linux-gnu/libc.so.6`.
+     */
+    path: string
+    /** `DT_SONAME`, for a shared library that has one. */
+    soname?: string
+    /** The load bias: what is added to the ELF's link-time addresses. */
+    base: bigint
+    /** The end of its highest segment, page-aligned, as a runtime address. */
+    end: bigint
+    /** True for the program itself, false for the dynamic linker and libraries. */
+    main: boolean
 }

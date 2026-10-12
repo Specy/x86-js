@@ -4,6 +4,7 @@ import type { X86ProjectFileSystem } from '../src/project-file-system'
 import { probeSource, quadwords, NATIVE, runNatively } from './linux-probe'
 import { BlinkState } from '../src/types'
 import { EmulatorStatus } from '../src/interface'
+import { elfFixture } from './elf-fixtures'
 
 const SOURCE = `bits 64
 global _start
@@ -301,7 +302,7 @@ describe('Project FileSystem guest contracts', () => {
             emulator.dispose()
         }
     })
-    it('refuses mounted File mmap before MAP_FIXED can destroy an anonymous mapping', async () => {
+    it('refuses a shared mapping of a mounted File before MAP_FIXED can destroy an anonymous one', async () => {
         const initial = new Session()
         initial.files.set('data.txt', new Uint8Array(4096))
         const { emulator, bytes } = await mounted(
@@ -311,7 +312,8 @@ describe('Project FileSystem guest contracts', () => {
                 'mov qword [r12],123',
                 'sys 2,path,2,0',
                 'mov r13,rax',
-                'sys 9,r12,4096,3,18,r13,0',
+                // MAP_SHARED | MAP_FIXED
+                'sys 9,r12,4096,3,17,r13,0',
                 'save',
                 'saveq r12',
                 'finish',
@@ -322,6 +324,47 @@ describe('Project FileSystem guest contracts', () => {
         try {
             await emulator.run(10000)
             expect(quadwords(Uint8Array.from(bytes))).toEqual([-19n, 123n])
+        } finally {
+            emulator.dispose()
+        }
+    })
+    it('maps a mounted File privately as a copy read through the Project FileSystem', async () => {
+        const initial = new Session()
+        initial.files.set('flag.txt', new TextEncoder().encode('flag{private_copy}\n'))
+        const { emulator, bytes, session } = await mounted(
+            [
+                'sys 2,flag,0,0',
+                'mov r13,rax',
+                // PROT_READ | PROT_WRITE, MAP_PRIVATE: writes stay in the copy
+                'sys 9,0,8192,3,2,r13,0',
+                'mov r12,rax',
+                'sys 1,1,r12,19',
+                'mov byte [r12],70',
+                'movzx eax,byte [r12+4096]',
+                'save',
+                'movzx eax,byte [r12+19]',
+                'save',
+                'finish',
+                ...PATHS,
+                'section .data',
+                "flag: db './flag.txt',0",
+                'section .text'
+            ],
+            initial
+        )
+        let stdout = ''
+        emulator.on('stdout', (chunk) => {
+            stdout += new TextDecoder().decode(chunk)
+        })
+        try {
+            await emulator.run(10000)
+            expect(emulator.stopReason?.kind).toBe('exit')
+            expect(stdout).toBe('flag{private_copy}\n')
+            // past the end of the File, and the page after it, read as zeros
+            expect(quadwords(Uint8Array.from(bytes))).toEqual([0n, 0n])
+            expect(new TextDecoder().decode(session.files.get('flag.txt'))).toBe(
+                'flag{private_copy}\n'
+            )
         } finally {
             emulator.dispose()
         }
@@ -1303,4 +1346,68 @@ describe('Project FileSystem guest contracts', () => {
             emulator.dispose()
         }
     })
+})
+
+it('protects the running Executable while preserving readable bytes and other writable Files', async () => {
+    const emulator = await createX86Emulator()
+    const session = new Session()
+    const bytes = elfFixture('self-write')
+    session.files.set('self-write', bytes)
+    try {
+        await emulator.loadExecutable(bytes)
+        emulator.setProgramArguments('./self-write', [])
+        emulator.setProtectedPath('/project/self-write')
+        emulator.mountProjectFileSystem(session)
+        emulator.initialize(0)
+        let output = ''
+        emulator.on('stdout', (bytes) => {
+            output += new TextDecoder().decode(bytes)
+        })
+        await emulator.run(1_000_000)
+        expect(output).toBe('open=-1 errno=26\nunlink=-1 errno=16\nrename=-1 errno=16\n')
+        expect(emulator.stopReason).toMatchObject({ kind: 'exit', exitCode: 0 })
+        expect(session.files.get('self-write')).toEqual(bytes)
+        expect(session.files.has('renamed')).toBe(false)
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('allows reading the Executable and writing other Files, rejecting truncation and rename replacement', async () => {
+    const session = new Session()
+    session.files.set('data.txt', Uint8Array.of(0x7f, 0x45, 0x4c, 0x46))
+    session.files.set('renamed.txt', Uint8Array.of(1, 2, 3))
+    const { emulator, bytes } = await mounted(
+        [
+            'sys 2,path,0,0',
+            'mov r12,rax',
+            'sys 0,r12,buf,4',
+            'save',
+            'saved buf',
+            'sys 3,r12',
+            'sys 2,path,512,0',
+            'save',
+            'sys 76,path,0',
+            'save',
+            'sys 82,other,path',
+            'save',
+            'sys 2,other,1,0',
+            'mov r12,rax',
+            'sys 1,r12,payload,3',
+            'save',
+            'finish',
+            ...PATHS
+        ],
+        session,
+        0
+    )
+    try {
+        emulator.setProtectedPath('/project/data.txt')
+        await emulator.run()
+        expect(quadwords(Uint8Array.from(bytes))).toEqual([4n, 0x464c457fn, -26n, -26n, -16n, 3n])
+        expect(session.files.get('data.txt')).toEqual(Uint8Array.of(0x7f, 0x45, 0x4c, 0x46))
+        expect(session.files.get('renamed.txt')).toEqual(Uint8Array.of(97, 98, 99))
+    } finally {
+        emulator.dispose()
+    }
 })

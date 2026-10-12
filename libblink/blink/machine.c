@@ -1049,7 +1049,7 @@ static u64 AluPopcnt(u64 x, struct Machine *m) {
 }
 
 static u64 AluLzcnt(u64 x, struct Machine *m, int bits) {
-  u64 r = x ? bsf(x) : bits;
+  u64 r = x ? bits - 1 - bsr(x) : bits;
   m->flags = SetFlag(m->flags, FLAGS_CF, !x);
   m->flags = SetFlag(m->flags, FLAGS_ZF, !r);
   return r;
@@ -1069,7 +1069,7 @@ static u64 AluBsf(u64 x, struct Machine *m) {
 }
 
 static u64 AluTzcnt(u64 x, struct Machine *m, int bits) {
-  u64 r = x ? bsr(x) : bits;
+  u64 r = x ? bsf(x) : bits;
   m->flags = SetFlag(m->flags, FLAGS_CF, !x);
   m->flags = SetFlag(m->flags, FLAGS_ZF, !r);
   return r;
@@ -1107,11 +1107,11 @@ static void OpBsf(P) {
   u64 (*op)(u64, struct Machine *);
   if (Rep(rde) == 3) {
     if (Rexw(rde)) {
-      op = AluLzcnt64;
+      op = AluTzcnt64;
     } else if (!Osz(rde)) {
-      op = AluLzcnt32;
+      op = AluTzcnt32;
     } else {
-      op = AluLzcnt16;
+      op = AluTzcnt16;
     }
   } else {
     op = AluBsf;
@@ -1123,11 +1123,11 @@ static void OpBsr(P) {
   u64 (*op)(u64, struct Machine *);
   if (Rep(rde) == 3) {
     if (Rexw(rde)) {
-      op = AluTzcnt64;
+      op = AluLzcnt64;
     } else if (!Osz(rde)) {
-      op = AluTzcnt32;
+      op = AluLzcnt32;
     } else {
-      op = AluTzcnt16;
+      op = AluLzcnt16;
     }
   } else {
     op = AluBsr;

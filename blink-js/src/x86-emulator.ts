@@ -23,7 +23,10 @@ import {
     type X86ImplementedSyscall,
     type X86Input,
     type X86RegisterName,
-    type X86Project
+    type X86Project,
+    type X86ExecutableInfo,
+    type X86ExecutableOptions,
+    type X86ProcessStart
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
@@ -74,7 +77,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         stderr: new Set(),
         signal: new Set(),
         inputRequest: new Set(),
-        waitRequest: new Set()
+        waitRequest: new Set(),
+        unimplementedSyscall: new Set()
     }
 
     private lastCompileResult: X86CompileResult | null = null
@@ -133,6 +137,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 waitRequest: (event) => {
                     const result = options.callbacks?.waitRequest?.(event)
                     emulator?.emit('waitRequest', event)
+                    return result
+                },
+                unimplementedSyscall: (event) => {
+                    const result = options.callbacks?.unimplementedSyscall?.(event)
+                    emulator?.emit('unimplementedSyscall', event)
                     return result
                 },
                 inputRequest: (event) => {
@@ -211,14 +220,58 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.lastCompileResult
     }
 
-    resolveMemoryLabel(name: string) { return this.runtime.resolveMemoryLabel(name) }
-    getMemoryLayout() { return this.runtime.getMemoryLayout() }
-    getHeapStart(): bigint { return this.runtime.getHeapStart() }
-    getHeapBreak(): bigint { return this.runtime.getHeapBreak() }
-    getStackTop(): bigint { return this.runtime.getStackTop() }
+    resolveMemoryLabel(name: string) {
+        return this.runtime.resolveMemoryLabel(name)
+    }
+    getMemoryLayout() {
+        return this.runtime.getMemoryLayout()
+    }
+    getLoadedObjects() {
+        return this.runtime.getLoadedObjects()
+    }
+    getLoadedObjectBytes(path: string) {
+        return this.runtime.getLoadedObjectBytes(path)
+    }
+    getHeapStart(): bigint {
+        return this.runtime.getHeapStart()
+    }
+    getHeapBreak(): bigint {
+        return this.runtime.getHeapBreak()
+    }
+    getStackTop(): bigint {
+        return this.runtime.getStackTop()
+    }
+    /**
+     * What the loader wrote above the initial stack pointer at the program's last start: `argc`,
+     * `argv[]`, `envp[]`, the auxiliary vector and the strings they point at, as it wrote them.
+     * Null before the program's first start, after a build or a load, and when the loader failed.
+     */
+    getProcessStart(): X86ProcessStart | null {
+        return this.runtime.getProcessStart()
+    }
+
+    async loadExecutable(
+        data: ArrayBuffer | Uint8Array,
+        options?: X86ExecutableOptions
+    ): Promise<X86ExecutableInfo> {
+        const info = await this.runtime.loadExecutable(data, options)
+        this.clearExecutionTrace()
+        this.lastSourceCode = ''
+        this.lastCompileResult = null
+        return info
+    }
+
+    setProgramArguments(argv0: string, args: string[]): void {
+        this.runtime.setProgramArguments(argv0, args)
+    }
+    setProtectedPath(path: string | null): void {
+        this.runtime.setProtectedPath(path)
+    }
 
     loadElf(data: ArrayBuffer | Uint8Array): void {
         this.clearExecutionTrace()
+        this.lastSourceCode = ''
+        this.lastCompileResult = null
         this.runtime.loadElf(data)
     }
 
@@ -564,6 +617,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.history.callStack()
     }
 
+    /**
+     * The instruction at a run-time address, as the disassembler's NASM text: a one-byte `db` for
+     * bytes that are no instruction, and null where nothing is mapped or the instruction runs
+     * into unmapped memory.
+     */
     getInstructionAt(address: bigint): Instruction | null {
         const instruction = this.runtime.getInstructionAt(address)
         if (!instruction) return null
@@ -695,6 +753,16 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     private resolveBreakpointAddresses(breakpoints: X86Breakpoint[]): bigint[] {
         const addresses = new Map<string, bigint>()
         for (const breakpoint of breakpoints) {
+            if (typeof breakpoint === 'object' && 'address' in breakpoint) {
+                if (
+                    typeof breakpoint.address !== 'bigint' ||
+                    breakpoint.address < 0n ||
+                    breakpoint.address > 0xffffffffffffffffn
+                )
+                    throw new Error('Invalid breakpoint address')
+                addresses.set(breakpoint.address.toString(), breakpoint.address)
+                continue
+            }
             const lineIndex = typeof breakpoint === 'number' ? breakpoint : breakpoint.line
             if (!Number.isSafeInteger(lineIndex) || lineIndex < 0) {
                 throw new Error(`Invalid breakpoint line index: ${lineIndex}`)

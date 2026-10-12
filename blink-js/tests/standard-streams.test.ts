@@ -394,6 +394,60 @@ describe('the terminal', () => {
         expect(run.results).toEqual([0n, 0n, 0n, 0n, 0x8a3bn, 24n | (80n << 16n)])
     })
 
+    // glibc 2.42 and later ask with termios2 in tcgetattr() and isatty(), and decide from isatty()
+    // whether standard output is line-buffered
+    it('answers TCGETS2 on 0, 1 and 2 with the termios TCGETS gives and 38400 bits per second', async () => {
+        const run = await probe([
+            'sys 16, 0, 0x802c542a, buf',
+            'save', // TCGETS2
+            'saved buf',
+            'saved buf + 4',
+            'saved buf + 8',
+            'saved buf + 12',
+            'saveq buf + 16',
+            'saveq buf + 24',
+            'saved buf + 32',
+            'saved buf + 36', // c_ispeed
+            'saved buf + 40', // c_ospeed
+            'sys 16, 1, 0x802c542a, buf2',
+            'save',
+            'sys 16, 2, 0x802c542a, buf2',
+            'save'
+        ])
+        expect(run.results).toEqual([
+            0n,
+            0x4500n,
+            0x5n,
+            0xbfn,
+            0x8a3bn,
+            0x0100_0415_7f1c_0300n,
+            0x170f_1200_1a13_1100n,
+            0x16n,
+            38400n,
+            38400n,
+            0n,
+            0n
+        ])
+    })
+
+    it('accepts TCSETS2, TCSETSW2 and TCSETSF2 and changes nothing', async () => {
+        const run = await probe([
+            'sys 16, 0, 0x802c542a, buf',
+            'mov dword [buf + 12], 0', // raw mode, asked for
+            'mov dword [buf + 40], 9600',
+            'sys 16, 0, 0x402c542b, buf',
+            'save',
+            'sys 16, 0, 0x402c542c, buf',
+            'save',
+            'sys 16, 0, 0x402c542d, buf',
+            'save',
+            'sys 16, 0, 0x802c542a, buf2',
+            'saved buf2 + 12',
+            'saved buf2 + 40'
+        ])
+        expect(run.results).toEqual([0n, 0n, 0n, 0x8a3bn, 38400n])
+    })
+
     it("leads the process's group and session, and refuses a group it has not", async () => {
         const run = await probe([
             'sys 16, 0, 0x540f, buf',

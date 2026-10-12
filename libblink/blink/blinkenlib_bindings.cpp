@@ -138,20 +138,6 @@ bool SetFpuState(val bytes) {
   return blinkenlib_set_fpu_state(block);
 }
 
-val GetDisassemblySnapshot() {
-  val result = val::object();
-  val lines = val::array();
-  uint32_t currentLine = blinkenlib_refresh_disassembly();
-  uint32_t lineCount = blinkenlib_get_disassembly_line_count();
-  for (uint32_t index = 0; index < lineCount; ++index) {
-    const char *line = blinkenlib_get_disassembly_line(index);
-    if (line && line[0]) lines.set(index, std::string(line));
-  }
-  result.set("lines", lines);
-  result.set("currentLine", currentLine);
-  return result;
-}
-
 const char *StopKindName(uint32_t kind) {
   switch (kind) {
     case BLINKENLIB_STOP_BREAKPOINT:
@@ -249,21 +235,6 @@ val GetLastStepInfo() {
   return result;
 }
 
-val GetInstructionAt(uint64_t address) {
-  uint64_t resolvedAddress = 0;
-  uint8_t size = 0;
-  char buffer[1024];
-  if (!blinkenlib_get_instruction_at(address, &resolvedAddress, &size, buffer,
-                                     sizeof(buffer))) {
-    return val::null();
-  }
-  val result = val::object();
-  result.set("address", resolvedAddress);
-  result.set("size", size);
-  result.set("code", std::string(buffer));
-  return result;
-}
-
 val ResolveSymbol(uint64_t address) {
   uint64_t symbolAddress = 0;
   char buffer[1024];
@@ -275,6 +246,36 @@ val ResolveSymbol(uint64_t address) {
   result.set("address", symbolAddress);
   result.set("name", std::string(buffer));
   return result;
+}
+
+val GetFileMaps() {
+  val result = val::array();
+  const char *path;
+  uint64_t address, size, offset;
+  for (uint32_t index = 0; blinkenlib_get_file_map(index, &path, &address, &size, &offset); ++index) {
+    val row = val::object();
+    row.set("path", std::string(path));
+    row.set("address", address);
+    row.set("size", size);
+    row.set("offset", offset);
+    result.set(index, row);
+  }
+  return result;
+}
+
+bool SetProgramArguments(val args, val env) {
+  std::string packed_args, packed_env;
+  auto pack = [](val words, std::string &packed) {
+    uint32_t length = words["length"].as<uint32_t>();
+    for (uint32_t i = 0; i < length; ++i) {
+      packed.append(words[i].as<std::string>());
+      packed.push_back('\0');
+    }
+  };
+  pack(args, packed_args);
+  pack(env, packed_env);
+  return blinkenlib_set_process_arguments(
+      packed_args.data(), packed_args.size(), packed_env.data(), packed_env.size());
 }
 
 void SetEmulationArgs(const std::string &progname, const std::string &argc,
@@ -324,14 +325,14 @@ EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
   emscripten::function("blinkenlibSetFpuState", &SetFpuState);
   emscripten::function("blinkenlibReadMemoryBytes", &ReadMemoryBytes);
   emscripten::function("blinkenlibWriteMemoryBytes", &WriteMemoryBytes);
-  emscripten::function("blinkenlibGetDisassembly", &GetDisassemblySnapshot);
   emscripten::function("blinkenlibSetRunControls", &SetRunControls);
   emscripten::function("blinkenlibGetRunControls", &GetRunControls);
   emscripten::function("blinkenlibGetRunStop", &GetRunStop);
   emscripten::function("blinkenlibGetLastStepInfo", &GetLastStepInfo);
-  emscripten::function("blinkenlibGetInstructionAt", &GetInstructionAt);
   emscripten::function("blinkenlibResolveSymbol", &ResolveSymbol);
   emscripten::function("blinkenlibSetEmulationArgs", &SetEmulationArgs);
+  emscripten::function("blinkenlibSetProgramArguments", &SetProgramArguments);
+  emscripten::function("blinkenlibGetFileMaps", &GetFileMaps);
   emscripten::function("blinkenlibGetSyscalls", &GetSyscalls);
   emscripten::function("blinkenlibGetInputMaxBytes",
                        &blinkenlib_get_input_max_bytes);

@@ -27,7 +27,7 @@ describe('native undo recording', () => {
             await emulator.run(300)
             expect(emulator.getUndoDepth()).toBe(300)
             const rows = emulator.getUndoHistory(300)
-            expect(new Set(rows.map(row => row.serial)).size).toBe(300)
+            expect(new Set(rows.map((row) => row.serial)).size).toBe(300)
             for (let i = 0; i < 300; i++) emulator.undo()
             expect(emulator.getRegisterValue('rbx')).toBe(0n)
             expect(emulator.getUndoDepth()).toBe(0)
@@ -200,12 +200,101 @@ cell: dq 0
             await emulator.run(4)
             expect(emulator.getCallStack().map((frame) => frame.name)).toEqual(['outer', 'inner'])
             const frames = emulator.getCallStack()
+            // each call went to where its symbol starts, and returns after the call
+            for (const frame of frames) expect(frame.target).toBe(frame.address)
+            expect(frames[1].destination).toBe(
+                frames[0].address + BigInt(emulator.getInstructionAt(frames[0].address)!.size!)
+            )
             await emulator.step()
             expect(emulator.getCallStack().map((frame) => frame.name)).toEqual(['outer'])
             emulator.undo()
             expect(emulator.getCallStack()).toEqual(frames)
             emulator.undo()
             expect(emulator.getCallStack()).toEqual(frames)
+        } finally {
+            emulator.dispose()
+        }
+    })
+
+    it('drops every frame whose return address rsp has passed, as unwinding and longjmp leave them', async () => {
+        // `deepest` restores the stack pointer `outer` saved and jumps back into `outer`, as a
+        // longjmp or a C++ landing pad does: `middle` and `deepest` never return
+        const emulator = await build(
+            PREFIX +
+                [
+                    'call outer',
+                    'hlt',
+                    'outer:',
+                    'mov rbx, rsp',
+                    'call middle',
+                    'landed:',
+                    'nop',
+                    'ret',
+                    'middle:',
+                    'push rbp',
+                    'call deepest',
+                    'deepest:',
+                    'sub rsp, 0x40',
+                    'mov rsp, rbx',
+                    'jmp landed'
+                ].join('\n') +
+                '\n'
+        )
+        const names = () => emulator.getCallStack().map((frame) => frame.name)
+        try {
+            await emulator.run(5)
+            expect(names()).toEqual(['outer', 'middle', 'deepest'])
+            const deep = emulator.getCallStack()
+            await emulator.step()
+            expect(emulator.getNextInstruction()?.code).toContain('mov rsp, rbx')
+            expect(emulator.getCallStack()).toEqual(deep)
+            await emulator.step()
+            // rsp is back where `outer` called from: its frame stays, the two below it are gone
+            expect(names()).toEqual(['outer'])
+            await emulator.step()
+            await emulator.step()
+            expect(emulator.getNextInstruction()?.code).toContain('ret')
+            expect(names()).toEqual(['outer'])
+            await emulator.step()
+            expect(names()).toEqual([])
+            // ret, nop, jmp and the mov: the frames come back with the step that dropped them
+            for (let i = 0; i < 4; i++) emulator.undo()
+            expect(emulator.getCallStack()).toEqual(deep)
+        } finally {
+            emulator.dispose()
+        }
+    })
+
+    it('keeps the caller frame when a ret returns through an address no call pushed', async () => {
+        // `outer` reaches `manual` by pushing its return address itself: the `ret` there is not
+        // the end of `outer`, whose own `ret` still is
+        const emulator = await build(
+            PREFIX +
+                [
+                    'call outer',
+                    'hlt',
+                    'outer:',
+                    'lea rax, [rel back]',
+                    'push rax',
+                    'jmp manual',
+                    'back:',
+                    'ret',
+                    'manual:',
+                    'ret'
+                ].join('\n') +
+                '\n'
+        )
+        const names = () => emulator.getCallStack().map((frame) => frame.name)
+        try {
+            await emulator.run(4)
+            expect(emulator.getNextInstruction()?.code).toContain('ret')
+            expect(names()).toEqual(['outer'])
+            await emulator.step()
+            expect(names()).toEqual(['outer'])
+            await emulator.step()
+            expect(names()).toEqual([])
+            emulator.undo()
+            expect(names()).toEqual(['outer'])
         } finally {
             emulator.dispose()
         }

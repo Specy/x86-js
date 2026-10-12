@@ -1,44 +1,52 @@
 {
-  "name": "@specy/x86",
-  "type": "module",
-  "version": "6.3.0",
-  "description": "X86 Emulator for JavaScript using Blink",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Specy/x86-js.git",
-    "directory": "blink-js"
-  },
-  "license": "ISC",
-  "types": "./dist/index.d.mts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.mts",
-      "import": "./dist/index.mjs",
-      "default": "./dist/index.mjs"
+    "name": "@specy/x86",
+    "type": "module",
+    "version": "7.0.0",
+    "description": "X86 Emulator for JavaScript using Blink",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Specy/x86-js.git",
+        "directory": "blink-js"
     },
-    "./compiler-output": {
-      "types": "./dist/compiler-output.d.mts",
-      "import": "./dist/compiler-output.mjs",
-      "default": "./dist/compiler-output.mjs"
+    "license": "ISC",
+    "types": "./dist/index.d.mts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.mts",
+            "import": "./dist/index.mjs",
+            "default": "./dist/index.mjs"
+        },
+        "./compiler-output": {
+            "types": "./dist/compiler-output.d.mts",
+            "import": "./dist/compiler-output.mjs",
+            "default": "./dist/compiler-output.mjs"
+        },
+        "./disassembler": {
+            "types": "./dist/disassembler.d.mts",
+            "import": "./dist/disassembler.mjs",
+            "default": "./dist/disassembler.mjs"
+        },
+        "./elf": {
+            "types": "./dist/elf.d.mts",
+            "import": "./dist/elf.mjs",
+            "default": "./dist/elf.mjs"
+        },
+        "./package.json": "./package.json"
     },
-    "./package.json": "./package.json"
-  },
-  "files": [
-    "dist"
-  ],
-  "scripts": {
-    "build": "tsdown && node scripts/copy-assets.mjs",
-    "build:wasm": "../compile_blink.sh",
-    "dev": "tsdown --watch",
-    "test": "vitest run",
-    "test:dist": "node tests/dist-smoke.mjs",
-    "type-check": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.2",
-    "rolldown-plugin-wasm": "^0.2.1",
-    "tsdown": "^0.21.7",
-    "typescript": "^6.0.2",
-    "vitest": "^3.0.0"
-  }
+    "files": ["dist"],
+    "scripts": {
+        "build": "tsdown && node scripts/copy-assets.mjs",
+        "build:wasm": "../compile_blink.sh",
+        "dev": "tsdown --watch",
+        "test": "vitest run",
+        "test:dist": "node tests/dist-smoke.mjs",
+        "type-check": "tsc --noEmit"
+    },
+    "devDependencies": {
+        "@types/node": "^22.10.2",
+        "rolldown-plugin-wasm": "^0.2.1",
+        "tsdown": "^0.21.7",
+        "typescript": "^6.0.2",
+        "vitest": "^3.0.0"
+    }
 }

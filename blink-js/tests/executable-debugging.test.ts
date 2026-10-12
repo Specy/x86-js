@@ -1,0 +1,190 @@
+import { expect, it } from 'vitest'
+import { loadDisassembler } from '../src/disassembler'
+import { analyze } from '../src/elf'
+import { createX86Emulator } from '../src/x86-emulator'
+import { elfFixture, fixtureEmulator } from './elf-fixtures'
+
+const { disassemble } = await loadDisassembler()
+
+it('stops at an address before strcmp, exposes its operands and names every loaded object', async () => {
+    const bytes = elfFixture('crackme')
+    const info = analyze(bytes)
+    const text = info.sections.find((section) => section.name === '.text')!
+    const strcmp = info.plt.find((stub) => stub.name === 'strcmp@plt')!
+    const call = disassemble(
+        bytes.subarray(text.offset, text.offset + text.size),
+        text.address
+    ).find(
+        (instruction) =>
+            instruction.isCall &&
+            instruction.operands.some((operand) => operand.branchTarget === strcmp.address)
+    )!
+    const emulator = await fixtureEmulator('crackme')
+    try {
+        emulator.provideInput('wrong\n')
+        await emulator.run(1_000_000, [{ address: 0x555555554000n + call.address }])
+        expect(emulator.stopReason?.kind).toBe('breakpoint')
+        expect(
+            new TextDecoder().decode(emulator.readMemoryBytes(emulator.getRegisterValue('rsi'), 8n))
+        ).toBe('hunter2\0')
+        expect(
+            new TextDecoder().decode(emulator.readMemoryBytes(emulator.getRegisterValue('rdi'), 6n))
+        ).toBe('wrong\0')
+        const objects = emulator.getLoadedObjects()
+        expect(objects.find((object) => object.path === '/program')?.base).toBe(0x555555554000n)
+        const libc = objects.find((object) => object.soname === 'libc.so.6')!
+        const linker = objects.find((object) => object.path === '/lib64/ld-linux-x86-64.so.2')!
+        expect(libc.end).toBeLessThanOrEqual(linker.base)
+        expect(linker.end).toBeLessThanOrEqual(0x7ffff7fff000n)
+        expect(emulator.getLoadedObjectBytes(libc.path)).toBeInstanceOf(Uint8Array)
+        expect(emulator.getInstructionAt(emulator.getPc())?.code).toContain('call')
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('names where a call into a PLT stub went, which no symbol starts', async () => {
+    const bytes = elfFixture('crackme')
+    const fgets = analyze(bytes).plt.find((stub) => stub.name === 'fgets@plt')!
+    const emulator = await createX86Emulator()
+    try {
+        await emulator.loadExecutable(bytes)
+        emulator.initialize(1000)
+        await emulator.run(1_000_000)
+        expect(emulator.stopReason?.kind).toBe('input')
+        // fgets waits inside libc, called through its stub from main
+        const frame = emulator
+            .getCallStack()
+            .find((candidate) => candidate.target === 0x555555554000n + fgets.address)!
+        expect(frame).toBeDefined()
+        expect(frame.address).toBeLessThan(frame.target)
+        expect(frame.name).toBe('_init')
+        const main = emulator.getCallStack().find((candidate) => candidate.name === 'main')!
+        expect(frame.destination).toBeGreaterThan(main.address)
+        expect(frame.destination).toBeLessThan(main.address + 0x100n)
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('drops the frames a caught C++ exception unwinds, so main returns and leaves the stack', async () => {
+    const emulator = await createX86Emulator()
+    let output = ''
+    emulator.on('stdout', (chunk) => {
+        output += new TextDecoder().decode(chunk)
+    })
+    try {
+        await emulator.loadExecutable(elfFixture('cpp'))
+        emulator.initialize(1000)
+        await emulator.run(50_000_000)
+        expect(output).toBe('hello\nC++\ncaught exception\n')
+        expect(emulator.stopReason?.kind).toBe('exit')
+        const frames = emulator.getCallStack()
+        // main threw through __cxa_throw@plt, which Blink names `_init`, and returned after the
+        // catch: neither frame is left, only the ones exit() runs in
+        expect(frames.map((frame) => frame.name)).not.toContain('main')
+        expect(frames.map((frame) => frame.name)).not.toContain('_init')
+        expect(frames[0].name).toBe('__libc_start_main')
+        // every frame's return address is still on the stack, the innermost lowest
+        const rsp = emulator.getRegisterValue('rsp')
+        for (let i = 0; i < frames.length; i++) {
+            expect(frames[i].sp).toBeGreaterThanOrEqual(rsp)
+            if (i > 0) expect(frames[i].sp).toBeLessThan(frames[i - 1].sp)
+        }
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('uses Zydis for instruction queries even when Blink cannot execute the instruction', async () => {
+    const bytes = elfFixture('avx')
+    const info = analyze(bytes)
+    const section = info.sections.find((section) => section.name === '.text')!
+    const code = disassemble(
+        bytes.subarray(section.offset, section.offset + section.size),
+        section.address
+    )
+    const avx = code.find((instruction) => instruction.mnemonic.startsWith('v'))!
+    const cet = code.find((instruction) => instruction.mnemonic === 'endbr64')!
+    const emulator = await fixtureEmulator('avx')
+    try {
+        emulator.getNextInstruction()
+        expect(emulator.getInstructionAt(0x555555554000n + avx.address)?.code).toBe(avx.text)
+        expect(emulator.getInstructionAt(0x555555554000n + cet.address)?.code).toBe('endbr64')
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('emits a named unimplemented syscall each time while leaving ENOSYS in rax', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        const events: { number: number; name: string }[] = []
+        emulator.on('unimplementedSyscall', (event) => {
+            events.push(event)
+        })
+        const source =
+            'global _start\nsection .text\n_start:\nmov eax,309\nsyscall\nmov r12,rax\nmov eax,309\nsyscall\nmov r13,rax\nmov eax,60\nxor edi,edi\nsyscall'
+        expect((await emulator.compile(source)).ok).toBe(true)
+        emulator.initialize(0)
+        await emulator.run()
+        expect(events).toEqual([
+            { number: 309, name: 'getcpu' },
+            { number: 309, name: 'getcpu' }
+        ])
+        expect(emulator.getRegisterValue('r12')).toBe(0xffffffffffffffdan)
+        expect(emulator.getRegisterValue('r13')).toBe(0xffffffffffffffdan)
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('answers null for an instruction that runs into unmapped memory', async () => {
+    const emulator = await createX86Emulator()
+    try {
+        // Two pages at 0x20000000, the second unmapped again. The first ends with `push es`,
+        // which is no instruction in 64-bit mode, `mov eax, 0x1`, which ends at the boundary,
+        // and the first byte of another `mov eax, imm32`, whose immediate would be unmapped.
+        const source = [
+            'global _start',
+            'section .text',
+            '_start:',
+            'mov eax, 9',
+            'mov edi, 0x20000000',
+            'mov esi, 0x2000',
+            'mov edx, 3',
+            'mov r10d, 0x32',
+            'mov r8, -1',
+            'xor r9d, r9d',
+            'syscall',
+            'mov eax, 11',
+            'mov edi, 0x20001000',
+            'mov esi, 0x1000',
+            'syscall',
+            'mov byte [0x20000ff9], 0x06',
+            'mov byte [0x20000ffa], 0xb8',
+            'mov dword [0x20000ffb], 1',
+            'mov byte [0x20000fff], 0xb8',
+            'stop:',
+            'mov eax, 60',
+            'xor edi, edi',
+            'syscall'
+        ].join('\n')
+        const build = await emulator.compile(source)
+        expect(build.ok, build.report).toBe(true)
+        const program = analyze(emulator.module.FS.readFile('/program') as Uint8Array)
+        const stop = program.symbols.find((symbol) => symbol.name === 'stop')!.value
+        emulator.initialize(0)
+        await emulator.run(1_000_000, [{ address: stop }])
+        expect(emulator.stopReason?.kind, emulator.stopReason?.details).toBe('breakpoint')
+        expect(emulator.getInstructionAt(0x20000ff9n)).toMatchObject({ code: 'db 0x06', size: 1 })
+        expect(emulator.getInstructionAt(0x20000ffan)).toMatchObject({
+            code: 'mov eax, 0x01',
+            size: 5
+        })
+        expect(emulator.getInstructionAt(0x20000fffn)).toBeNull()
+        expect(emulator.getInstructionAt(0x20001000n)).toBeNull()
+    } finally {
+        emulator.dispose()
+    }
+})

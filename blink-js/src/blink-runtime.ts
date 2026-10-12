@@ -10,6 +10,17 @@ import {
 } from './assemblers'
 import { writeArchive } from './archive'
 import { readResourceBytes } from './resources'
+import { analyze } from './elf'
+import { loadDisassembler, type Disassembler } from './disassembler'
+import { LINUX_SYSCALL_NAMES } from './syscall-names'
+import type { X86LoadedObject } from './types'
+import {
+    resolveLinuxLibraries,
+    validateProgramArguments,
+    X86_PROGRAM_ENVIRONMENT
+} from './linux-runtime'
+import type { X86ExecutableInfo, X86ExecutableOptions, X86ProcessStart } from './types'
+import { readProcessStart } from './process-start'
 import { parseSourceMap, type SourceMap } from './source-map'
 import {
     stageX86Project,
@@ -17,8 +28,18 @@ import {
     X86_PROJECT_ROOT,
     x86ProjectSourcePath
 } from './project'
-import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols, readElfSymbolTable } from './elf-symbols'
-import { captureFileSystemSkeleton, resetFileSystem, type FileSystemSkeleton } from './file-system'
+import {
+    DEFAULT_ENTRY_SYMBOL,
+    findNearestSymbol,
+    readDefinedGlobalSymbols,
+    readElfSymbolTable
+} from './elf-symbols'
+import {
+    captureFileSystemSkeleton,
+    resetFileSystem,
+    X86_WORKING_DIRECTORY,
+    type FileSystemSkeleton
+} from './file-system'
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
 import {
     BlinkState,
@@ -41,7 +62,6 @@ import { X86_FPU_STATE_SIZE, emptyFpuStateBlock } from './fpu-state'
 import { describeSignal } from './signals'
 import type {
     BlinkenlibModule,
-    DisassemblySnapshot,
     NativeInstruction,
     NativeStepInfo,
     NativeSymbol,
@@ -68,14 +88,9 @@ function archiveMemberName(position: number): string {
     return `u${position}.o`
 }
 
-/**
- * The shadow-memory range blink keeps for its own bookkeeping, which the
- * memory bridge refuses to read. Kept in step with `IsShadow` in
- * `blink/blinkenlib.c`, so the fast read path refuses exactly what the bridge
- * refuses.
- */
-export function isShadowAddress(address: bigint): boolean {
-    return address >= 0x7fff8000n && address < 0x100080000000n
+/** The wasm Core uses guest page tables; no guest range is ASan host shadow. */
+export function isShadowAddress(_address: bigint): boolean {
+    return false
 }
 
 const SIGTRAP = 5
@@ -111,6 +126,7 @@ export type BlinkRuntimeCallbacks = {
     /** A read found the terminal empty: answer it with `provideInput()`. */
     inputRequest?: (event: X86InputRequest) => MaybePromise<void>
     waitRequest?: (event: X86WaitRequest) => MaybePromise<void>
+    unimplementedSyscall?: (event: { number: number; name: string }) => MaybePromise<void>
 }
 
 export type BlinkRuntimeOptions = {
@@ -151,6 +167,10 @@ export class BlinkRuntime {
     private waitResumeState = BlinkState.ProgramRunning
     private programSources = false
     private generation = 0
+    /** Counts every replacement of the program: a load, a build or a cleared session. */
+    private programReplacements = 0
+    /** What Blink writes to stderr while it loads the program: why, when the load fails. */
+    private loaderOutput: number[] | null = null
     private readonly callbacks: Required<BlinkRuntimeCallbacks>
     private readonly scheduler: (callback: () => void) => void
     /**
@@ -182,12 +202,19 @@ export class BlinkRuntime {
 
     private readonly defaultArgc = '/program'
     private readonly defaultArgv = ''
+    private programArgv = ['/program']
+    /** The block the loader wrote above the stack at the last start; see `getProcessStart`. */
+    private processStart: X86ProcessStart | null = null
+    private systemFiles = new Map<string, Uint8Array>()
+    private readonly elfAnalyses = new WeakMap<Uint8Array, ReturnType<typeof analyze>>()
+    private protectedPath: string | null = null
 
     private constructor(
         module: BlinkenlibModule,
         mode: AssemblerMode,
         callbacks: Required<BlinkRuntimeCallbacks>,
-        scheduler: (callback: () => void) => void
+        scheduler: (callback: () => void) => void,
+        private readonly disassembler: Disassembler
     ) {
         this.module = module
         this.mode = mode
@@ -226,7 +253,10 @@ export class BlinkRuntime {
                 )
             }
         })
-        const module = await awaitBlinkenlibModule(modulePromise, wasmInitStarted)
+        const [module, disassembler] = await Promise.all([
+            awaitBlinkenlibModule(modulePromise, wasmInitStarted),
+            loadDisassembler()
+        ])
         mirrorHostError(module)
 
         const signalPointer = module.addFunction(
@@ -256,9 +286,17 @@ export class BlinkRuntime {
             exitPointer.toString(),
             outputPointer.toString()
         ])
-        module._blinkenlib_set_deferred_disassembly?.(true)
 
-        runtime = new BlinkRuntime(module, mode, callbacks, scheduler)
+        runtime = new BlinkRuntime(module, mode, callbacks, scheduler, disassembler)
+        module.onUnimplementedSyscall = (number) => {
+            if (runtime?.programSources)
+                observeCallbackResult(
+                    callbacks.unimplementedSyscall({
+                        number,
+                        name: LINUX_SYSCALL_NAMES[number] ?? `syscall_${number}`
+                    })
+                )
+        }
         runtime.environment = options.environment ?? {}
         await runtime.setMode(mode)
         return runtime
@@ -324,9 +362,14 @@ export class BlinkRuntime {
         // Before anything changes, so that a Project the build cannot take leaves the previous
         // program, and the state it is in, exactly as they were.
         validateX86Project(project)
+        // A later load or build supersedes this one: it stops at its next await (see
+        // `throwIfSuperseded`), leaving the newer program as it is.
+        const replacement = ++this.programReplacements
         this.detachProjectFileSystem()
         const sourceProject = copyX86Project(project)
         this.layoutUnits = []
+        this.systemFiles.clear()
+        this.protectedPath = null
         this.sourceProject = sourceProject
         // The build starts from the file system every program does, so nothing an earlier run
         // left behind can stand in for a File, an object or a tool; it replaces the program, and
@@ -334,6 +377,7 @@ export class BlinkRuntime {
         resetFileSystem(this.module.FS, this.skeleton)
         this.module.blinkenlibClearInput()
         this.programBytes = null
+        this.processStart = null
         this.stopReason = null
         this.assemblerLogs = ''
         this.assemblerErrors = []
@@ -348,12 +392,12 @@ export class BlinkRuntime {
 
         try {
             if (this.mode.wasmAssembler) {
-                await this.assembleWithWasmAssembler(sourceProject, options)
+                await this.assembleWithWasmAssembler(sourceProject, options, replacement)
             } else {
-                await this.assembleInBlink(sourceProject)
+                await this.assembleInBlink(sourceProject, replacement)
             }
         } finally {
-            this.assembleOnly = false
+            if (replacement === this.programReplacements) this.assembleOnly = false
             this.module.FS.chdir('/')
         }
 
@@ -372,17 +416,73 @@ export class BlinkRuntime {
     }
 
     private layoutUnits: { path: string; object: Uint8Array }[] = []
+    private analyzeObject(bytes: Uint8Array) {
+        let info = this.elfAnalyses.get(bytes)
+        if (!info) {
+            info = analyze(bytes)
+            this.elfAnalyses.set(bytes, info)
+        }
+        return info
+    }
+    private programLoadBias(): bigint {
+        if (!this.programBytes) return 0n
+        const info = this.analyzeObject(this.programBytes)
+        const first =
+            info.programHeaders
+                .filter((header) => header.type === 1)
+                .reduce(
+                    (lowest, header) => (header.address < lowest ? header.address : lowest),
+                    0x7fffffffffffffffn
+                ) & ~4095n
+        if (this.programSources && this.state !== BlinkState.ProgramLoaded) {
+            const map = this.module
+                .blinkenlibGetFileMaps()
+                .find((map) => map.path === PROGRAM && map.offset === 0n)
+            if (map) return map.address - first
+        }
+        return info.pie && first === 0n ? 0x555555554000n : 0n
+    }
     getMemoryLayout(): X86MemoryLayout {
-        return this.programBytes ? readMemoryLayout(this.programBytes, this.layoutUnits, this.sourceProject) : { sections: [], items: [], symbols: [] }
+        if (!this.programBytes) return { sections: [], items: [], symbols: [] }
+        const layout = readMemoryLayout(this.programBytes, this.layoutUnits, this.sourceProject)
+        const base = this.programLoadBias()
+        if (base) {
+            for (let i = 0; i < layout.items.length; i += 5) layout.items[i] += base
+            layout.symbols = layout.symbols.map((symbol) => ({
+                ...symbol,
+                address: symbol.address + base
+            }))
+        }
+        return layout
     }
     resolveMemoryLabel(name: string): bigint | undefined {
-        const data = this.getMemoryLayout().symbols.find(symbol => symbol.name === name)
+        const data = this.getMemoryLayout().symbols.find((symbol) => symbol.name === name)
         if (data) return data.address
-        return this.programBytes ? readElfSymbolTable(this.programBytes).symbols.find(symbol => symbol.name === name && symbol.sectionIndex !== 0)?.value : undefined
+        const symbol = this.programBytes
+            ? this.analyzeObject(this.programBytes).symbols.find(
+                  (symbol) => symbol.name === name && symbol.sectionIndex !== 0
+              )
+            : undefined
+        return symbol ? symbol.value + this.programLoadBias() : undefined
     }
-    getHeapBreak(): bigint { return this.module._blinkenlib_get_brk() }
-    getHeapStart(): bigint { return this.module._blinkenlib_get_brk_start() }
-    getStackTop(): bigint { return this.module._blinkenlib_get_stack_top() }
+    getHeapBreak(): bigint {
+        return this.module._blinkenlib_get_brk()
+    }
+    getHeapStart(): bigint {
+        return this.module._blinkenlib_get_brk_start()
+    }
+    getStackTop(): bigint {
+        return this.module._blinkenlib_get_stack_top()
+    }
+    /**
+     * What the loader wrote above the initial stack pointer at the program's last start: `argc`,
+     * `argv[]`, `envp[]`, the auxiliary vector and their strings, read back once, before the first
+     * instruction. Kept after the program ends, until the next start; null before the first start
+     * of a program, after a build, a load or `clearExecution()`, and when the loader failed.
+     */
+    getProcessStart(): X86ProcessStart | null {
+        return this.processStart
+    }
 
     /**
      * The objects this build's assembler wrote, for the checks that read them
@@ -481,14 +581,16 @@ export class BlinkRuntime {
         ]
     }
 
-    private async assembleInBlink(sourceProject: X86Project): Promise<void> {
+    private async assembleInBlink(sourceProject: X86Project, replacement: number): Promise<void> {
         stageX86Project(this.module.FS, sourceProject)
         this.setState(BlinkState.Assembling)
         await defer()
+        this.throwIfSuperseded(replacement)
         this.runTool('/assembler', this.mode.binaries.assembler!.commands)
         await this.waitForState(
             (state) => state !== BlinkState.Assembling && state !== BlinkState.Linking
         )
+        this.throwIfSuperseded(replacement)
         if (this.assemblerErrors.length === 0) {
             try {
                 this.assembledObjects = [this.module.FS.readFile('/program.o') as Uint8Array]
@@ -506,10 +608,12 @@ export class BlinkRuntime {
      */
     private async assembleWithWasmAssembler(
         sourceProject: X86Project,
-        options: { link: boolean }
+        options: { link: boolean },
+        replacement: number
     ): Promise<void> {
         this.setState(BlinkState.Assembling)
         const assembled = await this.mode.wasmAssembler!.assemble(sourceProject)
+        this.throwIfSuperseded(replacement)
 
         // What the assembler said goes into the report, as a blink-hosted tool's does.
         this.assemblerLogs += assembled.stdout + assembled.stderr
@@ -529,25 +633,43 @@ export class BlinkRuntime {
 
         const [entry, ...others] = assembled.units
         this.unitDiagnostics = duplicateUserDefinitions(assembled.units, sourceProject)
-        if (this.unitDiagnostics.length) { this.setState(BlinkState.Ready); return }
+        if (this.unitDiagnostics.length) {
+            this.setState(BlinkState.Ready)
+            return
+        }
         this.writeExecutableSync(ENTRY_OBJECT, entry!.object)
         const inputs = [ENTRY_OBJECT]
-        const starts = others.filter(unit => Object.hasOwn(sourceProject.startUnits ?? {}, unit.path))
+        const starts = others.filter((unit) =>
+            Object.hasOwn(sourceProject.startUnits ?? {}, unit.path)
+        )
         for (const [i, unit] of starts.entries()) {
             const object = `/start${i}.o`
             this.writeExecutableSync(object, unit.object)
             this.startObjectSources.set(object, `${X86_PROJECT_ROOT}/${unit.path}`)
             inputs.push(object)
         }
-        const members = others.filter(unit => !Object.hasOwn(sourceProject.startUnits ?? {}, unit.path))
-        this.archiveMembers = members.map(unit => unit.path)
-        const userMembers = members.filter(unit => Object.hasOwn(sourceProject.files, unit.path))
-        const support = members.filter(unit => Object.hasOwn(sourceProject.library ?? {}, unit.path))
-        for (const [archivePath, units] of [[UNIT_ARCHIVE, userMembers], ['/support.a', support]] as const) {
+        const members = others.filter(
+            (unit) => !Object.hasOwn(sourceProject.startUnits ?? {}, unit.path)
+        )
+        this.archiveMembers = members.map((unit) => unit.path)
+        const userMembers = members.filter((unit) => Object.hasOwn(sourceProject.files, unit.path))
+        const support = members.filter((unit) =>
+            Object.hasOwn(sourceProject.library ?? {}, unit.path)
+        )
+        for (const [archivePath, units] of [
+            [UNIT_ARCHIVE, userMembers],
+            ['/support.a', support]
+        ] as const) {
             if (!units.length) continue
-            this.writeExecutableSync(archivePath, writeArchive(units.map(unit => ({
-                name: archiveMemberName(members.indexOf(unit)), data: unit.object
-            }))))
+            this.writeExecutableSync(
+                archivePath,
+                writeArchive(
+                    units.map((unit) => ({
+                        name: archiveMemberName(members.indexOf(unit)),
+                        data: unit.object
+                    }))
+                )
+            )
             inputs.push(archivePath)
         }
         // A support member may reference a secondary user definition. Re-search archives for it.
@@ -556,19 +678,38 @@ export class BlinkRuntime {
         const mapped = userMembers.length > 0
         this.beginLinking()
         await defer()
-        this.runTool('/linker', this.mode.binaries.linker?.link(inputs).replace(
-            inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) + (mapped ? ' -Map /program.map' : ''))
-        await this.waitForState(state => state !== BlinkState.Linking)
+        this.throwIfSuperseded(replacement)
+        this.runTool(
+            '/linker',
+            this.mode.binaries.linker
+                ?.link(inputs)
+                .replace(inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) +
+                (mapped ? ' -Map /program.map' : '')
+        )
+        await this.waitForState((state) => state !== BlinkState.Linking)
+        this.throwIfSuperseded(replacement)
         if (mapped && this.state === BlinkState.ProgramLoaded) {
             const map = this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string
             for (const unit of userMembers) {
                 const member = archiveMemberName(members.indexOf(unit))
-                if (!map.includes(`${UNIT_ARCHIVE}(${member})`)) this.unitDiagnostics.push({
-                    file: unit.path, line: 1, severity: 'hint', warningClass: 'not-linked',
-                    error: 'nothing refers to a symbol this File defines, so it is not part of the program'
-                })
+                if (!map.includes(`${UNIT_ARCHIVE}(${member})`))
+                    this.unitDiagnostics.push({
+                        file: unit.path,
+                        line: 1,
+                        severity: 'hint',
+                        warningClass: 'not-linked',
+                        error: 'nothing refers to a symbol this File defines, so it is not part of the program'
+                    })
             }
         }
+    }
+
+    /** A build stops where it resumes once a later load or build has replaced its program. */
+    private throwIfSuperseded(replacement: number): void {
+        if (replacement !== this.programReplacements)
+            throw new Error(
+                'This build was superseded: another program was loaded or built before it finished'
+            )
     }
 
     /**
@@ -598,18 +739,67 @@ export class BlinkRuntime {
         }))
     }
 
+    async loadExecutable(
+        data: ArrayBuffer | Uint8Array,
+        options: X86ExecutableOptions = {}
+    ): Promise<X86ExecutableInfo> {
+        const bytes = copyBytes(data)
+        const info = analyze(bytes)
+        if (!info.supported) throw new Error(info.reason)
+        // Everything the options ask for is checked before the program is replaced, so a load
+        // that throws leaves the previous program as it was, and an earlier load or build going on.
+        if (options.argv0 !== undefined || options.arguments !== undefined)
+            validateProgramArguments(options.argv0 ?? '/program', options.arguments ?? [])
+        const protectedPath =
+            options.protectedPath === undefined
+                ? undefined
+                : normalizeProtectedPath(options.protectedPath)
+        // Taken once the load's own checks pass and before anything is awaited: a later load or
+        // build supersedes this one, whichever finishes first.
+        const replacement = ++this.programReplacements
+        const libraries = await resolveLinuxLibraries(info.needed, info.interpreter)
+        if (replacement !== this.programReplacements)
+            throw new Error(
+                'This load was superseded: another program was loaded or built while its libraries were fetched'
+            )
+        this.loadElf(bytes)
+        this.systemFiles = libraries.files
+        if (options.argv0 !== undefined || options.arguments !== undefined)
+            this.setProgramArguments(options.argv0 ?? '/program', options.arguments ?? [])
+        if (protectedPath !== undefined) this.protectedPath = protectedPath
+        return {
+            pie: info.pie,
+            interpreter: info.interpreter,
+            needed: info.needed,
+            missing: libraries.missing
+        }
+    }
+
+    setProgramArguments(argv0: string, args: string[]): void {
+        validateProgramArguments(argv0, args)
+        this.programArgv = [argv0, ...args]
+    }
+
+    setProtectedPath(path: string | null): void {
+        this.protectedPath = normalizeProtectedPath(path)
+    }
+
     loadElf(data: ArrayBuffer | Uint8Array): void {
         this.clearWaitTransport()
         ++this.generation
+        ++this.programReplacements
         this.detachProjectFileSystem()
         this.module._blinkenlib_abandon_execution()
         if (this.state === BlinkState.NotReady) throw new Error('Blink runtime is not ready')
-        this.programBytes =
-            data instanceof Uint8Array ? data.slice() : new Uint8Array(data.slice(0))
+        this.programBytes = copyBytes(data)
+        this.processStart = null
         this.module.blinkenlibClearInput()
         this.stopReason = null
         this.sourceMap = null
         this.sourceProject = null
+        this.layoutUnits = []
+        this.systemFiles.clear()
+        this.protectedPath = null
         this.setState(BlinkState.ProgramLoaded)
     }
 
@@ -618,7 +808,7 @@ export class BlinkRuntime {
      * before either. The program never sees it on the file system (see `startProgram`).
      */
     getExecutable(): Uint8Array | null {
-        return this.programBytes?.slice() ?? null
+        return this.programBytes ? new Uint8Array(this.programBytes) : null
     }
 
     starti(): void {
@@ -639,8 +829,7 @@ export class BlinkRuntime {
         if (this.state !== BlinkState.ProgramRunning) {
             throw new Error(`Cannot step while emulator is ${this.state}`)
         }
-        this.module._blinkenlib_stepi()
-        this.checkHostError()
+        this.callNative(() => this.module._blinkenlib_stepi())
     }
 
     continue(): void {
@@ -648,8 +837,7 @@ export class BlinkRuntime {
         if (this.state !== BlinkState.ProgramRunning) {
             throw new Error(`Cannot continue while emulator is ${this.state}`)
         }
-        this.module._blinkenlib_continue()
-        this.checkHostError()
+        this.callNative(() => this.module._blinkenlib_continue())
     }
 
     async runUntilBlocked(options: BlinkRunOptions = {}): Promise<BlinkState> {
@@ -683,8 +871,7 @@ export class BlinkRuntime {
     runSlice(budget: number, breakpoints: bigint[], skipAtPc: boolean): number {
         this.configureRunControls({ breakpointAddresses: breakpoints })
         this.resumeAfterStateMutation()
-        this.module._blinkenlib_run_slice!(budget, skipAtPc)
-        this.checkHostError()
+        this.callNative(() => this.module._blinkenlib_run_slice!(budget, skipAtPc))
         return Number(this.module.blinkenlibGetRunStop().executedInstructions)
     }
 
@@ -726,6 +913,38 @@ export class BlinkRuntime {
             throw new Error('Clock source must return finite nonnegative milliseconds')
         return value
     }
+    /**
+     * Runs a native entry point that executes guest instructions, then reports a host callback's
+     * error as `checkHostError` does. A native `exit()` inside the wasm, Blink ending the process
+     * on a condition it cannot recover from, unwinds out of the call as Emscripten's
+     * `ExitStatus`, past what the instruction would have released (and in Node it also sets
+     * `process.exitCode`). That becomes a stopped program with a `host-error` stop: the native
+     * state and the C stack are released, and the host process's exit code is left as it was.
+     */
+    private callNative(call: () => void): void {
+        const stack = this.module.stackSave?.()
+        const exitCode = nodeExitCode()
+        try {
+            call()
+        } catch (error) {
+            const status = nativeExitStatus(error)
+            if (status === null) throw error
+            restoreNodeExitCode(exitCode)
+            if (stack !== undefined) this.module.stackRestore?.(stack)
+            this.clearWaitTransport()
+            this.module._blinkenlib_recover_native_exit?.()
+            this.module.blinkHostError = undefined
+            this.stopReason = {
+                loadFail: false,
+                exitCode: status,
+                kind: 'host-error',
+                details: `The emulator could not continue the program (native exit ${status})`
+            }
+            this.setState(BlinkState.ProgramStopped)
+            return
+        }
+        this.checkHostError()
+    }
     private checkHostError(): void {
         if (this.module.blinkHostError === undefined) return
         const error = new X86EnvironmentError(this.module.blinkHostError)
@@ -763,8 +982,7 @@ export class BlinkRuntime {
                     return
                 this.stopReason = null
                 this.setState(BlinkState.ProgramRunning)
-                this.module._blinkenlib_faketty_resume()
-                this.checkHostError()
+                this.callNative(() => this.module._blinkenlib_faketty_resume())
             },
             Math.min(2147483647, Math.ceil(delay))
         )
@@ -780,8 +998,7 @@ export class BlinkRuntime {
         if (cancel) this.module._blinkenlib_wait_cancel()
         this.stopReason = null
         this.setState(resumeState)
-        this.module._blinkenlib_faketty_resume()
-        this.checkHostError()
+        this.callNative(() => this.module._blinkenlib_faketty_resume())
         return true
     }
     cancelWait(): boolean {
@@ -797,12 +1014,14 @@ export class BlinkRuntime {
             throw new Error('Cannot clear x86 execution from an active native instruction or build')
         this.clearWaitTransport()
         ++this.generation
+        ++this.programReplacements
         this.resumeScheduled = false
         this.detachProjectFileSystem()
         this.module._blinkenlib_clear_execution()
         this.module.blinkHostError = undefined
         this.programSources = false
         this.programBytes = null
+        this.processStart = null
         this.sourceMap = null
         this.sourceProject = null
         this.stopReason = null
@@ -828,8 +1047,7 @@ export class BlinkRuntime {
         if (this.waitTimer !== null) clearTimeout(this.waitTimer)
         this.waitTimer = null
         this.setState(BlinkState.ProgramRunning)
-        this.module._blinkenlib_faketty_resume()
-        this.checkHostError()
+        this.callNative(() => this.module._blinkenlib_faketty_resume())
         return true
     }
 
@@ -852,8 +1070,7 @@ export class BlinkRuntime {
      * so it takes this path and falls back to the bridge whenever this one
      * declines. The two agree byte for byte because they do the same lookup:
      * `blinkenlib_spy_address` IS the lookup `blinkenlib_read_memory_byte`
-     * makes, and the shadow-memory range the bridge refuses is refused here
-     * too. A page is contiguous in the host heap and the next page need not
+     * makes. A page is contiguous in the host heap and the next page need not
      * be, so the read stops at every page boundary and looks the next one up.
      */
     spyMemoryBytes(address: bigint, length: number): Uint8Array | null {
@@ -892,14 +1109,6 @@ export class BlinkRuntime {
     writeMemoryBytes(address: bigint, data: Uint8Array): void {
         const result = this.module.blinkenlibWriteMemoryBytes(address, data)
         if (!result.ok) throw new Error(`${result.error}: 0x${address.toString(16)}`)
-    }
-
-    getDisassemblyLines(): string[] {
-        return this.getDisassemblySnapshot().lines
-    }
-
-    getDisassemblyCurrentLine(): number {
-        return this.getDisassemblySnapshot().currentLine
     }
 
     getRegisterSnapshot(): RegisterSnapshot {
@@ -1023,7 +1232,64 @@ export class BlinkRuntime {
     }
 
     getInstructionAt(address: bigint): NativeInstruction | null {
-        return this.module.blinkenlibGetInstructionAt(address)
+        // A final instruction can end at a page boundary: read only its mapped bytes.
+        const whole = this.spyMemoryBytes(address, 15)
+        const bytes: number[] = whole ? [...whole] : []
+        for (let i = 0; !whole && i < 15; ++i) {
+            const part = this.spyMemoryBytes(address + BigInt(i), 1)
+            if (!part) break
+            bytes.push(part[0])
+        }
+        if (!bytes.length) return null
+        const instruction = this.disassembler.disassemble(Uint8Array.from(bytes), address)[0]
+        // Bytes that run into unmapped memory are no instruction: fetching the rest would fault,
+        // and a one-byte `db` would read as if the first byte alone were invalid.
+        if (!instruction || instruction.isTruncated) return null
+        return { address, size: instruction.length, code: instruction.text }
+    }
+
+    getLoadedObjects(): X86LoadedObject[] {
+        if (!this.programSources || this.state === BlinkState.ProgramLoaded) return []
+        const maps = this.module.blinkenlibGetFileMaps()
+        return maps
+            .filter((map) => map.offset === 0n)
+            .flatMap((map) => {
+                const bytes =
+                    map.path === PROGRAM ? this.programBytes : this.systemFiles.get(map.path)
+                if (!bytes) return []
+                const info = this.analyzeObject(bytes)
+                const loads = info.programHeaders.filter((header) => header.type === 1)
+                if (!loads.length) return []
+                const first =
+                    loads.reduce(
+                        (lowest, header) => (header.address < lowest ? header.address : lowest),
+                        loads[0].address
+                    ) & ~4095n
+                const base = map.address - first
+                const end = loads.reduce(
+                    (end, header) =>
+                        header.address + header.memorySize > end
+                            ? header.address + header.memorySize
+                            : end,
+                    0n
+                )
+                return [
+                    {
+                        path: map.path,
+                        soname: info.soname,
+                        base,
+                        end: base + ((end + 4095n) & ~4095n),
+                        main: map.path === PROGRAM
+                    }
+                ]
+            })
+            .sort((a, b) => (a.base < b.base ? -1 : a.base > b.base ? 1 : 0))
+    }
+
+    getLoadedObjectBytes(path: string): Uint8Array | null {
+        const bytes = path === PROGRAM ? this.programBytes : this.systemFiles.get(path)
+        // A copy: the libraries' bytes are shared by every emulator of the module.
+        return bytes ? new Uint8Array(bytes) : null
     }
 
     getLastStepInfo(): NativeStepInfo {
@@ -1117,6 +1383,8 @@ export class BlinkRuntime {
         this.clearWaitTransport()
         ++this.generation
         this.programSources = true
+        const stack = this.module.stackSave?.()
+        const exitCode = nodeExitCode()
         try {
             if (this.projectMountUsed) this.detachProjectFileSystem()
             if (
@@ -1126,28 +1394,75 @@ export class BlinkRuntime {
                 this.module.blinkenlibClearInput()
             }
             this.stopReason = null
+            this.processStart = null
             this.setState(BlinkState.ProgramRunning)
             resetFileSystem(this.module.FS, this.skeleton)
             this.projectMountUsed = this.projectMount !== null
+            for (const [path, bytes] of this.systemFiles) {
+                this.module.FS.mkdirTree(path.slice(0, path.lastIndexOf('/')))
+                this.writeExecutableSync(path, bytes)
+                this.module.FS.chmod(path, 0o755)
+            }
             if (this.programBytes) this.writeExecutableSync(PROGRAM, this.programBytes)
             this.setEmulationArgs(PROGRAM, this.defaultArgc, this.defaultArgv)
+            if (
+                !this.module.blinkenlibSetProgramArguments(this.programArgv, [
+                    ...X86_PROGRAM_ENVIRONMENT
+                ])
+            )
+                throw new Error('Arguments exceed the native process limits')
+            this.loaderOutput = []
             this.module._blinkenlib_starti()
+            this.loaderOutput = null
             this.checkHostError()
+            this.processStart = this.readProcessStart()
             this.module.FS.unlink(PROGRAM)
             if (method === '_blinkenlib_run') {
-                this.module._blinkenlib_continue()
-                this.checkHostError()
+                this.callNative(() => this.module._blinkenlib_continue())
             }
         } catch (error) {
-            const cause = this.module.blinkHostError ?? error
+            // The loader ends the process with exit(127) when it cannot load the program, after
+            // writing why to stderr.
+            const status = nativeExitStatus(error)
+            const loaderOutput = new TextDecoder().decode(Uint8Array.from(this.loaderOutput ?? []))
+            this.loaderOutput = null
+            if (status !== null) {
+                restoreNodeExitCode(exitCode)
+                if (stack !== undefined) this.module.stackRestore?.(stack)
+                this.module._blinkenlib_recover_native_exit?.()
+            }
+            const hostError = this.module.blinkHostError
             this.module.blinkHostError = undefined
+            const cause = hostError ?? error
             this.stopReason = {
                 loadFail: true,
-                exitCode: 0,
-                details: cause instanceof Error ? cause.message : String(cause),
+                exitCode: status ?? 0,
+                details:
+                    hostError === undefined && status !== null
+                        ? loaderFailure(loaderOutput, status)
+                        : cause instanceof Error
+                          ? cause.message
+                          : String(cause),
                 kind: 'load-fail'
             }
             this.setState(BlinkState.ProgramStopped)
+        }
+    }
+
+    /**
+     * The block the loader just wrote above the stack, read before the first instruction can
+     * change it; null when it does not read as one, which no start of Blink's loader gives.
+     */
+    private readProcessStart(): X86ProcessStart | null {
+        try {
+            return readProcessStart(
+                this.getSp(),
+                (address, length) =>
+                    this.spyMemoryBytes(address, length) ??
+                    this.readMemoryBytes(address, BigInt(length))
+            )
+        } catch {
+            return null
         }
     }
 
@@ -1164,8 +1479,12 @@ export class BlinkRuntime {
             throw new Error('Cannot change the x86 Project FileSystem while a program is active')
         this.detachProjectFileSystem()
         if (capability) {
-            this.projectMount = new ProjectFileSystemMount(this.module, capability, () =>
-                this.getCurrentInstructionSerial()
+            this.module.FS.mkdirTree(X86_WORKING_DIRECTORY)
+            this.projectMount = new ProjectFileSystemMount(
+                this.module,
+                capability,
+                () => this.getCurrentInstructionSerial(),
+                () => this.protectedPath
             )
         }
     }
@@ -1226,6 +1545,8 @@ export class BlinkRuntime {
             this.collectToolOutput(bytes)
             return
         }
+        if (channel === STDERR_CHANNEL && this.loaderOutput && this.loaderOutput.length < 4096)
+            this.loaderOutput.push(...bytes.subarray(0, 4096 - this.loaderOutput.length))
         const callback = channel === STDERR_CHANNEL ? this.callbacks.stderr : this.callbacks.stdout
         // A handler that throws must not unwind the wasm in the middle of a system call; it is
         // reported as an asynchronous callback's failure is.
@@ -1257,6 +1578,7 @@ export class BlinkRuntime {
                 exitCode,
                 kind: 'signal',
                 signal: info,
+                address: this.getPc(),
                 details: `Program terminated with Exit(${exitCode}) due to signal ${info.name}: ${info.description}`
             }
             // what was typed for the run is not for the next one
@@ -1272,8 +1594,7 @@ export class BlinkRuntime {
             this.scheduler(() => {
                 if (generation !== this.generation) return
                 this.resumeScheduled = false
-                this.module._blinkenlib_preempt_resume()
-                this.checkHostError()
+                this.callNative(() => this.module._blinkenlib_preempt_resume())
             })
             return
         }
@@ -1422,9 +1743,12 @@ export class BlinkRuntime {
         }
 
         this.beginLinking()
-        this.scheduler(() =>
-            this.runTool('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '')
-        )
+        // Not once a load or build has replaced the program while the link waited to start.
+        const replacement = this.programReplacements
+        this.scheduler(() => {
+            if (replacement === this.programReplacements)
+                this.runTool('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '')
+        })
     }
 
     private handleLinkerExit(code: number): void {
@@ -1487,10 +1811,6 @@ export class BlinkRuntime {
         }
     }
 
-    private getDisassemblySnapshot(): DisassemblySnapshot {
-        return this.module.blinkenlibGetDisassembly()
-    }
-
     private tryReadSourceMap(): SourceMap | null {
         if (!this.programBytes) return null
         try {
@@ -1516,6 +1836,7 @@ function withDefaultCallbacks(
         signal: callbacks.signal ?? (() => undefined),
         stateChange: callbacks.stateChange ?? (() => undefined),
         inputRequest: callbacks.inputRequest ?? (() => undefined),
+        unimplementedSyscall: callbacks.unimplementedSyscall ?? (() => undefined),
         waitRequest: callbacks.waitRequest ?? (() => undefined)
     }
 }
@@ -1587,13 +1908,62 @@ function toCompileResult(
     return { ok: false, errors, report, diagnostics }
 }
 
+/**
+ * Why Blink's loader ended the process: what it wrote to stderr, without the log prefix
+ * (`E2026-10-12T09:47:29.836000:blink/loader.c:143:42 `) its messages start with.
+ */
+function loaderFailure(output: string, status: number): string {
+    const message = output
+        .replace(/^[EI][\d-]+T[\d:.]+:[^\s:]+:\d+:\d+ /gm, '')
+        .trim()
+        .replace(/\s*\n\s*/g, '; ')
+    return `The emulator could not load the program${message ? `: ${message}` : ''} (native exit ${status})`
+}
+
+/** The status of Emscripten's `ExitStatus`, which a native `exit()` throws; null for anything else. */
+function nativeExitStatus(error: unknown): number | null {
+    if (typeof error !== 'object' || error === null) return null
+    const { name, status } = error as { name?: unknown; status?: unknown }
+    return name === 'ExitStatus' && typeof status === 'number' ? status : null
+}
+
+/** Emscripten's Node glue sets `process.exitCode` on a native `exit()`: what it was before. */
+function nodeExitCode(): typeof process.exitCode | undefined {
+    return typeof process === 'object' && process !== null ? process.exitCode : undefined
+}
+
+function restoreNodeExitCode(exitCode: typeof process.exitCode | undefined): void {
+    if (typeof process === 'object' && process !== null) process.exitCode = exitCode
+}
+
+/** The protected Executable's path, normalised; throws for one outside `/project`. */
+function normalizeProtectedPath(path: string | null): string | null {
+    if (path === null) return null
+    if (
+        typeof path !== 'string' ||
+        !path.startsWith('/project/') ||
+        path.includes('\0') ||
+        path.split('/').some((part) => part === '.' || part === '..')
+    )
+        throw new Error('The protected Executable must have an absolute /project path')
+    return '/project/' + path.slice('/project/'.length).split('/').filter(Boolean).join('/')
+}
+
+/**
+ * A copy of the caller's bytes that shares no memory with them. `Uint8Array#slice` is not enough:
+ * a Node `Buffer` is a Uint8Array whose `slice` returns a view of the same memory.
+ */
+function copyBytes(data: ArrayBuffer | Uint8Array): Uint8Array {
+    return data instanceof Uint8Array ? new Uint8Array(data) : new Uint8Array(data.slice(0))
+}
+
 /** Detaches a Project from the caller, who is free to mutate its own copy afterwards. */
 function copyX86Project(project: X86Project): X86Project {
     const copy = (files: X86Project['files']) =>
         Object.fromEntries(
             Object.entries(files).map(([path, contents]) => [
                 path,
-                contents instanceof Uint8Array ? contents.slice() : contents
+                contents instanceof Uint8Array ? new Uint8Array(contents) : contents
             ])
         )
     return {
@@ -1614,7 +1984,10 @@ function hostRandom(length: number): Uint8Array {
     return bytes
 }
 
-function duplicateUserDefinitions(units: readonly { path: string; object: Uint8Array }[], project: X86Project): X86CompilationDiagnostic[] {
+function duplicateUserDefinitions(
+    units: readonly { path: string; object: Uint8Array }[],
+    project: X86Project
+): X86CompilationDiagnostic[] {
     const definitions = new Map<string, string[]>()
     for (const unit of units) {
         if (!Object.hasOwn(project.files, unit.path)) continue
@@ -1625,7 +1998,14 @@ function duplicateUserDefinitions(units: readonly { path: string; object: Uint8A
             definitions.set(symbol.name, paths)
         }
     }
-    return [...definitions].flatMap(([name, files]) => files.length < 2 ? [] : files.map(file => ({
-        file, line: 1, severity: 'error' as const, error: `multiple definition of '${name}'`
-    })))
+    return [...definitions].flatMap(([name, files]) =>
+        files.length < 2
+            ? []
+            : files.map((file) => ({
+                  file,
+                  line: 1,
+                  severity: 'error' as const,
+                  error: `multiple definition of '${name}'`
+              }))
+    )
 }

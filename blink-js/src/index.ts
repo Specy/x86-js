@@ -10,3 +10,5 @@ export * from './resources'
 export * from './types'
 export * from './wasm-types'
 export * from './x86-emulator'
+
+export { assembleInstruction } from './wasm-assembler'

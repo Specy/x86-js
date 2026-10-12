@@ -116,29 +116,4 @@ describe('fast debugger state transfers', () => {
             emulator.dispose()
         }
     })
-
-    it('returns the same disassembly on demand as the eager legacy listing after steps and undo', async () => {
-        const emulator = await createX86Emulator()
-        try {
-            const deferred = emulator.module._blinkenlib_set_deferred_disassembly!
-            expect(deferred).toBeTypeOf('function')
-            expect((await emulator.compile(SOURCE)).ok).toBe(true)
-            emulator.initialize(16)
-            emulator.getNextInstruction()
-            for (let i = 0; i < 3; i++) {
-                deferred(true)
-                await emulator.step()
-                const lazy = emulator.module.blinkenlibGetDisassembly()
-                deferred(false)
-                expect(emulator.module.blinkenlibGetDisassembly()).toEqual(lazy)
-            }
-            deferred(true)
-            emulator.undo()
-            const afterUndo = emulator.module.blinkenlibGetDisassembly()
-            deferred(false)
-            expect(emulator.module.blinkenlibGetDisassembly()).toEqual(afterUndo)
-        } finally {
-            emulator.dispose()
-        }
-    })
 })

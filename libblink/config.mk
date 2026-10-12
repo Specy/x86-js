@@ -20,7 +20,7 @@ CXXFLAGS = -g -O2 -fwasm-exceptions
 CPPFLAGS = -isystem tool/stdatomic -DHTML -D_FILE_OFFSET_BITS=64 -D_DARWIN_C_SOURCE -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_GNU_SOURCE
 UOPFLAGS = -O2
 TARGET_ARCH =
-LDFLAGS = -O2 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sENVIRONMENT=web,node -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sEXIT_RUNTIME=0 -sEXPORT_ES6=1 -sMODULARIZE -sEXPORT_NAME="blinkenlib" -sEXPORTED_RUNTIME_METHODS=[UTF8ToString,stringToNewUTF8,AsciiToString,FS,callMain,addFunction,wasmExports] -lembind
+LDFLAGS = -O2 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sENVIRONMENT=web,node -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sEXIT_RUNTIME=0 -sEXPORT_ES6=1 -sMODULARIZE -sEXPORT_NAME="blinkenlib" -sEXPORTED_RUNTIME_METHODS=[UTF8ToString,stringToNewUTF8,AsciiToString,FS,callMain,addFunction,wasmExports,stackSave,stackRestore] -lembind
 LDLIBS =
 ZLIB = o/$(MODE)/third_party/libz/zlib.a
 

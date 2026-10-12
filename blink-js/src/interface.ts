@@ -31,8 +31,16 @@ export type MonacoError = {
 }
 
 export type StackFrame = {
+    /** The symbol the call went into, '' when no symbol covers it. */
     name: string
+    /** Where that symbol starts, or {@link target} when no symbol covers it. */
     address: bigint
+    /**
+     * Where the call went, which is not where its symbol starts when no symbol names the place
+     * it went to: a PLT stub, whose nearest symbol is `_init`, or a stripped function.
+     */
+    target: bigint
+    /** The return address: the instruction after the call, in the caller. */
     destination: bigint
     sp: bigint
     line: number

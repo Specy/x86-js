@@ -76,14 +76,6 @@ void (*signal_callback)(int, int) = 0;
 void (*exit_callback)(int) = 0;
 
 /*
- * this buffer holds the disassembly strings
- * that will be passed to js
- */
-#define DIS_MAX_LINES    200
-#define DIS_MAX_LINE_LEN 200
-char dis_buffer[DIS_MAX_LINES][DIS_MAX_LINE_LEN] = {0};
-
-/*
  * These buffers hold the program execution arguments.
  * The pointers to these strings will be passed to js,
  * and the content will be dynamically set by js
@@ -94,6 +86,41 @@ char dis_buffer[DIS_MAX_LINES][DIS_MAX_LINE_LEN] = {0};
 char argc_string[ARGC_MAX_LINE_LEN] = {0};
 char argv_string[ARGV_MAX_LINE_LEN] = {0};
 char progname_string[PROGNAME_MAX_LINE_LEN] = {0};
+static bool process_arguments_set;
+static char process_args_bytes[128 * 1024];
+static char process_env_bytes[4096];
+static char *process_args[1026];
+static char *process_env[65];
+
+static bool UnpackArguments(char *dest, u32 capacity, char **words,
+                             u32 maxwords, const char *bytes, u32 length) {
+  // No words at all, such as an empty environment, is a list too.
+  if (!length) {
+    words[0] = 0;
+    return true;
+  }
+  if (length > capacity || bytes[length - 1]) return false;
+  memcpy(dest, bytes, length);
+  u32 count = 0;
+  for (u32 i = 0; i < length;) {
+    if (count >= maxwords) return false;
+    words[count++] = dest + i;
+    while (dest[i++]) {}
+  }
+  words[count] = 0;
+  return true;
+}
+
+bool blinkenlib_set_process_arguments(const char *args, u32 argslen,
+                                       const char *env, u32 envlen) {
+  process_arguments_set = false;
+  if (!UnpackArguments(process_args_bytes, sizeof(process_args_bytes),
+                         process_args, 1025, args, argslen)) return false;
+  if (!UnpackArguments(process_env_bytes, sizeof(process_env_bytes),
+                         process_env, 64, env, envlen)) return false;
+  process_arguments_set = true;
+  return true;
+}
 
 struct clstruct cls;
 struct System *s;
@@ -103,7 +130,6 @@ struct Machine *m;
 static struct Dis dis[1];
 bool single_stepping = false;
 bool debugger_enabled = false;
-static u32 dis_current_line = 0;
 static struct Breakpoints run_breakpoints;
 #define RUN_BREAKPOINT_MAX 1024
 static u64 pending_run_breakpoints[RUN_BREAKPOINT_MAX];
@@ -115,9 +141,6 @@ static u64 last_stop_address = 0;
 static bool skip_current_breakpoint = false;
 static u64 skip_breakpoint_address = 0;
 static bool step_recording_enabled = false;
-/* Modern consumers request disassembly through refresh_disassembly(). The
- * legacy clstruct interface keeps its eager listing unless it opts in. */
-static bool deferred_disassembly = false;
 static bool active_step = false;
 /* Independent of history capacity, Undo and Pokes. Identities never reset. */
 static u64 instructions_executed, identity_allocator, active_identity;
@@ -143,6 +166,24 @@ void blinkenlib_abandon_execution(void) {
   DebugHistoryCancel();
   active_identity = 0;
   active_step = false;
+}
+/* A native exit() inside an instruction (Blink giving up on a condition it
+ * cannot recover from) unwinds to JavaScript past everything the instruction
+ * would have released. Release it as runLoop() does after a halt, and end
+ * the program, so that the runtime can report the stop and start afresh. */
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_recover_native_exit(void) {
+  if (m) {
+    m->sysdepth = 0;
+    m->sigdepth = 0;
+    m->canhalt = false;
+    m->nofault = false;
+    m->insyscall = false;
+    CollectPageLocks(m);
+    CollectGarbage(m, 0);
+    m->system->exited = true;
+  }
+  blinkenlib_abandon_execution();
 }
 static bool native_slice = false;
 static u64 active_pc_before = 0;
@@ -185,63 +226,11 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
  * Returns true if 𝑣 is a shadow memory virtual address.
  */
 static bool IsShadow(i64 v) {
-  return 0x7fff8000 <= v && v < 0x100080000000;
+  // ASan's shadow range protects host addresses only with a linear mapping.
+  // The wasm Core always uses guest page tables, including for addresses here.
+  return HasLinearMapping() && 0x7fff8000 <= v && v < 0x100080000000;
 }
 
-/**
- * disassemble n lines of code, starting from the current ip.
- * the disassembled lines will be stored in the dis struct.
- */
-static i64 Disassemble(void) {
-  i64 lines = DIS_MAX_LINES;
-  if (Dis(dis, m, GetPc(m), m->ip, lines) != -1) {
-    return DisFind(dis, GetPc(m));
-  } else {
-    return -1;
-  }
-}
-
-/**
- * get the index in the dis struct at which
- * the current instruction is stored.
- * if it's not there, the dis struct is repopulated
- * by a new run of the disassembler
- */
-static i64 GetDisIndex(void) {
-  i64 i;
-  if ((i = DisFind(dis, GetPc(m) - m->oplen)) != -1 ||
-      (i = Disassemble()) != -1) {
-    while (i + 1 < dis->ops.i) {
-      if (!dis->ops.p[i].size) {
-        ++i;
-      } else {
-        break;
-      }
-    }
-  }
-  return i;
-}
-
-/**
- * Populate a buffer with the ascii disassembly listing updated to
- * the current ip.
- * The buffer is designed to be read from js, and parsed into html.
- */
-u64 updateDisassembler() {
-  i64 lineIndex = GetDisIndex();
-  if (lineIndex < 0) lineIndex = 0;
-  for (int i = 0; i < dis->ops.i && i < DIS_MAX_LINES; i++) {
-    const char *curr = DisGetLine(dis, m, i);
-    int len = strlen(curr) + 1;
-    if (len > DIS_MAX_LINE_LEN) {
-      len = DIS_MAX_LINE_LEN;
-    }
-    memcpy(dis_buffer[i], curr, len);
-    dis_buffer[i][len - 1] = 0;
-  }
-  dis_current_line = lineIndex;
-  return dis_current_line;
-}
 
 static u8 *GetRegisterPointer(int register_id) {
   if (!m) return 0;
@@ -448,15 +437,12 @@ void update_clstruct(struct Machine *m) {
   cls.rcx = (u32)&m->cx;
   cls.rdx = (u32)&m->dx;
 
-  // disassembled code buffer
-  // TODO: all this data should be in a global
-  // disassembler struct, this function should
-  // only copy pointers.
-  cls.dis__max_lines = DIS_MAX_LINES;
-  cls.dis__max_line_len = DIS_MAX_LINE_LEN;
-  cls.dis__current_line = deferred_disassembly ? dis_current_line
-                                            : updateDisassembler();
-  cls.dis__buffer = (u32)&dis_buffer;
+  // Instruction text comes from the package's own decoder, so the legacy
+  // disassembly listing these fields described is empty.
+  cls.dis__max_lines = 0;
+  cls.dis__max_line_len = 0;
+  cls.dis__current_line = 0;
+  cls.dis__buffer = 0;
 
   // TODO: other useful data
   //  printf("page tables:\n%s\n", FormatPml4t(m));
@@ -625,7 +611,6 @@ void PostLoadSetup() {
     m->system->dis = dis;
     m->system->onsymbols = OnSymbols;
     LoadDebugSymbols(m->system);
-    Disassemble();
   }
 }
 
@@ -642,7 +627,6 @@ void TearDown(void) {
   FreeMachine(m);
   m = g_machine = 0;
   s = 0;
-  memset(dis_buffer, 0, sizeof(dis_buffer));
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -686,14 +670,16 @@ void setupProgram(bool withdebugger) {
 
   // get **argv
   // TODO
-  char *vars = 0;
+  char *emptyvars[] = {0};
+  char **vars = process_arguments_set ? process_env : emptyvars;
 
   // close previous instances
   TearDown();
   SetUp();
   OpenTerminalHostFds();
   char *bios = 0;
-  LoadProgram(m, progname_string, progname_string, args, &vars, bios);
+  LoadProgram(m, progname_string, progname_string,
+               process_arguments_set ? process_args : args, vars, bios);
   instructions_executed = 0;
   PostLoadSetup();
   m->recordwrites = withdebugger && step_recording_enabled;
@@ -1102,25 +1088,6 @@ bool blinkenlib_get_last_step_memory_write(u32 index, u64 *address, u32 *size,
   return true;
 }
 
-bool blinkenlib_get_instruction_at(u64 virtual_address, u64 *address, u8 *size,
-                                   char *buffer, u32 buffer_size) {
-  struct Dis one = {true};
-  const char *line;
-  if (buffer && buffer_size) buffer[0] = 0;
-  if (!m || !address || !size || !buffer || !buffer_size) return false;
-  if (Dis(&one, m, virtual_address, virtual_address - m->cs.base, 1) == -1 ||
-      one.ops.i <= 0) {
-    DisFree(&one);
-    return false;
-  }
-  *address = one.ops.p[0].addr;
-  *size = one.ops.p[0].size;
-  line = DisGetLine(&one, m, 0);
-  snprintf(buffer, buffer_size, "%s", line ? line : "");
-  DisFree(&one);
-  return true;
-}
-
 bool blinkenlib_resolve_symbol(u64 virtual_address, u64 *symbol_address,
                                char *buffer, u32 buffer_size) {
   long symbol;
@@ -1135,35 +1102,10 @@ bool blinkenlib_resolve_symbol(u64 virtual_address, u64 *symbol_address,
   return true;
 }
 
-EMSCRIPTEN_KEEPALIVE
-void blinkenlib_set_deferred_disassembly(bool enabled) {
-  deferred_disassembly = enabled;
-}
-
-u32 blinkenlib_refresh_disassembly() {
-  if (!m || !debugger_enabled) return 0;
-  cls.dis__current_line = updateDisassembler();
-  return cls.dis__current_line;
-}
-
-u32 blinkenlib_get_disassembly_current_line() {
-  return dis_current_line;
-}
-
-u32 blinkenlib_get_disassembly_line_count() {
-  if (!m || !debugger_enabled) return 0;
-  if (dis->ops.i < 0) return 0;
-  if (dis->ops.i > DIS_MAX_LINES) return DIS_MAX_LINES;
-  return dis->ops.i;
-}
-
-const char *blinkenlib_get_disassembly_line(u32 index) {
-  if (index >= DIS_MAX_LINES) return "";
-  return dis_buffer[index];
-}
 
 void blinkenlib_set_program_args(const char *progname, const char *argc,
                                  const char *argv) {
+  process_arguments_set = false;
   CopySafeAscii(progname_string, PROGNAME_MAX_LINE_LEN, progname);
   CopySafeAscii(argc_string, ARGC_MAX_LINE_LEN, argc);
   CopySafeAscii(argv_string, ARGV_MAX_LINE_LEN, argv);
@@ -1243,4 +1185,17 @@ int main(int argc, char *argv[]) {
   cls.version = CLSTRUCT_VERSION;
   // overlays setup goes here
   // vfs setup goes here
+}
+
+bool blinkenlib_get_file_map(u32 index, const char **path, u64 *address, u64 *size, u64 *offset) {
+  if (!s) return false;
+  u32 current = 0;
+  for (struct Dll *e = dll_first(s->filemaps); e; e = dll_next(s->filemaps, e)) {
+    struct FileMap *fm = FILEMAP_CONTAINER(e);
+    if (fm->offset < 0 || !fm->pages) continue;
+    if (current++ != index) continue;
+    *path = fm->path; *address = fm->virt; *size = fm->size; *offset = fm->offset;
+    return true;
+  }
+  return false;
 }

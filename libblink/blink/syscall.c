@@ -94,6 +94,15 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+// A listener that throws must not unwind through OpSyscall, which would leave
+// the syscall half done: the error is rethrown on its own task instead.
+EM_JS(void, NotifyUnimplementedSyscall, (int number), {
+  try {
+    if (Module.onUnimplementedSyscall) Module.onUnimplementedSyscall(number);
+  } catch (error) {
+    setTimeout(() => { throw error; }, 0);
+  }
+});
 #endif
 
 #ifdef __HAIKU__
@@ -779,6 +788,40 @@ static int SysFutexWait(struct Machine *m,  //
   return rc;
 }
 
+#ifdef __EMSCRIPTEN__
+// The browser build runs one thread: nothing else can change a futex word or
+// wake its waiter. A wait whose word matches therefore ends only by timing
+// out, which it does through the same guest wait as nanosleep(), so that the
+// host sees a wait request and a Testcase's virtual clock advances to the
+// deadline. Without a timeout nothing could ever end it, so it returns at
+// once, as a spurious wakeup would. FUTEX_WAIT's timeout is relative and
+// measured on CLOCK_MONOTONIC; FUTEX_WAIT_BITSET's is an absolute time on
+// CLOCK_MONOTONIC, or on CLOCK_REALTIME with FUTEX_CLOCK_REALTIME.
+static int SysFutexWaitAlone(struct Machine *m, i64 uaddr, u32 expect,
+                             i64 timeout_addr, bool absolute, int clock,
+                             u32 bitset) {
+  u8 *mem;
+  struct timespec now, timeout, deadline;
+  // Linux reads and checks the timeout first, then the operation's operands.
+  if (timeout_addr && LoadTimespecR(m, timeout_addr, &timeout) == -1) {
+    return -1;
+  }
+  if (!bitset || (uaddr & 3)) return einval();
+  if (!(mem = LookupAddress(m, uaddr))) return -1;
+  if (Load32(mem) != expect) return eagain();
+  if (!timeout_addr) return 0;
+  HostNow(clock, &now);
+  deadline = GuestWaitDeadline(absolute ? timeout : AddTime(now, timeout));
+  if (CompareTime(now, deadline) >= 0) {
+    errno = ETIMEDOUT;
+    return -1;
+  }
+  if (GuestWaitInterrupted(m)) return eintr();
+  GuestWaitClock(clock);
+  GuestWaitHalt(m, deadline, false);
+}
+#endif
+
 static int SysFutex(struct Machine *m,  //
                     i64 uaddr,          //
                     i32 op,             //
@@ -786,6 +829,27 @@ static int SysFutex(struct Machine *m,  //
                     i64 timeout_addr,   //
                     i64 uaddr2,         //
                     u32 val3) {
+#ifdef __EMSCRIPTEN__
+  int cmd = op & ~(FUTEX_PRIVATE_FLAG_LINUX | FUTEX_CLOCK_REALTIME_LINUX);
+  bool realtime = !!(op & FUTEX_CLOCK_REALTIME_LINUX);
+  // Linux takes FUTEX_CLOCK_REALTIME only on the absolute waits.
+  if (realtime && cmd != FUTEX_WAIT_BITSET_LINUX) return enosys();
+  switch (cmd) {
+    case FUTEX_WAIT_LINUX:
+      return SysFutexWaitAlone(m, uaddr, val, timeout_addr, false,
+                               CLOCK_MONOTONIC, -1);
+    case FUTEX_WAIT_BITSET_LINUX:
+      return SysFutexWaitAlone(m, uaddr, val, timeout_addr, true,
+                               realtime ? CLOCK_REALTIME : CLOCK_MONOTONIC,
+                               val3);
+    case FUTEX_WAKE_LINUX:
+      if (uaddr & 3) return einval();
+      return SysFutexWake(m, uaddr, val);
+    default:
+      LOGF("unsupported %s op %#x", "futex", op);
+      return einval();
+  }
+#endif
   if (uaddr & 3) return efault();
   op &= ~FUTEX_PRIVATE_FLAG_LINUX;
   switch (op) {
@@ -895,10 +959,11 @@ void UnlockRobustFutexes(struct Machine *m) {
 static i32 ReturnRobustList(struct Machine *m, i64 head_ptr_addr,
                             i64 len_ptr_addr) {
   u8 buf[8];
-  Write64(buf, m->robust_list);
-  CopyToUserWrite(m, head_ptr_addr, buf, sizeof(buf));
+  // Linux writes the length first, and either write can fail with EFAULT.
   Write64(buf, sizeof(struct robust_list_linux));
-  CopyToUserWrite(m, len_ptr_addr, buf, sizeof(buf));
+  if (CopyToUserWrite(m, len_ptr_addr, buf, sizeof(buf)) == -1) return -1;
+  Write64(buf, m->robust_list);
+  if (CopyToUserWrite(m, head_ptr_addr, buf, sizeof(buf)) == -1) return -1;
   return 0;
 }
 
@@ -927,11 +992,68 @@ static i32 SysGetRobustList(struct Machine *m, int pid, i64 head_ptr_addr,
 }
 
 static i32 SysSetRobustList(struct Machine *m, i64 head_addr, u64 len) {
+  // Linux only records the pointer; the list is read when the thread exits.
   if (len != sizeof(struct robust_list_linux)) return einval();
-  if (!IsValidMemory(m, head_addr, len, PROT_READ | PROT_WRITE)) return -1;
   m->robust_list = head_addr;
   return 0;
 }
+
+#ifdef __EMSCRIPTEN__
+static i32 SysRseq(struct Machine *m, u64 area, u32 len, u32 flags, u32 sig) {
+  u8 cpu[4] = {0};
+  if (flags & ~1u) return einval();
+  if (flags == 1) {
+    if (!m->rseq_area || area != m->rseq_area || len != m->rseq_size) {
+      return einval();
+    }
+    if (sig != m->rseq_signature) return eperm();
+    // As Linux's rseq_reset_rseq_cpu_node_id(): cpu_id_start, node_id and
+    // mm_cid become 0 and cpu_id RSEQ_CPU_ID_UNINITIALIZED.
+    if (CopyToUserWrite(m, area, cpu, 4) == -1 ||
+        CopyToUserWrite(m, area + 20, cpu, 4) == -1 ||
+        CopyToUserWrite(m, area + 24, cpu, 4) == -1) {
+      return -1;
+    }
+    Write32(cpu, -1);
+    if (CopyToUserWrite(m, area + 4, cpu, 4) == -1) return -1;
+    m->rseq_area = 0;
+    m->rseq_size = 0;
+    m->rseq_signature = 0;
+    return 0;
+  }
+  if (len < 32 || (area & 31)) return einval();
+  if (m->rseq_area) {
+    if (area != m->rseq_area || len != m->rseq_size) return einval();
+    if (sig != m->rseq_signature) return eperm();
+    errno = EBUSY;
+    return -1;
+  }
+  if (!IsValidMemory(m, area, len, PROT_READ | PROT_WRITE)) return -1;
+  if (CopyToUserWrite(m, area, cpu, 4) == -1 ||
+      CopyToUserWrite(m, area + 4, cpu, 4) == -1) return -1;
+  if (len >= 24 && CopyToUserWrite(m, area + 20, cpu, 4) == -1) return -1;
+  if (len >= 28 && CopyToUserWrite(m, area + 24, cpu, 4) == -1) return -1;
+  m->rseq_area = area;
+  m->rseq_size = len;
+  m->rseq_signature = sig;
+  return 0;
+}
+
+#define PTRACE_ATTACH_LINUX 16
+#define PTRACE_SEIZE_LINUX  0x4206
+static i32 SysPtrace(struct Machine *m, u64 request, u64 pid, u64 addr, u64 data) {
+  if (request == PTRACE_ATTACH_LINUX || request == PTRACE_SEIZE_LINUX) {
+    // Linux refuses to attach a process to itself, or to one of its threads;
+    // there is no other process to attach to.
+    if ((i32)pid == m->tid || (i32)pid == m->system->pid) return eperm();
+    return esrch();
+  }
+  if (request) return esrch();
+  if (m->ptrace_traceme) return eperm();
+  m->ptrace_traceme = true;
+  return 0;
+}
+#endif
 
 // This process is the only one there is, so any other pid names nobody.
 static int ValidateAffinityPid(struct Machine *m, int pid) {
@@ -1269,12 +1391,28 @@ EM_JS(bool, IsProjectDescriptor, (int fd), {
 });
 #endif
 
+// Linux's vm.mmap_min_addr default: no mapping goes below it.
+#define kMmapMinAddr 0x10000
+
 static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
                        int flags, int fildes, i64 offset) {
   u64 key;
   int oflags;
   bool fixedmap;
   i64 newautomap;
+#ifdef __EMSCRIPTEN__
+  // Without MAP_FIXED an address is only a hint, which Linux rounds down to a
+  // page and raises to mmap_min_addr (round_hint_to_min()); a hint whose
+  // range does not fit the address space is ignored.
+  if (!(flags & (MAP_FIXED_LINUX | MAP_FIXED_NOREPLACE_LINUX)) && virt) {
+    virt &= -4096;
+    if ((u64)virt < kMmapMinAddr) virt = kMmapMinAddr;
+    if (!IsValidAddrSize(virt, size) || (u64)virt >= 0x7ffffffff000 ||
+        (u64)size > 0x7ffffffff000 - (u64)virt) {
+      virt = 0;
+    }
+  }
+#endif
   if (!IsValidAddrSize(virt, size)) return einval();
   if (flags & MAP_GROWSDOWN_LINUX) return enotsup();
   if ((key = Prot2Page(prot)) == (u64)-1) return einval();
@@ -1311,9 +1449,13 @@ static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
       return -1;
     }
 #ifdef __EMSCRIPTEN__
-    // The session has no mapping lifetime or msync contract. Refuse before MAP_FIXED can
-    // remove any existing map, rather than letting libc's failed mmap panic in ReserveVirtual.
-    if (IsProjectDescriptor(fildes)) return enodev();
+    // A shared mapping of a Project File would need a mapping lifetime and an
+    // msync contract the session does not have, so it is refused before
+    // MAP_FIXED can remove any existing map. A private one is a copy, read
+    // through the Project FileSystem as any read of the File is.
+    if ((flags & MAP_SHARED_LINUX) && IsProjectDescriptor(fildes)) {
+      return enodev();
+    }
 #endif
   }
   newautomap = -1;
@@ -1339,7 +1481,12 @@ static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
     goto CreateTheMap;
   }
   if ((!virt || !IsFullyUnmapped(m->system, virt, size))) {
-    if ((virt = FindVirtual(m->system, m->system->automap, size)) == -1) {
+#ifdef __EMSCRIPTEN__
+    virt = FindVirtualTopDown(m->system, FLAG_automapend, size);
+#else
+    virt = FindVirtual(m->system, m->system->automap, size);
+#endif
+    if (virt == -1) {
       goto Finished;
     }
     newautomap = ROUNDUP(virt + size, FLAG_pagesize);
@@ -1353,6 +1500,9 @@ CreateTheMap:
   if (virt != -1 && newautomap != -1) {
     m->system->automap = newautomap;
   }
+#ifdef __EMSCRIPTEN__
+  if (newautomap != -1) CommitVirtualTopDown(m->system, virt);
+#endif
 Finished:
   return virt;
 }
@@ -6377,7 +6527,8 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
     case 0x010: /* ioctl: only mutating terminal/descriptor operations */
       switch (arg2) {
         case TIOCSWINSZ_LINUX: case TCSETS_LINUX: case TCSETSW_LINUX:
-        case TCSETSF_LINUX: case TIOCSPGRP_LINUX: case FIONBIO_LINUX:
+        case TCSETSF_LINUX: case TCSETS2_LINUX: case TCSETSW2_LINUX:
+        case TCSETSF2_LINUX: case TIOCSPGRP_LINUX: case FIONBIO_LINUX:
         case FIOCLEX_LINUX: case FIONCLEX_LINUX:
           DebugHistoryMarkIrreversible();
       }
@@ -6453,6 +6604,8 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
     case 0x109: /* linkat */
     case 0x10A: /* symlinkat */
     case 0x10C: /* fchmodat */
+    case 0x065: /* ptrace */
+    case 0x14E: /* rseq */
     case 0x111: /* set_robust_list */
     case 0x118: /* utimensat */
     case 0x124: /* dup3 */
@@ -6669,8 +6822,12 @@ void OpSyscall(P) {
     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
     SYSCALL(2, 0x0C8, "tkill", SysTkill, STRACE_TKILL);
     SYSCALL(3, 0x0EA, "tgkill", SysTgkill, STRACE_3);
+    SYSCALL(2, 0x111, "set_robust_list", SysSetRobustList, STRACE_2);
+    SYSCALL(3, 0x112, "get_robust_list", SysGetRobustList, STRACE_3);
+    SYSCALL(4, 0x14E, "rseq", SysRseq, STRACE_4);
+    SYSCALL(4, 0x065, "ptrace", SysPtrace, STRACE_4);
 #endif
-#ifdef HAVE_THREADS
+#if defined(HAVE_THREADS) || defined(__EMSCRIPTEN__)
     SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
 #endif
 #ifdef __EMSCRIPTEN__
@@ -6773,6 +6930,9 @@ void OpSyscall(P) {
       break;
     default:
     DefaultCase:
+#ifdef __EMSCRIPTEN__
+      NotifyUnimplementedSyscall(call);
+#endif
       LOGF("missing syscall 0x%03" PRIx64, ax);
       ax = enosys();
       break;

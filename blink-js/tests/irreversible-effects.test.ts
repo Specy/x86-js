@@ -52,7 +52,10 @@ describe('unjournaled effect boundaries', () => {
             1
         ],
         ['thread clear-tid pointer', ['sys 218,buf'], 1],
-        ['terminal flags', ['sys 16,0,0x5401,buf', 'sys 16,0,0x5402,buf'], 2]
+        ['terminal flags', ['sys 16,0,0x5401,buf', 'sys 16,0,0x5402,buf'], 2],
+        ['termios2 terminal flags', ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542b,buf'], 2],
+        ['termios2 drained flags', ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542c,buf'], 2],
+        ['termios2 flushed flags', ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542d,buf'], 2]
     ] as const)(
         'retains %s as a barrier, with reversible CPU steps and Pokes above it',
         async (_name, body, count) => {

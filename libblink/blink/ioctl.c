@@ -94,6 +94,54 @@ static int IoctlTcsets(struct Machine *m, int fd, int request, i64 addr,
   return fn(fd, request, &tio);
 }
 
+// The bits per second a CBAUD code in c_cflag stands for, or 0 for BOTHER
+// and codes Linux does not define.
+static u32 LinuxBaudRate(u32 code) {
+  static const u32 kRates[] = {0,    50,   75,   110,  134,   150,
+                               200,  300,  600,  1200, 1800,  2400,
+                               4800, 9600, 19200, 38400};
+  static const u32 kExtendedRates[] = {
+      0,       57600,   115200,  230400,  460800,  500000,
+      576000,  921600,  1000000, 1152000, 1500000, 2000000,
+      2500000, 3000000, 3500000, 4000000};
+  code &= CBAUD_LINUX;
+  if (code & CBAUDEX_LINUX) return kExtendedRates[code & ~CBAUDEX_LINUX];
+  return kRates[code];
+}
+
+// TCGETS2, which glibc 2.42 and later use for tcgetattr() and isatty(): the
+// termios TCGETS gives, then its speeds in bits per second, the input speed
+// being the output speed unless c_cflag's CIBAUD names one of its own.
+static int IoctlTcgets2(struct Machine *m, int fd, i64 addr,
+                        int fn(int, struct termios *)) {
+  int rc;
+  u32 cflag, ospeed;
+  struct termios tio;
+  struct termios2_linux gtio;
+  if ((rc = fn(fd, &tio)) != -1) {
+    memset(&gtio, 0, sizeof(gtio));
+    XlatTermiosToLinux(&gtio.termios, &tio);
+    cflag = Read32(gtio.termios.cflag);
+    ospeed = LinuxBaudRate(cflag);
+    Write32(gtio.ospeed, ospeed);
+    Write32(gtio.ispeed, cflag & CIBAUD_LINUX ? LinuxBaudRate(cflag >> 16)
+                                              : ospeed);
+    if (CopyToUserWrite(m, addr, &gtio, sizeof(gtio)) == -1) rc = -1;
+  }
+  return rc;
+}
+
+// TCSETS2 and the like: the termios as TCSETS takes it. The speeds in bits
+// per second are not translated, as nothing here has a speed of its own.
+static int IoctlTcsets2(struct Machine *m, int fd, int request, i64 addr,
+                        int fn(int, int, const struct termios *)) {
+  struct termios tio;
+  struct termios2_linux gtio;
+  if (CopyFromUserRead(m, &gtio, addr, sizeof(gtio)) == -1) return -1;
+  XlatLinuxToTermios(&tio, &gtio.termios);
+  return fn(fd, request, &tio);
+}
+
 static int IoctlTiocgpgrp(struct Machine *m, int fd, i64 addr) {
   int rc;
   u8 *pgrp;
@@ -402,6 +450,10 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       case TCSETS_LINUX:
       case TCSETSW_LINUX:
       case TCSETSF_LINUX:
+      case TCGETS2_LINUX:
+      case TCSETS2_LINUX:
+      case TCSETSW2_LINUX:
+      case TCSETSF2_LINUX:
         break;  // through its callbacks, below
 #ifndef DISABLE_NONPOSIX
       case FIONBIO_LINUX:
@@ -426,6 +478,14 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       return IoctlTcsets(m, fildes, TCSADRAIN, addr, tcsetattr_impl);
     case TCSETSF_LINUX:
       return IoctlTcsets(m, fildes, TCSAFLUSH, addr, tcsetattr_impl);
+    case TCGETS2_LINUX:
+      return IoctlTcgets2(m, fildes, addr, tcgetattr_impl);
+    case TCSETS2_LINUX:
+      return IoctlTcsets2(m, fildes, TCSANOW, addr, tcsetattr_impl);
+    case TCSETSW2_LINUX:
+      return IoctlTcsets2(m, fildes, TCSADRAIN, addr, tcsetattr_impl);
+    case TCSETSF2_LINUX:
+      return IoctlTcsets2(m, fildes, TCSAFLUSH, addr, tcsetattr_impl);
     case TIOCGPGRP_LINUX:
       return IoctlTiocgpgrp(m, fildes, addr);
     case TIOCSPGRP_LINUX:
