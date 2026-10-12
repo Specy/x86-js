@@ -19,7 +19,8 @@ import {
     validateProgramArguments,
     X86_PROGRAM_ENVIRONMENT
 } from './linux-runtime'
-import type { X86ExecutableInfo, X86ExecutableOptions } from './types'
+import type { X86ExecutableInfo, X86ExecutableOptions, X86ProcessStart } from './types'
+import { readProcessStart } from './process-start'
 import { parseSourceMap, type SourceMap } from './source-map'
 import {
     stageX86Project,
@@ -202,6 +203,8 @@ export class BlinkRuntime {
     private readonly defaultArgc = '/program'
     private readonly defaultArgv = ''
     private programArgv = ['/program']
+    /** The block the loader wrote above the stack at the last start; see `getProcessStart`. */
+    private processStart: X86ProcessStart | null = null
     private systemFiles = new Map<string, Uint8Array>()
     private readonly elfAnalyses = new WeakMap<Uint8Array, ReturnType<typeof analyze>>()
     private protectedPath: string | null = null
@@ -374,6 +377,7 @@ export class BlinkRuntime {
         resetFileSystem(this.module.FS, this.skeleton)
         this.module.blinkenlibClearInput()
         this.programBytes = null
+        this.processStart = null
         this.stopReason = null
         this.assemblerLogs = ''
         this.assemblerErrors = []
@@ -469,6 +473,15 @@ export class BlinkRuntime {
     }
     getStackTop(): bigint {
         return this.module._blinkenlib_get_stack_top()
+    }
+    /**
+     * What the loader wrote above the initial stack pointer at the program's last start: `argc`,
+     * `argv[]`, `envp[]`, the auxiliary vector and their strings, read back once, before the first
+     * instruction. Kept after the program ends, until the next start; null before the first start
+     * of a program, after a build, a load or `clearExecution()`, and when the loader failed.
+     */
+    getProcessStart(): X86ProcessStart | null {
+        return this.processStart
     }
 
     /**
@@ -779,6 +792,7 @@ export class BlinkRuntime {
         this.module._blinkenlib_abandon_execution()
         if (this.state === BlinkState.NotReady) throw new Error('Blink runtime is not ready')
         this.programBytes = copyBytes(data)
+        this.processStart = null
         this.module.blinkenlibClearInput()
         this.stopReason = null
         this.sourceMap = null
@@ -1007,6 +1021,7 @@ export class BlinkRuntime {
         this.module.blinkHostError = undefined
         this.programSources = false
         this.programBytes = null
+        this.processStart = null
         this.sourceMap = null
         this.sourceProject = null
         this.stopReason = null
@@ -1379,6 +1394,7 @@ export class BlinkRuntime {
                 this.module.blinkenlibClearInput()
             }
             this.stopReason = null
+            this.processStart = null
             this.setState(BlinkState.ProgramRunning)
             resetFileSystem(this.module.FS, this.skeleton)
             this.projectMountUsed = this.projectMount !== null
@@ -1399,6 +1415,7 @@ export class BlinkRuntime {
             this.module._blinkenlib_starti()
             this.loaderOutput = null
             this.checkHostError()
+            this.processStart = this.readProcessStart()
             this.module.FS.unlink(PROGRAM)
             if (method === '_blinkenlib_run') {
                 this.callNative(() => this.module._blinkenlib_continue())
@@ -1429,6 +1446,23 @@ export class BlinkRuntime {
                 kind: 'load-fail'
             }
             this.setState(BlinkState.ProgramStopped)
+        }
+    }
+
+    /**
+     * The block the loader just wrote above the stack, read before the first instruction can
+     * change it; null when it does not read as one, which no start of Blink's loader gives.
+     */
+    private readProcessStart(): X86ProcessStart | null {
+        try {
+            return readProcessStart(
+                this.getSp(),
+                (address, length) =>
+                    this.spyMemoryBytes(address, length) ??
+                    this.readMemoryBytes(address, BigInt(length))
+            )
+        } catch {
+            return null
         }
     }
 

@@ -25,7 +25,8 @@ import {
     type X86RegisterName,
     type X86Project,
     type X86ExecutableInfo,
-    type X86ExecutableOptions
+    type X86ExecutableOptions,
+    type X86ProcessStart
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
@@ -239,6 +240,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     }
     getStackTop(): bigint {
         return this.runtime.getStackTop()
+    }
+    /**
+     * What the loader wrote above the initial stack pointer at the program's last start: `argc`,
+     * `argv[]`, `envp[]`, the auxiliary vector and the strings they point at, as it wrote them.
+     * Null before the program's first start, after a build or a load, and when the loader failed.
+     */
+    getProcessStart(): X86ProcessStart | null {
+        return this.runtime.getProcessStart()
     }
 
     async loadExecutable(

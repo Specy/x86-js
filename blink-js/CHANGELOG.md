@@ -31,6 +31,9 @@ Debugger reads and Undo work throughout the guest address space.
   load throws the same way, leaving the later program loaded. A load or build
   its own checks refuse supersedes nothing.
 - Pass lossless UTF-8 Arguments and the fixed Linux environment.
+- `getProcessStart()` reports the block the loader wrote above the initial
+  stack pointer at the last start: argc, the argv, envp and auxiliary
+  vectors, and each string's address and length.
 - Protect a mounted running Executable from writes/truncation with ETXTBSY
   and from unlink/rename with EBUSY.
 - Support set_robust_list, get_robust_list (EFAULT for an unwritable

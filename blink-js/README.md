@@ -602,6 +602,29 @@ and 128 KiB including argv0 and terminators. A start supplies PATH, HOME, PWD,
 LANG, TERM, SHELL, USER and LOGNAME with fixed Linux values. AT_EXECFN continues
 to name the actual executable path. Arguments apply at the next start.
 
+`getProcessStart()` says where the loader put them, for a debugger to name the
+bytes above the initial stack pointer. Each start reads the block back once,
+before the first instruction, and keeps it until the next start, after the
+program ends too; it is `null` before a program's first start, after a build, a
+load or `clearExecution()`, and when the loader failed. Addresses are `bigint`;
+each string's `length` counts its NUL.
+
+```ts
+emulator.setProgramArguments('./main', ['hello'])
+emulator.initialize(0)
+emulator.getNextInstruction() // starts the program
+const start = emulator.getProcessStart()!
+// start.start: the initial rsp, where argc is; start.end: the top of the stack
+// start.argv, start.envp, start.auxv (to start.auxvEnd): the vectors, in that order
+// start.arguments[i], start.environment[i]: { address, length } of each string
+// start.execfn, start.random: what AT_EXECFN and AT_RANDOM point at
+// start.path: the program's path the loader writes first, at the very top
+```
+
+The strings follow the vectors, past at most 15 bytes of alignment padding, in
+this order: the arguments, the environment, AT_EXECFN's path, the 16 AT_RANDOM
+bytes and the path at the top.
+
 With a mounted Project FileSystem, `setProtectedPath('/project/crackme')`
 protects the executable from writes and truncation (`ETXTBSY`). Reads remain
 available. Unlinking or renaming it, including replacing its name, returns

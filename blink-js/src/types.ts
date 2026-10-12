@@ -221,6 +221,45 @@ export type X86ExecutableInfo = {
     needed: string[]
     missing: string[]
 }
+/** Bytes of the process-start block: where they start and how many, a string's NUL included. */
+export type X86ProcessStartBytes = { address: bigint; length: number }
+
+/**
+ * What a Linux process starts with, as the loader wrote it above the initial stack pointer at the
+ * program's last start (`getProcessStart()`): `argc`, the `argv[]`, `envp[]` and auxiliary vectors,
+ * and the strings and bytes they point at. Addresses are the program's own; the facts are what the
+ * loader wrote, whatever the program does to that memory afterwards.
+ */
+export type X86ProcessStart = {
+    /** The initial `rsp`, where `argc` is: the block's first byte. */
+    start: bigint
+    /** One past its last byte, the end of the strings above it: the top of the stack. */
+    end: bigint
+    /** The number of arguments, `argv[0]` included, which the eight bytes at `start` hold. */
+    argc: number
+    /** The NULL-terminated array of pointers to the arguments, right after `argc`. */
+    argv: bigint
+    /** The NULL-terminated array of pointers to the environment's strings, after `argv`'s NULL. */
+    envp: bigint
+    /** The auxiliary vector, type and value pairs after `envp`'s NULL. */
+    auxv: bigint
+    /** One past the auxiliary vector's `AT_NULL` pair: the end of the vectors. */
+    auxvEnd: bigint
+    /** Each argument's string, `argv[0]` first. */
+    arguments: X86ProcessStartBytes[]
+    /** Each environment string, `NAME=value`, in `envp`'s order. */
+    environment: X86ProcessStartBytes[]
+    /** The program's path that `AT_EXECFN` points at. */
+    execfn?: X86ProcessStartBytes
+    /** The 16 random bytes `AT_RANDOM` points at, which seed the C library's stack guard. */
+    random?: X86ProcessStartBytes
+    /**
+     * The program's path the loader writes first, at the very top, where Linux puts the file name
+     * `AT_EXECFN` points at; this loader points `AT_EXECFN` at a copy of it below.
+     */
+    path?: X86ProcessStartBytes
+}
+
 export type X86ExecutableOptions = {
     argv0?: string
     arguments?: string[]
