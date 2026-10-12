@@ -11,6 +11,9 @@ import {
 import { writeArchive } from './archive'
 import { readResourceBytes } from './resources'
 import { analyze } from './elf'
+import { disassemble } from './disassembler'
+import { LINUX_SYSCALL_NAMES } from './syscall-names'
+import type { X86LoadedObject } from './types'
 import { resolveLinuxLibraries, validateProgramArguments, X86_PROGRAM_ENVIRONMENT } from './linux-runtime'
 import type { X86ExecutableInfo, X86ExecutableOptions } from './types'
 import { parseSourceMap, type SourceMap } from './source-map'
@@ -109,6 +112,7 @@ export type BlinkRuntimeCallbacks = {
     /** A read found the terminal empty: answer it with `provideInput()`. */
     inputRequest?: (event: X86InputRequest) => MaybePromise<void>
     waitRequest?: (event: X86WaitRequest) => MaybePromise<void>
+    unimplementedSyscall?: (event: { number: number; name: string }) => MaybePromise<void>
 }
 
 export type BlinkRuntimeOptions = {
@@ -182,6 +186,7 @@ export class BlinkRuntime {
     private readonly defaultArgv = ''
     private programArgv = ['/program']
     private systemFiles = new Map<string, Uint8Array>()
+    private readonly elfAnalyses = new WeakMap<Uint8Array, ReturnType<typeof analyze>>()
     private protectedPath: string | null = null
 
     private constructor(
@@ -260,6 +265,9 @@ export class BlinkRuntime {
         module._blinkenlib_set_deferred_disassembly?.(true)
 
         runtime = new BlinkRuntime(module, mode, callbacks, scheduler)
+        module.onUnimplementedSyscall = number => {
+            if (runtime?.programSources) observeCallbackResult(callbacks.unimplementedSyscall({ number, name: LINUX_SYSCALL_NAMES[number] ?? `syscall_${number}` }))
+        }
         runtime.environment = options.environment ?? {}
         await runtime.setMode(mode)
         return runtime
@@ -375,13 +383,36 @@ export class BlinkRuntime {
     }
 
     private layoutUnits: { path: string; object: Uint8Array }[] = []
+    private analyzeObject(bytes: Uint8Array) {
+        let info = this.elfAnalyses.get(bytes)
+        if (!info) { info = analyze(bytes); this.elfAnalyses.set(bytes, info) }
+        return info
+    }
+    private programLoadBias(): bigint {
+        if (!this.programBytes) return 0n
+        const info = this.analyzeObject(this.programBytes)
+        const first = info.programHeaders.filter(header => header.type === 1).reduce((lowest, header) => header.address < lowest ? header.address : lowest, 0x7fffffffffffffffn) & ~4095n
+        if (this.programSources && this.state !== BlinkState.ProgramLoaded) {
+            const map = this.module.blinkenlibGetFileMaps().find(map => map.path === PROGRAM && map.offset === 0n)
+            if (map) return map.address - first
+        }
+        return info.pie && first === 0n ? 0x555555554000n : 0n
+    }
     getMemoryLayout(): X86MemoryLayout {
-        return this.programBytes ? readMemoryLayout(this.programBytes, this.layoutUnits, this.sourceProject) : { sections: [], items: [], symbols: [] }
+        if (!this.programBytes) return { sections: [], items: [], symbols: [] }
+        const layout = readMemoryLayout(this.programBytes, this.layoutUnits, this.sourceProject)
+        const base = this.programLoadBias()
+        if (base) {
+            for (let i = 0; i < layout.items.length; i += 5) layout.items[i] += base
+            layout.symbols = layout.symbols.map(symbol => ({ ...symbol, address: symbol.address + base }))
+        }
+        return layout
     }
     resolveMemoryLabel(name: string): bigint | undefined {
         const data = this.getMemoryLayout().symbols.find(symbol => symbol.name === name)
         if (data) return data.address
-        return this.programBytes ? readElfSymbolTable(this.programBytes).symbols.find(symbol => symbol.name === name && symbol.sectionIndex !== 0)?.value : undefined
+        const symbol = this.programBytes ? this.analyzeObject(this.programBytes).symbols.find(symbol => symbol.name === name && symbol.sectionIndex !== 0) : undefined
+        return symbol ? symbol.value + this.programLoadBias() : undefined
     }
     getHeapBreak(): bigint { return this.module._blinkenlib_get_brk() }
     getHeapStart(): bigint { return this.module._blinkenlib_get_brk_start() }
@@ -1054,7 +1085,37 @@ export class BlinkRuntime {
     }
 
     getInstructionAt(address: bigint): NativeInstruction | null {
-        return this.module.blinkenlibGetInstructionAt(address)
+        // A final instruction can end at a page boundary: read only its mapped bytes.
+        const whole = this.spyMemoryBytes(address, 15)
+        const bytes: number[] = whole ? [...whole] : []
+        for (let i = 0; !whole && i < 15; ++i) {
+            const part = this.spyMemoryBytes(address + BigInt(i), 1)
+            if (!part) break
+            bytes.push(part[0])
+        }
+        if (!bytes.length) return null
+        const instruction = disassemble(Uint8Array.from(bytes), address)[0]
+        return instruction ? { address, size: instruction.length, code: instruction.text } : null
+    }
+
+    getLoadedObjects(): X86LoadedObject[] {
+        if (!this.programSources || this.state === BlinkState.ProgramLoaded) return []
+        const maps = this.module.blinkenlibGetFileMaps()
+        return maps.filter(map => map.offset === 0n).flatMap(map => {
+            const bytes = map.path === PROGRAM ? this.programBytes : this.systemFiles.get(map.path)
+            if (!bytes) return []
+            const info = this.analyzeObject(bytes)
+            const loads = info.programHeaders.filter(header => header.type === 1)
+            if (!loads.length) return []
+            const first = loads.reduce((lowest, header) => header.address < lowest ? header.address : lowest, loads[0].address) & ~4095n
+            const base = map.address - first
+            const end = loads.reduce((end, header) => header.address + header.memorySize > end ? header.address + header.memorySize : end, 0n)
+            return [{ path: map.path, soname: info.soname, base, end: base + ((end + 4095n) & ~4095n) }]
+        }).sort((a,b) => a.base < b.base ? -1 : a.base > b.base ? 1 : 0)
+    }
+
+    getLoadedObjectBytes(path: string): Uint8Array | null {
+        return (path === PROGRAM ? this.programBytes : this.systemFiles.get(path))?.slice() ?? null
     }
 
     getLastStepInfo(): NativeStepInfo {
@@ -1557,6 +1618,7 @@ function withDefaultCallbacks(
         signal: callbacks.signal ?? (() => undefined),
         stateChange: callbacks.stateChange ?? (() => undefined),
         inputRequest: callbacks.inputRequest ?? (() => undefined),
+        unimplementedSyscall: callbacks.unimplementedSyscall ?? (() => undefined),
         waitRequest: callbacks.waitRequest ?? (() => undefined)
     }
 }

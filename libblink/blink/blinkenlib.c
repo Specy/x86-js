@@ -1279,3 +1279,16 @@ int main(int argc, char *argv[]) {
   // overlays setup goes here
   // vfs setup goes here
 }
+
+bool blinkenlib_get_file_map(u32 index, const char **path, u64 *address, u64 *size, u64 *offset) {
+  if (!s) return false;
+  u32 current = 0;
+  for (struct Dll *e = dll_first(s->filemaps); e; e = dll_next(s->filemaps, e)) {
+    struct FileMap *fm = FILEMAP_CONTAINER(e);
+    if (fm->offset < 0 || !fm->pages) continue;
+    if (current++ != index) continue;
+    *path = fm->path; *address = fm->virt; *size = fm->size; *offset = fm->offset;
+    return true;
+  }
+  return false;
+}

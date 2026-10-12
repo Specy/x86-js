@@ -277,6 +277,21 @@ val ResolveSymbol(uint64_t address) {
   return result;
 }
 
+val GetFileMaps() {
+  val result = val::array();
+  const char *path;
+  uint64_t address, size, offset;
+  for (uint32_t index = 0; blinkenlib_get_file_map(index, &path, &address, &size, &offset); ++index) {
+    val row = val::object();
+    row.set("path", std::string(path));
+    row.set("address", address);
+    row.set("size", size);
+    row.set("offset", offset);
+    result.set(index, row);
+  }
+  return result;
+}
+
 bool SetProgramArguments(val args, val env) {
   std::string packed_args, packed_env;
   auto pack = [](val words, std::string &packed) {
@@ -348,6 +363,7 @@ EMSCRIPTEN_BINDINGS(blinkenlib_facade) {
   emscripten::function("blinkenlibResolveSymbol", &ResolveSymbol);
   emscripten::function("blinkenlibSetEmulationArgs", &SetEmulationArgs);
   emscripten::function("blinkenlibSetProgramArguments", &SetProgramArguments);
+  emscripten::function("blinkenlibGetFileMaps", &GetFileMaps);
   emscripten::function("blinkenlibGetSyscalls", &GetSyscalls);
   emscripten::function("blinkenlibGetInputMaxBytes",
                        &blinkenlib_get_input_max_bytes);

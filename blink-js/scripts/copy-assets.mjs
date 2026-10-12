@@ -13,6 +13,9 @@ const copies = [
   ['src/wasm/nasm.wasm', 'dist/wasm/nasm.wasm'],
   ['src/wasm/nasm.d.mts', 'dist/wasm/nasm.d.mts'],
   ['src/assets', 'dist/assets'],
+  ['../third_party/zydis/LICENSE-Zydis', 'dist/assets/zydis/LICENSE-Zydis'],
+  ['../third_party/zydis/LICENSE-Zycore', 'dist/assets/zydis/LICENSE-Zycore'],
+  ['../third_party/zydis/README.md', 'dist/assets/zydis/NOTICE.md'],
 ]
 
 await mkdir(resolve(root, 'dist'), { recursive: true })

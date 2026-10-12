@@ -6,7 +6,7 @@ int main(void) {
   printf("Enter password: ");
   if (!fgets(password, sizeof(password), stdin)) return 1;
   password[strcspn(password, "\n")] = 0;
-  if (strcmp(password, "hunter2")) puts("Wrong!");
-  else puts("Correct!");
+  if (!strcmp(password, "hunter2")) puts("Correct!");
+  else puts("Wrong!");
   return 0;
 }

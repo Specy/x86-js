@@ -47,7 +47,7 @@ export function analyze(bytes: Uint8Array): ElfAnalysis {
         let stop = offset
         while (stop < end && bytes[stop]) ++stop
         if (stop === end) throw new Error('an unterminated ELF string')
-        return new TextDecoder().decode(bytes.subarray(offset, stop)).split('@')[0]
+        return new TextDecoder().decode(bytes.subarray(offset, stop))
     }
     try {
         result.type = view.getUint16(16, true)
@@ -89,7 +89,7 @@ export function analyze(bytes: Uint8Array): ElfAnalysis {
                 const nameAt = view.getUint32(at, true)
                 if (nameAt >= strings.size) throw new Error('an invalid ELF dynamic symbol name')
                 result.dynamicSymbols.push({
-                    index: i, name: string(strings.offset + nameAt, strings.offset + strings.size),
+                    index: i, name: string(strings.offset + nameAt, strings.offset + strings.size).split('@')[0],
                     value: view.getBigUint64(at + 8, true), size: view.getBigUint64(at + 16, true),
                     type: ({ 1: 'object', 2: 'function', 6: 'tls', 10: 'ifunc' } as const)[info & 15] ?? 'notype',
                     binding: ({ 0: 'local', 1: 'global', 2: 'weak', 10: 'unique' } as const)[info >> 4] ?? 'other',
@@ -141,7 +141,7 @@ export function analyze(bytes: Uint8Array): ElfAnalysis {
                 const stride = plt.entrySize || 16
                 slots.forEach((slot, index) => {
                     const offset = (index + (name === '.plt' ? 1 : 0)) * stride
-                    if (offset < plt.size) result.plt.push({ address: plt.address + BigInt(offset), name: `${slot.symbol}@plt`, got: slot.address })
+                    if (offset < plt.size) result.plt.push({ address: plt.address + BigInt(offset), name: `${slot.symbol}${name === '.plt' && table.sections.some(s => s.name === '.plt.sec') ? '@plt_resolver' : '@plt'}`, got: slot.address })
                 })
             }
         }
@@ -153,7 +153,7 @@ export function analyze(bytes: Uint8Array): ElfAnalysis {
                 if (bytes[at] !== 0xff || bytes[at + 1] !== 0x25) continue
                 const got = pltgot.address + BigInt(offset + 6) + BigInt(view.getInt32(at + 2, true))
                 const slot = result.relocations.find(relocation => relocation.type === 6 && relocation.address === got)
-                if (slot?.symbol) result.plt.push({ address: pltgot.address + BigInt(offset), name: `${slot.symbol}@plt`, got })
+                if (slot?.symbol) result.plt.push({ address: pltgot.address + BigInt(Math.floor(offset / (pltgot.entrySize || 8)) * (pltgot.entrySize || 8)), name: `${slot.symbol}@plt`, got })
             }
         }
         if (result.type === 1) return fail('an object file, not a program')

@@ -129,7 +129,7 @@ export type X86SourceLocation = {
     line: number
 }
 
-export type X86Breakpoint = number | X86SourceLocation
+export type X86Breakpoint = number | X86SourceLocation | { address: bigint }
 
 /**
  * `diagnostics` carries everything the assembler said, warnings included - a
@@ -172,6 +172,7 @@ export type X86EmulatorEventMap = {
     signal: { signal: number; code: number }
     inputRequest: X86InputRequest
     waitRequest: X86WaitRequest
+    unimplementedSyscall: { number: number; name: string }
 }
 
 export type X86EmulatorEventName = keyof X86EmulatorEventMap
@@ -218,3 +219,5 @@ export type X86ExecutableOptions = {
     arguments?: string[]
     protectedPath?: string | null
 }
+
+export type X86LoadedObject = { path: string; soname?: string; base: bigint; end: bigint }

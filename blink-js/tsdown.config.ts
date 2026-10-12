@@ -4,6 +4,7 @@ import { defineConfig } from 'tsdown'
 export default defineConfig({
   entry: {
     index: './src/index.ts',
+    disassembler: './src/disassembler/index.ts',
     // The compiler-output translator imports nothing from the emulator, so its
     // bundle carries no wasm and a consumer that only translates never loads it.
     'compiler-output': './src/compiler-output/index.ts',
@@ -16,6 +17,11 @@ export default defineConfig({
         types: './dist/index.d.mts',
         import: './dist/index.mjs',
         default: './dist/index.mjs',
+      },
+      './disassembler': {
+        types: './dist/disassembler.d.mts',
+        import: './dist/disassembler.mjs',
+        default: './dist/disassembler.mjs',
       },
       './compiler-output': {
         types: './dist/compiler-output.d.mts',

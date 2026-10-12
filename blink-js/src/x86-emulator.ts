@@ -76,7 +76,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         stderr: new Set(),
         signal: new Set(),
         inputRequest: new Set(),
-        waitRequest: new Set()
+        waitRequest: new Set(),
+        unimplementedSyscall: new Set()
     }
 
     private lastCompileResult: X86CompileResult | null = null
@@ -135,6 +136,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 waitRequest: (event) => {
                     const result = options.callbacks?.waitRequest?.(event)
                     emulator?.emit('waitRequest', event)
+                    return result
+                },
+                unimplementedSyscall: event => {
+                    const result = options.callbacks?.unimplementedSyscall?.(event)
+                    emulator?.emit('unimplementedSyscall', event)
                     return result
                 },
                 inputRequest: (event) => {
@@ -215,6 +221,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     resolveMemoryLabel(name: string) { return this.runtime.resolveMemoryLabel(name) }
     getMemoryLayout() { return this.runtime.getMemoryLayout() }
+    getLoadedObjects() { return this.runtime.getLoadedObjects() }
+    getLoadedObjectBytes(path: string) { return this.runtime.getLoadedObjectBytes(path) }
     getHeapStart(): bigint { return this.runtime.getHeapStart() }
     getHeapBreak(): bigint { return this.runtime.getHeapBreak() }
     getStackTop(): bigint { return this.runtime.getStackTop() }
@@ -710,6 +718,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     private resolveBreakpointAddresses(breakpoints: X86Breakpoint[]): bigint[] {
         const addresses = new Map<string, bigint>()
         for (const breakpoint of breakpoints) {
+            if (typeof breakpoint === 'object' && 'address' in breakpoint) {
+                if (typeof breakpoint.address !== 'bigint' || breakpoint.address < 0n || breakpoint.address > 0xffffffffffffffffn)
+                    throw new Error('Invalid breakpoint address')
+                addresses.set(breakpoint.address.toString(), breakpoint.address)
+                continue
+            }
             const lineIndex = typeof breakpoint === 'number' ? breakpoint : breakpoint.line
             if (!Number.isSafeInteger(lineIndex) || lineIndex < 0) {
                 throw new Error(`Invalid breakpoint line index: ${lineIndex}`)

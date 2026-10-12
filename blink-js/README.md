@@ -537,3 +537,70 @@ The Linux process also answers `set_robust_list`, `get_robust_list` and `rseq` f
 single thread on CPU 0. `ptrace(PTRACE_TRACEME)` succeeds once and then returns
 `EPERM`; other requests return `ESRCH`. The existing `futex` wait/wake handler is
 available, including the uncontended wake used by C++ exception handling.
+
+## Loading an executable
+
+`loadExecutable(bytes)` accepts a little-endian x86-64 Linux ELF executable,
+including a PIE. It loads its interpreter and recursively resolves dependencies
+from five bundled Ubuntu libraries: `ld-linux-x86-64.so.2`, `libc.so.6`,
+`libm.so.6`, `libstdc++.so.6` and `libgcc_s.so.1`. They are fetched only when
+needed and cached. The result includes `pie`, `interpreter`, `needed` and
+`missing`; missing libraries still reach the dynamic linker, whose error is
+written to stderr. `loadElf(bytes)` remains available without library resolution.
+
+```ts
+const emulator = await createX86Emulator()
+const info = await emulator.loadExecutable(bytes)
+emulator.setProgramArguments('./crackme', ['hunter2'])
+emulator.initialize(200_000)
+await emulator.run(1_000_000, [{ address: 0x555555555170n }])
+```
+
+The fixed Linux layout places PIEs at `0x555555554000`, maps downwards below
+`0x7ffff7fff000`, and reserves the stack below `0x7ffffffff000`. Non-PIE
+executables use their ELF addresses; the heap starts after the main executable.
+`getLoadedObjects()` reports each object's path, soname, load bias and end;
+`getLoadedObjectBytes(path)` returns a copy for inspection. Debugger addresses,
+`getMemoryLayout()` and `resolveMemoryLabel()` include the main program's bias.
+
+## Arguments and the executable's File
+
+`setProgramArguments(argv0, words)` supplies UTF-8 words as an array, preserving
+empty strings and spaces. NUL is refused, with limits of 1,024 argument words
+and 128 KiB including argv0 and terminators. A start supplies PATH, HOME, PWD,
+LANG, TERM, SHELL, USER and LOGNAME with fixed Linux values. AT_EXECFN continues
+to name the actual executable path. Arguments apply at the next start.
+
+With a mounted Project FileSystem, `setProtectedPath('/project/crackme')`
+protects the executable from writes and truncation (`ETXTBSY`). Reads remain
+available. Unlinking or renaming it, including replacing its name, returns
+`EBUSY`; this deliberately differs from Linux to preserve the original File.
+
+## Disassembly and address Breakpoints
+
+```ts
+import { analyze, disassemble } from '@specy/x86/disassembler'
+const elf = analyze(bytes)
+const instructions = disassemble(codeBytes, 0x401000n)
+```
+
+The independent subpath needs no Blink instance. `analyze` returns ELF headers,
+sections, symbols, dynamic dependencies, relocations and PLT stubs, or a reason
+when a program cannot run. `disassemble` uses Zydis 4.1.1 for NASM-flavoured
+Intel text, including CET and AVX-512. It exposes instruction lengths, flow
+kinds, direct branch targets and RIP-relative targets with text spans. Invalid
+bytes become one-byte `db` instructions. The Core's instruction queries use the
+same text; Blink executes the instructions and may reject extensions it lacks.
+
+`run(limit, [{ address }])` stops before the instruction at that runtime
+address, with the same continue semantics as source Breakpoints.
+`unimplementedSyscall` emits `{ number, name }` on each unimplemented call,
+without pausing or changing the program's ENOSYS result.
+
+## Assembling an instruction
+
+`assembleInstruction(text, address)` uses NASM in its own wasm module, with the
+provided origin, and returns `{ bytes }` or `{ error }`. Direct branches use
+short encodings when their displacement fits. To apply a temporary patch,
+check its length, pad shorter replacements with `0x90`, and write the bytes
+between `beginPoke()` and `endPoke()`. Undo restores the original bytes.

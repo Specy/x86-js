@@ -94,6 +94,9 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+EM_JS(void, NotifyUnimplementedSyscall, (int number), {
+  if (Module.onUnimplementedSyscall) Module.onUnimplementedSyscall(number);
+});
 #endif
 
 #ifdef __HAIKU__
@@ -6824,6 +6827,9 @@ void OpSyscall(P) {
       break;
     default:
     DefaultCase:
+#ifdef __EMSCRIPTEN__
+      NotifyUnimplementedSyscall(call);
+#endif
       LOGF("missing syscall 0x%03" PRIx64, ax);
       ax = enosys();
       break;

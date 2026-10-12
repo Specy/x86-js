@@ -254,3 +254,23 @@ export const nasmWasmAssembler: WasmAssembler = {
         }
     },
 }
+
+/** Assemble one instruction at its runtime address, for a debugger Poke. */
+export async function assembleInstruction(text: string, address: bigint): Promise<{ bytes: Uint8Array } | { error: string }> {
+    if (!text.trim() || /[\r\n]/.test(text)) return { error: 'Enter one instruction' }
+    if (address < 0n || address > 0xffffffffffffffffn) return { error: 'Invalid x86-64 address' }
+    // NASM treats an absolute numeric target as near even at -Ox. Prefer the
+    // architectural short encoding when a direct branch's displacement fits.
+    const branch = /^(j(?:mp|[a-z]{1,3}))\s+(0x[\da-f]+|\d+)$/i.exec(text.trim())
+    if (branch) {
+        const delta = BigInt(branch[2]) - address - 2n
+        if (delta >= -128n && delta <= 127n) text = `${branch[1]} short ${branch[2]}`
+    }
+    const { module, stderr } = await createNasmModule()
+    module.FS.writeFile('/instruction.asm' , `bits 64\norg 0x${address.toString(16)}\n${text}\n`)
+    const status = callNasm(module, ['-Ox', '-fbin', '/instruction.asm', '-o', '/instruction.bin'])
+    if (status !== 0) return { error: stderr().trim().split('\n')[0] || 'The instruction did not assemble' }
+    const bytes = Uint8Array.from(module.FS.readFile('/instruction.bin') as Uint8Array)
+    if (!bytes.length) return { error: stderr().trim().split('\n')[0] || 'The text did not encode an instruction' }
+    return { bytes }
+}

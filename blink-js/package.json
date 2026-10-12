@@ -21,6 +21,11 @@
       "import": "./dist/compiler-output.mjs",
       "default": "./dist/compiler-output.mjs"
     },
+    "./disassembler": {
+      "types": "./dist/disassembler.d.mts",
+      "import": "./dist/disassembler.mjs",
+      "default": "./dist/disassembler.mjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [

@@ -400,7 +400,7 @@ const ROOT_EXPORTS_2_8_0 = [
 ]
 // The token provideInput() takes for End of input, and where programs start.
 const ROOT_EXPORTS_5_0_0 = ['END_OF_INPUT', 'X86_WORKING_DIRECTORY', 'X86EnvironmentError']
-const ROOT_EXPORTS = [...ROOT_EXPORTS_2_8_0, ...ROOT_EXPORTS_5_0_0]
+const ROOT_EXPORTS = [...ROOT_EXPORTS_2_8_0, ...ROOT_EXPORTS_5_0_0, 'assembleInstruction']
 
 const root = await import(dist)
 const rootNames = Object.keys(root)
@@ -995,7 +995,7 @@ console.log(
     `ok - ran a program to exit code 7, a two-file project to a breakpoint, the SSE and x87 register files through undo, checked both sides of a store, and read ${failed.errors.length} diagnostic(s)`
 )
 console.log(
-    `ok - translated GCC output through @specy/x86/compiler-output without WebAssembly, built and ran ${fixture ? `ctor-O2 and ${fixture.name}` : 'ctor-O2'} with a start unit, read standard input, and the root exports the ${ROOT_EXPORTS_2_8_0.length} names of 2.8.0 and the ${ROOT_EXPORTS_5_0_0.length} of 5.0.0`
+    `ok - translated GCC output through @specy/x86/compiler-output without WebAssembly, built and ran ${fixture ? `ctor-O2 and ${fixture.name}` : 'ctor-O2'} with a start unit, read standard input, and the root exports the ${ROOT_EXPORTS_2_8_0.length} names of 2.8.0 and the ${ROOT_EXPORTS_5_0_0.length} of 5.0.0, plus assembleInstruction in 7.0.0`
 )
 
 // Bundled Linux assets must resolve from dist too, without the source tree.
@@ -1012,3 +1012,11 @@ try {
     assert.equal(output, 'hello\nC++\ncaught exception\n')
     console.log('ok - loaded a dynamic C++ executable using only dist Linux assets')
 } finally { imported.dispose() }
+
+assert.equal(import.meta.resolve('@specy/x86/disassembler'), new URL('../dist/disassembler.mjs', import.meta.url).href)
+const decoder = await import('@specy/x86/disassembler')
+assert.equal(decoder.disassemble(Uint8Array.of(0xf3, 0x0f, 0x1e, 0xfa), 0x401000n)[0].text, 'endbr64')
+assert.equal(decoder.analyze(readFileSync(new URL('./fixtures/elf/crackme', import.meta.url))).supported, true)
+const patch = await root.assembleInstruction('je 0x555555555170', 0x555555555160n)
+assert.deepEqual([...patch.bytes], [0x74, 0x0e])
+console.log('ok - imported the independent disassembler subpath and assembled a short address branch')
