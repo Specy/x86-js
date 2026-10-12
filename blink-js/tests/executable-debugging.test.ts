@@ -67,6 +67,35 @@ it('names where a call into a PLT stub went, which no symbol starts', async () =
     }
 })
 
+it('drops the frames a caught C++ exception unwinds, so main returns and leaves the stack', async () => {
+    const emulator = await createX86Emulator()
+    let output = ''
+    emulator.on('stdout', (chunk) => {
+        output += new TextDecoder().decode(chunk)
+    })
+    try {
+        await emulator.loadExecutable(elfFixture('cpp'))
+        emulator.initialize(1000)
+        await emulator.run(50_000_000)
+        expect(output).toBe('hello\nC++\ncaught exception\n')
+        expect(emulator.stopReason?.kind).toBe('exit')
+        const frames = emulator.getCallStack()
+        // main threw through __cxa_throw@plt, which Blink names `_init`, and returned after the
+        // catch: neither frame is left, only the ones exit() runs in
+        expect(frames.map((frame) => frame.name)).not.toContain('main')
+        expect(frames.map((frame) => frame.name)).not.toContain('_init')
+        expect(frames[0].name).toBe('__libc_start_main')
+        // every frame's return address is still on the stack, the innermost lowest
+        const rsp = emulator.getRegisterValue('rsp')
+        for (let i = 0; i < frames.length; i++) {
+            expect(frames[i].sp).toBeGreaterThanOrEqual(rsp)
+            if (i > 0) expect(frames[i].sp).toBeLessThan(frames[i - 1].sp)
+        }
+    } finally {
+        emulator.dispose()
+    }
+})
+
 it('uses Zydis for instruction queries even when Blink cannot execute the instruction', async () => {
     const bytes = elfFixture('avx')
     const info = analyze(bytes)

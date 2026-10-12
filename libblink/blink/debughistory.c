@@ -354,10 +354,18 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
     f->destination = before.pc + before.size;
     f->sp = after.registers[BLINKENLIB_REG_RSP];
     stack = f;
-  } else if (!is_poke && before.flow == BLINKENLIB_CONTROL_FLOW_RETURN && stack) {
-    struct Frame *previous = Retain(stack->previous);
-    Release(stack);
-    stack = previous;
+  } else if (!is_poke) {
+    /* A frame lasts while its return address is on the stack. A `ret` takes
+     * it off, and so does anything else that moves rsp above it, such as C++
+     * exception unwinding or longjmp landing in an outer function, which
+     * leave many frames at once without a `ret` each. A `ret` that returns
+     * through an address no `call` pushed leaves the frames it is below. */
+    u64 sp = after.registers[BLINKENLIB_REG_RSP];
+    while (stack && stack->sp < sp) {
+      struct Frame *previous = Retain(stack->previous);
+      Release(stack);
+      stack = previous;
+    }
   }
 }
 void DebugHistoryFinish(bool exited) {
