@@ -32,6 +32,11 @@ Debugger reads and Undo work throughout the guest address space.
   destination), rseq (unregistering resets the area as Linux does),
   ptrace TRACEME (and EPERM for attaching to itself); correct LZCNT and
   TZCNT.
+- The terminal on descriptors 0, 1 and 2 answers termios2's TCGETS2,
+  TCSETS2, TCSETSW2 and TCSETSF2 as it answers TCGETS and TCSETS, with
+  38400 bits per second, so glibc 2.42 and later find a tty: isatty() is
+  true, and standard output is line-buffered, which writes a prompt
+  without a newline before the read that waits for its answer.
 - futex waits time out: FUTEX_WAIT's relative and FUTEX_WAIT_BITSET's absolute
   timeouts (CLOCK_MONOTONIC, or CLOCK_REALTIME with FUTEX_CLOCK_REALTIME) wait
   through the environment's clock and answer ETIMEDOUT, so glibc's

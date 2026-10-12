@@ -598,6 +598,7 @@
 #define TCFLSH_LINUX             0x540b
 #define TCGETA_LINUX             0x5405
 #define TCGETS_LINUX             0x5401
+#define TCGETS2_LINUX            0x802c542a
 #define TCGETX_LINUX             0x5432
 #define TCSBRK_LINUX             0x5409
 #define TCSBRKP_LINUX            0x5425
@@ -605,8 +606,11 @@
 #define TCSETAF_LINUX            0x5408
 #define TCSETAW_LINUX            0x5407
 #define TCSETS_LINUX             0x5402
+#define TCSETS2_LINUX            0x402c542b
 #define TCSETSF_LINUX            0x5404
+#define TCSETSF2_LINUX           0x402c542d
 #define TCSETSW_LINUX            0x5403
+#define TCSETSW2_LINUX           0x402c542c
 #define TCSETX_LINUX             0x5433
 #define TCSETXF_LINUX            0x5434
 #define TCSETXW_LINUX            0x5435
@@ -957,6 +961,14 @@ struct termios_linux {
   u8 lflag[4];
   u8 line;
   u8 cc[NCCS_LINUX];
+};
+
+// what TCGETS2 and TCSETS2 take: the termios, then its input and output
+// speeds in bits per second
+struct termios2_linux {
+  struct termios_linux termios;
+  u8 ispeed[4];
+  u8 ospeed[4];
 };
 
 struct sockaddr_linux {

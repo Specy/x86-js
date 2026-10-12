@@ -50,6 +50,49 @@ describe('glibc executables', () => {
             expect(stop).toMatchObject({ kind: 'exit', exitCode: 0 })
         })
     }
+    // A Linux process on a tty: glibc line-buffers standard output, and flushes it before a read
+    // of standard input waits, so a prompt without a newline comes before the input request.
+    it("writes crackme's prompt before the read that waits for the password", async () => {
+        const emulator = await fixtureEmulator('crackme')
+        const writes: string[] = []
+        emulator.on('stdout', (bytes) => {
+            writes.push(new TextDecoder().decode(bytes))
+        })
+        try {
+            await emulator.run(2_000_000)
+            expect(emulator.stopReason?.kind).toBe('input')
+            expect(writes).toEqual(['Enter password: '])
+            await emulator.provideInput('hunter2\n')
+            await emulator.run(2_000_000)
+            expect(writes).toEqual(['Enter password: ', 'Correct!\n'])
+            expect(emulator.stopReason).toMatchObject({ kind: 'exit', exitCode: 0 })
+        } finally {
+            emulator.dispose()
+        }
+    })
+    it('answers isatty() for 0, 1 and 2, waiting for input or given it beforehand', async () => {
+        for (const beforehand of [false, true]) {
+            const emulator = await fixtureEmulator('isatty')
+            const writes: string[] = []
+            emulator.on('stdout', (bytes) => {
+                writes.push(new TextDecoder().decode(bytes))
+            })
+            try {
+                if (beforehand) await emulator.provideInput('bob\n')
+                await emulator.run(2_000_000)
+                if (!beforehand) {
+                    expect(emulator.stopReason?.kind).toBe('input')
+                    expect(writes).toEqual(['1 1 1\n', 'name? '])
+                    await emulator.provideInput('bob\n')
+                    await emulator.run(2_000_000)
+                }
+                expect(writes).toEqual(['1 1 1\n', 'name? ', 'hi bob\n'])
+                expect(emulator.stopReason).toMatchObject({ kind: 'exit', exitCode: 0 })
+            } finally {
+                emulator.dispose()
+            }
+        }
+    })
     it('maps libm without aborting on a page past the file end', async () => {
         const { output, stop } = await runFixture('math', ['0'])
         expect(output).toBe('cos=1.000000\n')
