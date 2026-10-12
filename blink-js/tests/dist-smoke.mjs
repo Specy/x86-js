@@ -1001,22 +1001,39 @@ console.log(
 // Bundled Linux assets must resolve from dist too, without the source tree.
 const imported = await createX86Emulator()
 try {
-    const info = await imported.loadExecutable(readFileSync(new URL('./fixtures/elf/cpp', import.meta.url)))
+    const info = await imported.loadExecutable(
+        readFileSync(new URL('./fixtures/elf/cpp', import.meta.url))
+    )
     assert.deepEqual(info.missing, [])
     imported.setProgramArguments('./cpp', ['two words', '猫'])
     imported.initialize(0)
     let output = ''
-    imported.on('stdout', bytes => { output += new TextDecoder().decode(bytes) })
+    imported.on('stdout', (bytes) => {
+        output += new TextDecoder().decode(bytes)
+    })
     await imported.run(2_000_000)
     assert.equal(imported.stopReason?.kind, 'exit')
     assert.equal(output, 'hello\nC++\ncaught exception\n')
     console.log('ok - loaded a dynamic C++ executable using only dist Linux assets')
-} finally { imported.dispose() }
+} finally {
+    imported.dispose()
+}
 
-assert.equal(import.meta.resolve('@specy/x86/disassembler'), new URL('../dist/disassembler.mjs', import.meta.url).href)
+assert.equal(
+    import.meta.resolve('@specy/x86/disassembler'),
+    new URL('../dist/disassembler.mjs', import.meta.url).href
+)
 const decoder = await import('@specy/x86/disassembler')
-assert.equal(decoder.disassemble(Uint8Array.of(0xf3, 0x0f, 0x1e, 0xfa), 0x401000n)[0].text, 'endbr64')
-assert.equal(decoder.analyze(readFileSync(new URL('./fixtures/elf/crackme', import.meta.url))).supported, true)
+assert.equal(
+    decoder.disassemble(Uint8Array.of(0xf3, 0x0f, 0x1e, 0xfa), 0x401000n)[0].text,
+    'endbr64'
+)
+assert.equal(
+    decoder.analyze(readFileSync(new URL('./fixtures/elf/crackme', import.meta.url))).supported,
+    true
+)
 const patch = await root.assembleInstruction('je 0x555555555170', 0x555555555160n)
 assert.deepEqual([...patch.bytes], [0x74, 0x0e])
-console.log('ok - imported the independent disassembler subpath and assembled a short address branch')
+console.log(
+    'ok - imported the independent disassembler subpath and assembled a short address branch'
+)

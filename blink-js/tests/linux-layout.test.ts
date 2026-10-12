@@ -26,19 +26,20 @@ it('loads a PIE and interpreter at Linux addresses with the heap after the main 
         for (let i = 0; i < view.getUint16(56, true); ++i) {
             const header = Number(view.getBigUint64(32, true)) + i * view.getUint16(54, true)
             if (view.getUint32(header, true) === 1) {
-                const end = view.getBigUint64(header + 16, true) + view.getBigUint64(header + 40, true)
+                const end =
+                    view.getBigUint64(header + 16, true) + view.getBigUint64(header + 40, true)
                 if (end > highest) highest = end
             }
         }
         expect(emulator.getHeapStart()).toBe(PIE + ((highest + 4095n) & ~4095n))
-        const main = elf.symbols.find(symbol => symbol.name === 'main')!
+        const main = elf.symbols.find((symbol) => symbol.name === 'main')!
         for (let slice = 0; slice < 10; ++slice) {
             emulator.runtime.runSlice(50_000, [PIE + main.value], false)
             if (emulator.stopReason?.kind !== 'limit') break
         }
         expect(emulator.getPc(), emulator.stopReason?.details).toBe(PIE + main.value)
         // The PIE's writable bytes are visible through guest page tables, including Poke Undo.
-        const data = elf.sections.find(section => section.name === '.data')!
+        const data = elf.sections.find((section) => section.name === '.data')!
         const at = PIE + data.address
         const original = [...emulator.readMemoryBytes(at, 8n)]
         emulator.initialize(100)
@@ -48,20 +49,40 @@ it('loads a PIE and interpreter at Linux addresses with the heap after the main 
         expect(emulator.canUndo()).toBe(true)
         emulator.undo()
         expect([...emulator.readMemoryBytes(at, 8n)]).toEqual(original)
-    } finally { emulator.dispose() }
+    } finally {
+        emulator.dispose()
+    }
 })
 
 it('allocates downwards, respects free hints and reuses the highest unmapped hole', async () => {
-    await expectCore([
-        'sys 9, 0, 4096, 3, 0x22, -1, 0', 'mov r12, rax', 'save',
-        'sys 9, 0, 8192, 3, 0x22, -1, 0', 'save',
-        'sys 11, r12, 4096', 'save',
-        'sys 9, 0, 4096, 3, 0x22, -1, 0', 'save',
-        'sys 9, 0x10000000, 4096, 3, 0x22, -1, 0', 'save',
-        'sys 9, 0x10000000, 4096, 3, 0x22, -1, 0', 'save',
-        'sys 9, 0, 0x10000000, 0, 0x22, -1, 0', 'save',
-    ], [MMAP_TOP - 4096n, MMAP_TOP - 12288n, 0, MMAP_TOP - 4096n,
-        0x10000000n, MMAP_TOP - 16384n, MMAP_TOP - 16384n - 0x10000000n])
+    await expectCore(
+        [
+            'sys 9, 0, 4096, 3, 0x22, -1, 0',
+            'mov r12, rax',
+            'save',
+            'sys 9, 0, 8192, 3, 0x22, -1, 0',
+            'save',
+            'sys 11, r12, 4096',
+            'save',
+            'sys 9, 0, 4096, 3, 0x22, -1, 0',
+            'save',
+            'sys 9, 0x10000000, 4096, 3, 0x22, -1, 0',
+            'save',
+            'sys 9, 0x10000000, 4096, 3, 0x22, -1, 0',
+            'save',
+            'sys 9, 0, 0x10000000, 0, 0x22, -1, 0',
+            'save'
+        ],
+        [
+            MMAP_TOP - 4096n,
+            MMAP_TOP - 12288n,
+            0,
+            MMAP_TOP - 4096n,
+            0x10000000n,
+            MMAP_TOP - 16384n,
+            MMAP_TOP - 16384n - 0x10000000n
+        ]
+    )
 })
 
 it('reads and undoes memory inside the old host-shadow range', async () => {
@@ -95,5 +116,7 @@ _start:
         expect(emulator.canUndo()).toBe(true)
         emulator.undo()
         expect([...emulator.readMemoryBytes(0xc000000000n, 1n)]).toEqual([0])
-    } finally { emulator.dispose() }
+    } finally {
+        emulator.dispose()
+    }
 })

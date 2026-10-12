@@ -212,8 +212,12 @@ export class ProjectFileSystemMount {
     }
     private protect(path: string, errno: 'ETXTBSY' | 'EBUSY'): void {
         const protectedPath = this.protectedPath()
-        if (protectedPath && (path === protectedPath.slice('/project/'.length) ||
-            protectedPath.slice('/project/'.length).startsWith(path + '/'))) this.error(errno)
+        if (
+            protectedPath &&
+            (path === protectedPath.slice('/project/'.length) ||
+                protectedPath.slice('/project/'.length).startsWith(path + '/'))
+        )
+            this.error(errno)
     }
     private path(node: ProjectNode, name: string): string {
         return node.projectPath ? `${node.projectPath}/${name}` : name
@@ -364,7 +368,7 @@ export class ProjectFileSystemMount {
                         : (stream.flags & O_ACCMODE) === O_RDWR
                           ? 'read-write'
                           : 'read'
-                if (access !== 'read' || node.pendingTruncate || (stream.flags & 512))
+                if (access !== 'read' || node.pendingTruncate || stream.flags & 512)
                     this.protect(node.projectPath, 'ETXTBSY')
                 const fd = this.effect(() =>
                     this.capability.open(node.projectPath, {

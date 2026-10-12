@@ -82,10 +82,12 @@ export type RegisterSnapshot = {
 }
 
 export type MemoryReadResult =
-    { ok: true; bytes: number[] } | { ok: false; error: string; readBytes: number }
+    | { ok: true; bytes: number[] }
+    | { ok: false; error: string; readBytes: number }
 
 export type MemoryWriteResult =
-    { ok: true; writtenBytes: number } | { ok: false; error: string; writtenBytes: number }
+    | { ok: true; writtenBytes: number }
+    | { ok: false; error: string; writtenBytes: number }
 
 export type NativeRunStopKind = 'none' | 'breakpoint' | 'limit'
 

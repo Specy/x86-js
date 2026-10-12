@@ -70,7 +70,11 @@ function compiledNasmModule(): Promise<WebAssembly.Module | null> {
     return compiledNasm
 }
 
-async function createNasmModule(): Promise<{ module: NasmModule; stdout: () => string; stderr: () => string }> {
+async function createNasmModule(): Promise<{
+    module: NasmModule
+    stdout: () => string
+    stderr: () => string
+}> {
     let stdout = ''
     let stderr = ''
     const compiled = await compiledNasmModule()
@@ -93,13 +97,13 @@ async function createNasmModule(): Promise<{ module: NasmModule; stdout: () => s
                       instantiateWasm: (imports, receiveInstance) => {
                           WebAssembly.instantiate(compiled, imports).then(
                               (instance) => receiveInstance(instance, compiled),
-                              failInstantiation,
+                              failInstantiation
                           )
-                      },
+                      }
                   }
-                : {}),
+                : {})
         }),
-        instantiationFailed,
+        instantiationFailed
     ])
     return { module, stdout: () => stdout, stderr: () => stderr }
 }
@@ -164,7 +168,10 @@ function callNasm(module: NasmModule, args: string[]): number {
  * is scanned before any of them is treated as a unit, because a fragment can be included by a
  * File that sorts after it.
  */
-async function scanIncludedFiles(project: X86Project, candidates: readonly string[]): Promise<Set<string>> {
+async function scanIncludedFiles(
+    project: X86Project,
+    candidates: readonly string[]
+): Promise<Set<string>> {
     const included = new Set<string>()
     if (candidates.length < 2) return included
 
@@ -189,14 +196,22 @@ async function scanIncludedFiles(project: X86Project, candidates: readonly strin
  * from `%include`ing it.
  */
 function withLibraryUnit(project: X86Project, path: string): X86Project {
-    return { entry: project.entry, files: { ...project.files, [path]: (project.startUnits?.[path] ?? project.library?.[path])! } }
+    return {
+        entry: project.entry,
+        files: {
+            ...project.files,
+            [path]: (project.startUnits?.[path] ?? project.library?.[path])!
+        }
+    }
 }
 
 export const nasmWasmAssembler: WasmAssembler = {
     async assemble(project: X86Project): Promise<WasmAssemblyResult> {
         const candidates = x86TranslationUnitCandidates(project)
         const included = await scanIncludedFiles(project, candidates)
-        const [entry, ...others] = candidates.filter((path) => path === project.entry || !included.has(path))
+        const [entry, ...others] = candidates.filter(
+            (path) => path === project.entry || !included.has(path)
+        )
         const library = new Set(Object.keys({ ...project.startUnits, ...project.library }))
         const units = [entry!, ...[...library].sort(), ...others]
 
@@ -207,9 +222,12 @@ export const nasmWasmAssembler: WasmAssembler = {
 
         for (const path of units) {
             const isLibrary = library.has(path)
-            const unitSource = isLibrary ? (project.startUnits?.[path] ?? project.library?.[path]) : undefined
+            const unitSource = isLibrary
+                ? (project.startUnits?.[path] ?? project.library?.[path])
+                : undefined
             // Only a unit written as text is kept: a library given as bytes is assembled every time.
-            const key = typeof unitSource === 'string' ? libraryObjectKey(path, unitSource) : undefined
+            const key =
+                typeof unitSource === 'string' ? libraryObjectKey(path, unitSource) : undefined
             const cached = key === undefined ? undefined : takeLibraryObject(key)
             if (cached) {
                 stdout += cached.stdout
@@ -223,7 +241,13 @@ export const nasmWasmAssembler: WasmAssembler = {
             stageX86Project(module.FS, staged)
             const source = selectX86Source(module.FS, staged, path)
             const dependencies = key === undefined ? [] : ['-MD', DEPENDENCIES_PATH]
-            const unitStatus = callNasm(module, [...NASM_ARGS, ...dependencies, source, '-o', OBJECT_PATH])
+            const unitStatus = callNasm(module, [
+                ...NASM_ARGS,
+                ...dependencies,
+                source,
+                '-o',
+                OBJECT_PATH
+            ])
             const unitStdout = readStdout()
             const unitStderr = readStderr()
             stdout += unitStdout
@@ -238,9 +262,21 @@ export const nasmWasmAssembler: WasmAssembler = {
             }
             const object = module.FS.readFile(OBJECT_PATH) as Uint8Array
             assembled.push({ path, object })
-            if (key !== undefined && !CLOCK_MACRO.test(unitSource as string) && module.FS.analyzePath(DEPENDENCIES_PATH).exists) {
-                const read = parseDependencyList(module.FS.readFile(DEPENDENCIES_PATH, { encoding: 'utf8' }) as string, staged)
-                if (read.length === 1) keepLibraryObject(key, { object: object.slice(), stdout: unitStdout, stderr: unitStderr })
+            if (
+                key !== undefined &&
+                !CLOCK_MACRO.test(unitSource as string) &&
+                module.FS.analyzePath(DEPENDENCIES_PATH).exists
+            ) {
+                const read = parseDependencyList(
+                    module.FS.readFile(DEPENDENCIES_PATH, { encoding: 'utf8' }) as string,
+                    staged
+                )
+                if (read.length === 1)
+                    keepLibraryObject(key, {
+                        object: object.slice(),
+                        stdout: unitStdout,
+                        stderr: unitStderr
+                    })
             }
         }
 
@@ -250,13 +286,16 @@ export const nasmWasmAssembler: WasmAssembler = {
             stdout,
             stderr,
             units: ok ? assembled : [],
-            object: ok ? (assembled[0]?.object ?? null) : null,
+            object: ok ? (assembled[0]?.object ?? null) : null
         }
-    },
+    }
 }
 
 /** Assemble one instruction at its runtime address, for a debugger Poke. */
-export async function assembleInstruction(text: string, address: bigint): Promise<{ bytes: Uint8Array } | { error: string }> {
+export async function assembleInstruction(
+    text: string,
+    address: bigint
+): Promise<{ bytes: Uint8Array } | { error: string }> {
     if (!text.trim() || /[\r\n]/.test(text)) return { error: 'Enter one instruction' }
     if (address < 0n || address > 0xffffffffffffffffn) return { error: 'Invalid x86-64 address' }
     // NASM treats an absolute numeric target as near even at -Ox. Prefer the
@@ -267,10 +306,12 @@ export async function assembleInstruction(text: string, address: bigint): Promis
         if (delta >= -128n && delta <= 127n) text = `${branch[1]} short ${branch[2]}`
     }
     const { module, stderr } = await createNasmModule()
-    module.FS.writeFile('/instruction.asm' , `bits 64\norg 0x${address.toString(16)}\n${text}\n`)
+    module.FS.writeFile('/instruction.asm', `bits 64\norg 0x${address.toString(16)}\n${text}\n`)
     const status = callNasm(module, ['-Ox', '-fbin', '/instruction.asm', '-o', '/instruction.bin'])
-    if (status !== 0) return { error: stderr().trim().split('\n')[0] || 'The instruction did not assemble' }
+    if (status !== 0)
+        return { error: stderr().trim().split('\n')[0] || 'The instruction did not assemble' }
     const bytes = Uint8Array.from(module.FS.readFile('/instruction.bin') as Uint8Array)
-    if (!bytes.length) return { error: stderr().trim().split('\n')[0] || 'The text did not encode an instruction' }
+    if (!bytes.length)
+        return { error: stderr().trim().split('\n')[0] || 'The text did not encode an instruction' }
     return { bytes }
 }

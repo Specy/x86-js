@@ -384,5 +384,5 @@ export const LINUX_SYSCALL_NAMES: Readonly<Record<number, string>> = {
     468: 'file_getattr',
     469: 'file_setattr',
     470: 'listns',
-    471: 'rseq_slice_yield',
+    471: 'rseq_slice_yield'
 }

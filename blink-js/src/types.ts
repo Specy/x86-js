@@ -37,7 +37,14 @@ export enum BlinkState {
 }
 
 export type StopReasonKind =
-    'exit' | 'signal' | 'input' | 'wait' | 'limit' | 'breakpoint' | 'load-fail' | 'host-error'
+    | 'exit'
+    | 'signal'
+    | 'input'
+    | 'wait'
+    | 'limit'
+    | 'breakpoint'
+    | 'load-fail'
+    | 'host-error'
 
 /** A signal that ended the program, as Linux describes it. */
 export type X86SignalInfo = {

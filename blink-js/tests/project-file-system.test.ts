@@ -1318,35 +1318,54 @@ it('protects the running Executable while preserving readable bytes and other wr
         emulator.mountProjectFileSystem(session)
         emulator.initialize(0)
         let output = ''
-        emulator.on('stdout', bytes => { output += new TextDecoder().decode(bytes) })
+        emulator.on('stdout', (bytes) => {
+            output += new TextDecoder().decode(bytes)
+        })
         await emulator.run(1_000_000)
         expect(output).toBe('open=-1 errno=26\nunlink=-1 errno=16\nrename=-1 errno=16\n')
         expect(emulator.stopReason).toMatchObject({ kind: 'exit', exitCode: 0 })
         expect(session.files.get('self-write')).toEqual(bytes)
         expect(session.files.has('renamed')).toBe(false)
-    } finally { emulator.dispose() }
+    } finally {
+        emulator.dispose()
+    }
 })
 
 it('allows reading the Executable and writing other Files, rejecting truncation and rename replacement', async () => {
     const session = new Session()
     session.files.set('data.txt', Uint8Array.of(0x7f, 0x45, 0x4c, 0x46))
     session.files.set('renamed.txt', Uint8Array.of(1, 2, 3))
-    const { emulator, bytes } = await mounted([
-        'sys 2,path,0,0', 'mov r12,rax',
-        'sys 0,r12,buf,4', 'save', 'saved buf',
-        'sys 3,r12',
-        'sys 2,path,512,0', 'save',
-        'sys 76,path,0', 'save',
-        'sys 82,other,path', 'save',
-        'sys 2,other,1,0', 'mov r12,rax',
-        'sys 1,r12,payload,3', 'save',
-        'finish', ...PATHS,
-    ], session, 0)
+    const { emulator, bytes } = await mounted(
+        [
+            'sys 2,path,0,0',
+            'mov r12,rax',
+            'sys 0,r12,buf,4',
+            'save',
+            'saved buf',
+            'sys 3,r12',
+            'sys 2,path,512,0',
+            'save',
+            'sys 76,path,0',
+            'save',
+            'sys 82,other,path',
+            'save',
+            'sys 2,other,1,0',
+            'mov r12,rax',
+            'sys 1,r12,payload,3',
+            'save',
+            'finish',
+            ...PATHS
+        ],
+        session,
+        0
+    )
     try {
         emulator.setProtectedPath('/project/data.txt')
         await emulator.run()
         expect(quadwords(Uint8Array.from(bytes))).toEqual([4n, 0x464c457fn, -26n, -26n, -16n, 3n])
         expect(session.files.get('data.txt')).toEqual(Uint8Array.of(0x7f, 0x45, 0x4c, 0x46))
         expect(session.files.get('renamed.txt')).toEqual(Uint8Array.of(97, 98, 99))
-    } finally { emulator.dispose() }
+    } finally {
+        emulator.dispose()
+    }
 })

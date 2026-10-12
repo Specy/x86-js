@@ -14,7 +14,11 @@ import { analyze } from './elf'
 import { disassemble } from './disassembler'
 import { LINUX_SYSCALL_NAMES } from './syscall-names'
 import type { X86LoadedObject } from './types'
-import { resolveLinuxLibraries, validateProgramArguments, X86_PROGRAM_ENVIRONMENT } from './linux-runtime'
+import {
+    resolveLinuxLibraries,
+    validateProgramArguments,
+    X86_PROGRAM_ENVIRONMENT
+} from './linux-runtime'
 import type { X86ExecutableInfo, X86ExecutableOptions } from './types'
 import { parseSourceMap, type SourceMap } from './source-map'
 import {
@@ -23,8 +27,18 @@ import {
     X86_PROJECT_ROOT,
     x86ProjectSourcePath
 } from './project'
-import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols, readElfSymbolTable } from './elf-symbols'
-import { captureFileSystemSkeleton, resetFileSystem, X86_WORKING_DIRECTORY, type FileSystemSkeleton } from './file-system'
+import {
+    DEFAULT_ENTRY_SYMBOL,
+    findNearestSymbol,
+    readDefinedGlobalSymbols,
+    readElfSymbolTable
+} from './elf-symbols'
+import {
+    captureFileSystemSkeleton,
+    resetFileSystem,
+    X86_WORKING_DIRECTORY,
+    type FileSystemSkeleton
+} from './file-system'
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
 import {
     BlinkState,
@@ -265,8 +279,14 @@ export class BlinkRuntime {
         module._blinkenlib_set_deferred_disassembly?.(true)
 
         runtime = new BlinkRuntime(module, mode, callbacks, scheduler)
-        module.onUnimplementedSyscall = number => {
-            if (runtime?.programSources) observeCallbackResult(callbacks.unimplementedSyscall({ number, name: LINUX_SYSCALL_NAMES[number] ?? `syscall_${number}` }))
+        module.onUnimplementedSyscall = (number) => {
+            if (runtime?.programSources)
+                observeCallbackResult(
+                    callbacks.unimplementedSyscall({
+                        number,
+                        name: LINUX_SYSCALL_NAMES[number] ?? `syscall_${number}`
+                    })
+                )
         }
         runtime.environment = options.environment ?? {}
         await runtime.setMode(mode)
@@ -385,15 +405,26 @@ export class BlinkRuntime {
     private layoutUnits: { path: string; object: Uint8Array }[] = []
     private analyzeObject(bytes: Uint8Array) {
         let info = this.elfAnalyses.get(bytes)
-        if (!info) { info = analyze(bytes); this.elfAnalyses.set(bytes, info) }
+        if (!info) {
+            info = analyze(bytes)
+            this.elfAnalyses.set(bytes, info)
+        }
         return info
     }
     private programLoadBias(): bigint {
         if (!this.programBytes) return 0n
         const info = this.analyzeObject(this.programBytes)
-        const first = info.programHeaders.filter(header => header.type === 1).reduce((lowest, header) => header.address < lowest ? header.address : lowest, 0x7fffffffffffffffn) & ~4095n
+        const first =
+            info.programHeaders
+                .filter((header) => header.type === 1)
+                .reduce(
+                    (lowest, header) => (header.address < lowest ? header.address : lowest),
+                    0x7fffffffffffffffn
+                ) & ~4095n
         if (this.programSources && this.state !== BlinkState.ProgramLoaded) {
-            const map = this.module.blinkenlibGetFileMaps().find(map => map.path === PROGRAM && map.offset === 0n)
+            const map = this.module
+                .blinkenlibGetFileMaps()
+                .find((map) => map.path === PROGRAM && map.offset === 0n)
             if (map) return map.address - first
         }
         return info.pie && first === 0n ? 0x555555554000n : 0n
@@ -404,19 +435,32 @@ export class BlinkRuntime {
         const base = this.programLoadBias()
         if (base) {
             for (let i = 0; i < layout.items.length; i += 5) layout.items[i] += base
-            layout.symbols = layout.symbols.map(symbol => ({ ...symbol, address: symbol.address + base }))
+            layout.symbols = layout.symbols.map((symbol) => ({
+                ...symbol,
+                address: symbol.address + base
+            }))
         }
         return layout
     }
     resolveMemoryLabel(name: string): bigint | undefined {
-        const data = this.getMemoryLayout().symbols.find(symbol => symbol.name === name)
+        const data = this.getMemoryLayout().symbols.find((symbol) => symbol.name === name)
         if (data) return data.address
-        const symbol = this.programBytes ? this.analyzeObject(this.programBytes).symbols.find(symbol => symbol.name === name && symbol.sectionIndex !== 0) : undefined
+        const symbol = this.programBytes
+            ? this.analyzeObject(this.programBytes).symbols.find(
+                  (symbol) => symbol.name === name && symbol.sectionIndex !== 0
+              )
+            : undefined
         return symbol ? symbol.value + this.programLoadBias() : undefined
     }
-    getHeapBreak(): bigint { return this.module._blinkenlib_get_brk() }
-    getHeapStart(): bigint { return this.module._blinkenlib_get_brk_start() }
-    getStackTop(): bigint { return this.module._blinkenlib_get_stack_top() }
+    getHeapBreak(): bigint {
+        return this.module._blinkenlib_get_brk()
+    }
+    getHeapStart(): bigint {
+        return this.module._blinkenlib_get_brk_start()
+    }
+    getStackTop(): bigint {
+        return this.module._blinkenlib_get_stack_top()
+    }
 
     /**
      * The objects this build's assembler wrote, for the checks that read them
@@ -563,25 +607,43 @@ export class BlinkRuntime {
 
         const [entry, ...others] = assembled.units
         this.unitDiagnostics = duplicateUserDefinitions(assembled.units, sourceProject)
-        if (this.unitDiagnostics.length) { this.setState(BlinkState.Ready); return }
+        if (this.unitDiagnostics.length) {
+            this.setState(BlinkState.Ready)
+            return
+        }
         this.writeExecutableSync(ENTRY_OBJECT, entry!.object)
         const inputs = [ENTRY_OBJECT]
-        const starts = others.filter(unit => Object.hasOwn(sourceProject.startUnits ?? {}, unit.path))
+        const starts = others.filter((unit) =>
+            Object.hasOwn(sourceProject.startUnits ?? {}, unit.path)
+        )
         for (const [i, unit] of starts.entries()) {
             const object = `/start${i}.o`
             this.writeExecutableSync(object, unit.object)
             this.startObjectSources.set(object, `${X86_PROJECT_ROOT}/${unit.path}`)
             inputs.push(object)
         }
-        const members = others.filter(unit => !Object.hasOwn(sourceProject.startUnits ?? {}, unit.path))
-        this.archiveMembers = members.map(unit => unit.path)
-        const userMembers = members.filter(unit => Object.hasOwn(sourceProject.files, unit.path))
-        const support = members.filter(unit => Object.hasOwn(sourceProject.library ?? {}, unit.path))
-        for (const [archivePath, units] of [[UNIT_ARCHIVE, userMembers], ['/support.a', support]] as const) {
+        const members = others.filter(
+            (unit) => !Object.hasOwn(sourceProject.startUnits ?? {}, unit.path)
+        )
+        this.archiveMembers = members.map((unit) => unit.path)
+        const userMembers = members.filter((unit) => Object.hasOwn(sourceProject.files, unit.path))
+        const support = members.filter((unit) =>
+            Object.hasOwn(sourceProject.library ?? {}, unit.path)
+        )
+        for (const [archivePath, units] of [
+            [UNIT_ARCHIVE, userMembers],
+            ['/support.a', support]
+        ] as const) {
             if (!units.length) continue
-            this.writeExecutableSync(archivePath, writeArchive(units.map(unit => ({
-                name: archiveMemberName(members.indexOf(unit)), data: unit.object
-            }))))
+            this.writeExecutableSync(
+                archivePath,
+                writeArchive(
+                    units.map((unit) => ({
+                        name: archiveMemberName(members.indexOf(unit)),
+                        data: unit.object
+                    }))
+                )
+            )
             inputs.push(archivePath)
         }
         // A support member may reference a secondary user definition. Re-search archives for it.
@@ -590,17 +652,26 @@ export class BlinkRuntime {
         const mapped = userMembers.length > 0
         this.beginLinking()
         await defer()
-        this.runTool('/linker', this.mode.binaries.linker?.link(inputs).replace(
-            inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) + (mapped ? ' -Map /program.map' : ''))
-        await this.waitForState(state => state !== BlinkState.Linking)
+        this.runTool(
+            '/linker',
+            this.mode.binaries.linker
+                ?.link(inputs)
+                .replace(inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) +
+                (mapped ? ' -Map /program.map' : '')
+        )
+        await this.waitForState((state) => state !== BlinkState.Linking)
         if (mapped && this.state === BlinkState.ProgramLoaded) {
             const map = this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string
             for (const unit of userMembers) {
                 const member = archiveMemberName(members.indexOf(unit))
-                if (!map.includes(`${UNIT_ARCHIVE}(${member})`)) this.unitDiagnostics.push({
-                    file: unit.path, line: 1, severity: 'hint', warningClass: 'not-linked',
-                    error: 'nothing refers to a symbol this File defines, so it is not part of the program'
-                })
+                if (!map.includes(`${UNIT_ARCHIVE}(${member})`))
+                    this.unitDiagnostics.push({
+                        file: unit.path,
+                        line: 1,
+                        severity: 'hint',
+                        warningClass: 'not-linked',
+                        error: 'nothing refers to a symbol this File defines, so it is not part of the program'
+                    })
             }
         }
     }
@@ -632,7 +703,10 @@ export class BlinkRuntime {
         }))
     }
 
-    async loadExecutable(data: ArrayBuffer | Uint8Array, options: X86ExecutableOptions = {}): Promise<X86ExecutableInfo> {
+    async loadExecutable(
+        data: ArrayBuffer | Uint8Array,
+        options: X86ExecutableOptions = {}
+    ): Promise<X86ExecutableInfo> {
         const bytes = data instanceof Uint8Array ? data.slice() : new Uint8Array(data.slice(0))
         const info = analyze(bytes)
         if (!info.supported) throw new Error(info.reason)
@@ -644,7 +718,12 @@ export class BlinkRuntime {
         if (options.argv0 !== undefined || options.arguments !== undefined)
             this.setProgramArguments(options.argv0 ?? '/program', options.arguments ?? [])
         if (options.protectedPath !== undefined) this.setProtectedPath(options.protectedPath)
-        return { pie: info.pie, interpreter: info.interpreter, needed: info.needed, missing: libraries.missing }
+        return {
+            pie: info.pie,
+            interpreter: info.interpreter,
+            needed: info.needed,
+            missing: libraries.missing
+        }
     }
 
     setProgramArguments(argv0: string, args: string[]): void {
@@ -653,9 +732,17 @@ export class BlinkRuntime {
     }
 
     setProtectedPath(path: string | null): void {
-        if (path !== null && (!path.startsWith('/project/') || path.includes('\0') || path.split('/').some(part => part === '.' || part === '..')))
+        if (
+            path !== null &&
+            (!path.startsWith('/project/') ||
+                path.includes('\0') ||
+                path.split('/').some((part) => part === '.' || part === '..'))
+        )
             throw new Error('The protected Executable must have an absolute /project path')
-        this.protectedPath = path === null ? null : '/project/' + path.slice('/project/'.length).split('/').filter(Boolean).join('/')
+        this.protectedPath =
+            path === null
+                ? null
+                : '/project/' + path.slice('/project/'.length).split('/').filter(Boolean).join('/')
     }
 
     loadElf(data: ArrayBuffer | Uint8Array): void {
@@ -1101,17 +1188,38 @@ export class BlinkRuntime {
     getLoadedObjects(): X86LoadedObject[] {
         if (!this.programSources || this.state === BlinkState.ProgramLoaded) return []
         const maps = this.module.blinkenlibGetFileMaps()
-        return maps.filter(map => map.offset === 0n).flatMap(map => {
-            const bytes = map.path === PROGRAM ? this.programBytes : this.systemFiles.get(map.path)
-            if (!bytes) return []
-            const info = this.analyzeObject(bytes)
-            const loads = info.programHeaders.filter(header => header.type === 1)
-            if (!loads.length) return []
-            const first = loads.reduce((lowest, header) => header.address < lowest ? header.address : lowest, loads[0].address) & ~4095n
-            const base = map.address - first
-            const end = loads.reduce((end, header) => header.address + header.memorySize > end ? header.address + header.memorySize : end, 0n)
-            return [{ path: map.path, soname: info.soname, base, end: base + ((end + 4095n) & ~4095n) }]
-        }).sort((a,b) => a.base < b.base ? -1 : a.base > b.base ? 1 : 0)
+        return maps
+            .filter((map) => map.offset === 0n)
+            .flatMap((map) => {
+                const bytes =
+                    map.path === PROGRAM ? this.programBytes : this.systemFiles.get(map.path)
+                if (!bytes) return []
+                const info = this.analyzeObject(bytes)
+                const loads = info.programHeaders.filter((header) => header.type === 1)
+                if (!loads.length) return []
+                const first =
+                    loads.reduce(
+                        (lowest, header) => (header.address < lowest ? header.address : lowest),
+                        loads[0].address
+                    ) & ~4095n
+                const base = map.address - first
+                const end = loads.reduce(
+                    (end, header) =>
+                        header.address + header.memorySize > end
+                            ? header.address + header.memorySize
+                            : end,
+                    0n
+                )
+                return [
+                    {
+                        path: map.path,
+                        soname: info.soname,
+                        base,
+                        end: base + ((end + 4095n) & ~4095n)
+                    }
+                ]
+            })
+            .sort((a, b) => (a.base < b.base ? -1 : a.base > b.base ? 1 : 0))
     }
 
     getLoadedObjectBytes(path: string): Uint8Array | null {
@@ -1228,7 +1336,11 @@ export class BlinkRuntime {
             }
             if (this.programBytes) this.writeExecutableSync(PROGRAM, this.programBytes)
             this.setEmulationArgs(PROGRAM, this.defaultArgc, this.defaultArgv)
-            if (!this.module.blinkenlibSetProgramArguments(this.programArgv, [...X86_PROGRAM_ENVIRONMENT]))
+            if (
+                !this.module.blinkenlibSetProgramArguments(this.programArgv, [
+                    ...X86_PROGRAM_ENVIRONMENT
+                ])
+            )
                 throw new Error('Arguments exceed the native process limits')
             this.module._blinkenlib_starti()
             this.checkHostError()
@@ -1264,8 +1376,10 @@ export class BlinkRuntime {
         this.detachProjectFileSystem()
         if (capability) {
             this.module.FS.mkdirTree(X86_WORKING_DIRECTORY)
-            this.projectMount = new ProjectFileSystemMount(this.module, capability, () =>
-                this.getCurrentInstructionSerial(),
+            this.projectMount = new ProjectFileSystemMount(
+                this.module,
+                capability,
+                () => this.getCurrentInstructionSerial(),
                 () => this.protectedPath
             )
         }
@@ -1717,7 +1831,10 @@ function hostRandom(length: number): Uint8Array {
     return bytes
 }
 
-function duplicateUserDefinitions(units: readonly { path: string; object: Uint8Array }[], project: X86Project): X86CompilationDiagnostic[] {
+function duplicateUserDefinitions(
+    units: readonly { path: string; object: Uint8Array }[],
+    project: X86Project
+): X86CompilationDiagnostic[] {
     const definitions = new Map<string, string[]>()
     for (const unit of units) {
         if (!Object.hasOwn(project.files, unit.path)) continue
@@ -1728,7 +1845,14 @@ function duplicateUserDefinitions(units: readonly { path: string; object: Uint8A
             definitions.set(symbol.name, paths)
         }
     }
-    return [...definitions].flatMap(([name, files]) => files.length < 2 ? [] : files.map(file => ({
-        file, line: 1, severity: 'error' as const, error: `multiple definition of '${name}'`
-    })))
+    return [...definitions].flatMap(([name, files]) =>
+        files.length < 2
+            ? []
+            : files.map((file) => ({
+                  file,
+                  line: 1,
+                  severity: 'error' as const,
+                  error: `multiple definition of '${name}'`
+              }))
+    )
 }

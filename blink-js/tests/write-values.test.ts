@@ -3,7 +3,7 @@ import { RegisterSize, type MutationOperation } from '../src/interface'
 import {
     createX86Emulator as createDefaultX86Emulator,
     type X86Emulator,
-    type X86EmulatorOptions,
+    type X86EmulatorOptions
 } from '../src/x86-emulator'
 import type { BlinkenlibModule } from '../src/wasm-types'
 import { isShadowAddress } from '../src/blink-runtime'
@@ -23,7 +23,7 @@ async function startedEmulator(source: string, undoSize = 32, steps = 0): Promis
 /** The newest entry's WriteRegister mutations, by register name. */
 function registerWrites(
     emulator: X86Emulator,
-    back = 0,
+    back = 0
 ): Map<string, { old: bigint; new: bigint; size: RegisterSize }> {
     const mutations = emulator.getUndoHistory(back + 1)[back]?.mutations ?? []
     const writes = new Map<string, { old: bigint; new: bigint; size: RegisterSize }>()
@@ -37,7 +37,7 @@ function registerWrites(
 function memoryWrites(emulator: X86Emulator, back = 0) {
     const mutations = emulator.getUndoHistory(back + 1)[back]?.mutations ?? []
     return mutations.flatMap((mutation) =>
-        mutation.type === 'WriteMemoryBytes' ? [mutation.value] : [],
+        mutation.type === 'WriteMemoryBytes' ? [mutation.value] : []
     )
 }
 
@@ -92,7 +92,7 @@ function countBridgeCalls(emulator: X86Emulator) {
             emulator.runtime.getRegisterSnapshot = snapshot
             emulator.runtime.getFpuStateRaw = fpu
             module._blinkenlib_spy_address = spy
-        },
+        }
     }
 }
 
@@ -124,7 +124,7 @@ describe('every write reports the value it wrote', () => {
             register: 'rax',
             old: 0n,
             new: 0x1122334455667788n,
-            size: RegisterSize.Double,
+            size: RegisterSize.Double
         })
 
         // mov $0xff, %al writes ONE byte, and the entry still reports the whole
@@ -135,7 +135,7 @@ describe('every write reports the value it wrote', () => {
             register: 'rax',
             old: 0x1122334455667788n,
             new: 0x11223344556677ffn,
-            size: RegisterSize.Double,
+            size: RegisterSize.Double
         })
         expect(emulator.getRegisterValue('rax')).toBe(byteWrite!.new)
 
@@ -146,13 +146,13 @@ describe('every write reports the value it wrote', () => {
         const emulator = await startedEmulator(SIZED_WRITES, 32, 3)
         const buffer = emulator.getRegisterValue('rbx')
         expect([...emulator.readMemoryBytes(buffer, 8n)]).toEqual([
-            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11
         ])
 
         // A two-byte store reports two bytes: the width of the write, not of the register.
         await emulator.step()
         expect(memoryWrites(emulator)).toEqual([
-            { address: buffer, old: [0x88, 0x77], new: [0xef, 0xbe] },
+            { address: buffer, old: [0x88, 0x77], new: [0xef, 0xbe] }
         ])
         expect([...emulator.readMemoryBytes(buffer, 2n)]).toEqual([0xef, 0xbe])
 
@@ -189,7 +189,7 @@ _start:
   syscall
 `,
             32,
-            2,
+            2
         )
 
         // movq %rax, %xmm0 puts 4.0 in lane 0 and zeroes the rest.
@@ -197,7 +197,7 @@ _start:
             register: 'xmm0',
             old: 0n,
             new: 0x4010000000000000n,
-            size: RegisterSize.Quad,
+            size: RegisterSize.Quad
         })
 
         // addsd doubles it to 8.0.
@@ -206,7 +206,7 @@ _start:
             register: 'xmm0',
             old: 0x4010000000000000n,
             new: 0x4020000000000000n,
-            size: RegisterSize.Quad,
+            size: RegisterSize.Quad
         })
         expect(emulator.getFpuState().xmm[0]).toBe(0x4020000000000000n)
 
@@ -221,7 +221,7 @@ _start:
             register: 'st0',
             old: doubleBits(1),
             new: doubleBits(2),
-            size: RegisterSize.Double,
+            size: RegisterSize.Double
         })
         expect(x87.get('fstat')?.old).toBe(BigInt(statusBeforeAdd))
         expect(x87.get('fstat')?.new).toBe(BigInt(emulator.getFpuState().fstat))
@@ -244,7 +244,7 @@ target:
   ret
 `,
             32,
-            1,
+            1
         )
 
         // x86 reports control flow as the entry's own pc and a call-stack
@@ -257,7 +257,9 @@ target:
         // The one place a program counter change IS a write is a Poke of rip,
         // and that reports the address it put there next to the one it replaced.
         const pcBefore = emulator.getPc()
-        const target = emulator.getCompiledInstructions().find((instruction) => instruction.address !== pcBefore)!
+        const target = emulator
+            .getCompiledInstructions()
+            .find((instruction) => instruction.address !== pcBefore)!
         emulator.beginPoke()
         emulator.setRegisterValue('rip', target.address)
         expect(emulator.endPoke()).toBe(true)
@@ -266,7 +268,7 @@ target:
             register: 'rip',
             old: pcBefore,
             new: target.address,
-            size: RegisterSize.Double,
+            size: RegisterSize.Double
         })
 
         emulator.undo()
@@ -320,7 +322,9 @@ describe('a store into a page the machine has not touched yet', () => {
         const stored = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
 
         await emulator.step()
-        expect(memoryWrites(emulator)).toEqual([{ address: buffer, old: new Array(8).fill(0), new: stored }])
+        expect(memoryWrites(emulator)).toEqual([
+            { address: buffer, old: new Array(8).fill(0), new: stored }
+        ])
         expect(emulator.canUndo()).toBe(true)
 
         // The very same instruction over the now-resident page.
@@ -355,7 +359,7 @@ _start:
   syscall
 `,
             32,
-            3,
+            3
         )
         const area = emulator.getRegisterValue('rdi')
 
@@ -363,7 +367,7 @@ _start:
         const entry = emulator.getUndoHistory(1)[0]!
         expect(entry.mutations).toContainEqual({
             type: 'Other',
-            value: `Wrote 100000 bytes to 0x${area.toString(16)}`,
+            value: `Wrote 100000 bytes to 0x${area.toString(16)}`
         })
         expect(entry.mutations.some((mutation) => mutation.type === 'WriteMemoryBytes')).toBe(false)
         expect(emulator.canUndo()).toBe(false)
@@ -418,8 +422,8 @@ describe('the page lookup beside the bridge', () => {
                 {
                     address: buffer,
                     old: [1, 2, 3, 4, 5, 6, 7, 8],
-                    new: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
-                },
+                    new: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+                }
             ])
         } finally {
             module._blinkenlib_spy_address = spy
@@ -447,7 +451,7 @@ _start:
   syscall
 `,
             32,
-            1,
+            1
         )
 
         const allOnes = registerWrites(emulator).get('rax')!
@@ -477,7 +481,9 @@ _start:
             expect(byte).toBeGreaterThanOrEqual(0)
             expect(byte).toBeLessThanOrEqual(255)
         }
-        expect(write.new).toEqual([...emulator.readMemoryBytes(write.address, BigInt(write.new.length))])
+        expect(write.new).toEqual([
+            ...emulator.readMemoryBytes(write.address, BigInt(write.new.length))
+        ])
         emulator.dispose()
     })
 })
@@ -531,7 +537,7 @@ describe('the history shape stays additive', () => {
         const poke = history[0]!
         expect(poke.kind).toBe('poke')
         const pokedRegister = poke.writes!.find(
-            (write) => write.type === 'register' && write.name === 'rdx',
+            (write) => write.type === 'register' && write.name === 'rdx'
         )
         expect(pokedRegister).toEqual({ type: 'register', name: 'rdx', old: rdxBefore, new: 0x99n })
         const pokedMemory = poke.writes!.find((write) => write.type === 'memory')!
@@ -539,10 +545,10 @@ describe('the history shape stays additive', () => {
 
         // And the poke's mutations gained the field the same way an instruction's did.
         const pokedFpu = poke.mutations.find(
-            (mutation) => mutation.type === 'WriteRegister' && mutation.value.register === 'xmm4',
+            (mutation) => mutation.type === 'WriteRegister' && mutation.value.register === 'xmm4'
         )
         expect(pokedFpu && pokedFpu.type === 'WriteRegister' && pokedFpu.value.new).toBe(
-            (1n << 127n) | 5n,
+            (1n << 127n) | 5n
         )
         emulator.dispose()
     })
@@ -586,9 +592,11 @@ describe('recording both sides costs JavaScript nothing per step', () => {
 
             // Both sides of every store are in the history all the same.
             expect(memoryWrites(emulator, 2)).toEqual([
-                { address: buffer, old: [0x88, 0x77], new: [0xef, 0xbe] },
+                { address: buffer, old: [0x88, 0x77], new: [0xef, 0xbe] }
             ])
-            expect(memoryWrites(emulator, 1)[0]!.new).toEqual([0xff, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11])
+            expect(memoryWrites(emulator, 1)[0]!.new).toEqual([
+                0xff, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11
+            ])
             expect(memoryWrites(emulator)).toEqual([])
         } finally {
             probe.restore()
@@ -632,11 +640,11 @@ _start:
   syscall
 `,
             32,
-            2,
+            2
         )
 
         expect(memoryWrites(emulator)).toEqual([
-            { address: emulator.getRegisterValue('rbx'), old: [0x01], new: [0xaa] },
+            { address: emulator.getRegisterValue('rbx'), old: [0x01], new: [0xaa] }
         ])
 
         await emulator.step()
