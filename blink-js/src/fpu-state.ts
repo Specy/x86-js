@@ -28,8 +28,10 @@ export const X86_FPU_STATE_CW_OFFSET = 336
 export const X86_FPU_STATE_IP_OFFSET = 340
 /** Byte offset of the last x87 data pointer, carried through untouched. */
 export const X86_FPU_STATE_DP_OFFSET = 348
+/** Byte offset of `ymmh[16][16]`, the upper 128 bits of `ymm0..ymm15`. */
+export const X86_FPU_STATE_YMMH_OFFSET = 356
 /** Total size in bytes of the block, matching `BLINKENLIB_FPU_STATE_SIZE`. */
-export const X86_FPU_STATE_SIZE = 356
+export const X86_FPU_STATE_SIZE = 612
 
 /**
  * The SSE register file in the order `decodeFpuState` returns it: `xmm[0]`
@@ -73,7 +75,31 @@ export const X86_X87_REGISTERS = [
     'ftag',
 ] as const
 
+/**
+ * The AVX register file: `ymm0` through `ymm15`, whose low halves are
+ * `xmm0..xmm15`. `X86FpuState.ymm` holds them in this order.
+ */
+export const X86_YMM_REGISTERS = [
+    'ymm0',
+    'ymm1',
+    'ymm2',
+    'ymm3',
+    'ymm4',
+    'ymm5',
+    'ymm6',
+    'ymm7',
+    'ymm8',
+    'ymm9',
+    'ymm10',
+    'ymm11',
+    'ymm12',
+    'ymm13',
+    'ymm14',
+    'ymm15',
+] as const
+
 export type X86SseRegisterName = (typeof X86_SSE_REGISTERS)[number]
+export type X86YmmRegisterName = (typeof X86_YMM_REGISTERS)[number]
 export type X86X87RegisterName = (typeof X86_X87_REGISTERS)[number]
 
 export type X86FpuState = {
@@ -82,6 +108,12 @@ export type X86FpuState = {
      * byte in memory, is the least significant part of the value.
      */
     xmm: bigint[]
+    /**
+     * `ymm0` through `ymm15` as unsigned 256-bit values: the matching `xmm` in
+     * the low 128 bits and the upper half above it. Writing `ymm` through
+     * `setFpuState` replaces both halves, and so wins over `xmm`.
+     */
+    ymm: bigint[]
     /** The SSE control and status register. */
     mxcsr: number
     /**
@@ -143,6 +175,14 @@ export function decodeFpuState(raw: Uint8Array): X86FpuState {
         xmm[index] = (high << 64n) | low
     }
 
+    const ymm: bigint[] = new Array(XMM_COUNT)
+    for (let index = 0; index < XMM_COUNT; index += 1) {
+        const offset = X86_FPU_STATE_YMMH_OFFSET + index * 16
+        const low = view.getBigUint64(offset, true)
+        const high = view.getBigUint64(offset + 8, true)
+        ymm[index] = (((high << 64n) | low) << 128n) | xmm[index]!
+    }
+
     const fstat = view.getUint32(X86_FPU_STATE_SW_OFFSET, true) & WORD_MASK
     const top = topOfStack(fstat)
     const st: number[] = new Array(ST_COUNT)
@@ -153,6 +193,7 @@ export function decodeFpuState(raw: Uint8Array): X86FpuState {
 
     return {
         xmm,
+        ymm,
         mxcsr: view.getUint32(X86_FPU_STATE_MXCSR_OFFSET, true) >>> 0,
         st,
         fctrl: view.getUint32(X86_FPU_STATE_CW_OFFSET, true) & WORD_MASK,
@@ -174,11 +215,21 @@ export function encodeFpuState(state: X86FpuState, base: Uint8Array): Uint8Array
     const raw = new Uint8Array(base)
     const view = viewOf(raw)
 
+    // A caller that changed `ymm` has changed both halves of the register; one that changed only
+    // `xmm` leaves the upper half as it was. When both moved, `ymm` wins.
+    const before = decodeFpuState(base)
     for (let index = 0; index < XMM_COUNT; index += 1) {
-        const value = BigInt.asUintN(128, state.xmm[index] ?? 0n)
+        const wide = BigInt.asUintN(256, state.ymm?.[index] ?? before.ymm[index]!)
+        const narrow = BigInt.asUintN(128, state.xmm[index] ?? 0n)
+        const wideChanged = wide !== before.ymm[index]
+        const value = wideChanged ? BigInt.asUintN(128, wide) : narrow
+        const high = wideChanged ? wide >> 128n : before.ymm[index]! >> 128n
         const offset = X86_FPU_STATE_XMM_OFFSET + index * 16
         view.setBigUint64(offset, value & LOW_64, true)
         view.setBigUint64(offset + 8, value >> 64n, true)
+        const upper = X86_FPU_STATE_YMMH_OFFSET + index * 16
+        view.setBigUint64(upper, high & LOW_64, true)
+        view.setBigUint64(upper + 8, high >> 64n, true)
     }
     view.setUint32(X86_FPU_STATE_MXCSR_OFFSET, state.mxcsr >>> 0, true)
 

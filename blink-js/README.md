@@ -85,6 +85,12 @@ const rax = emulator.getRegisterValue('rax')
 const bytes = emulator.readMemoryBytes(address, length)
 ```
 
+### Vector registers and instruction sets
+
+`getFpuState()` returns the SSE and x87 register files in one call. `xmm` holds `xmm0` to `xmm15` as 128-bit values and `ymm` holds `ymm0` to `ymm15` as 256-bit values, the matching `xmm` in the low half. `setFpuState()` writes both: change `ymm[n]` to set a whole register, or `xmm[n]` alone to keep the upper half. A step that writes a `ymm` register's upper half reports a `WriteRegister` of `ymm`*n* with the whole 256-bit value on both sides; a step that only changes the low half reports `xmm`*n*, as before. `X86_YMM_REGISTERS` names them.
+
+The emulator runs the x86-64 baseline, x87, SSE through SSE3 and SSSE3, and, VEX-encoded, AVX, AVX2, FMA3, F16C, BMI1, BMI2, AES-NI, PCLMULQDQ and the SSE4.1 and SSE4.2 instructions (including the string compares). It does not run AVX-512 (EVEX), which raises SIGILL. `CPUID` still reports only the baseline plus SSE3 and SSSE3, so a C library selects its SSE2 routines; a program built with `-mavx2` runs, because it uses the instructions without asking. A 256-bit access may be unaligned except for the aligned moves (`vmovaps`, `vmovdqa`, `vmovntdq` and relatives), and a vector instruction that faults leaves every register as it was. A signal frame holds the legacy `xmm` state only, so the upper halves are neither saved nor restored around a handler.
+
 ### Undo history and call stack
 
 Undo recording is opt-in. Call `initialize(undoSize)` after loading or compiling a program and before execution. `undoSize` is the maximum number of reversible instructions kept in history; internally this is a fixed-size circular buffer, so older entries are discarded when the buffer fills.

@@ -38,6 +38,7 @@ import { NativeHistory } from './native-history'
 import type { X86ProjectFileSystem } from './project-file-system'
 import {
     X86_SSE_REGISTERS,
+    X86_YMM_REGISTERS,
     X86_X87_REGISTERS,
     decodeFpuState,
     encodeFpuState,
@@ -888,7 +889,26 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const stateAfter = decodeFpuState(fpuAfter)
 
         for (let index = 0; index < stateBefore.xmm.length; index += 1) {
-            if (stateBefore.xmm[index] === stateAfter.xmm[index]) continue
+            if (stateBefore.ymm[index] === stateAfter.ymm[index]) continue
+            // an instruction that reaches the upper half writes the whole ymm register
+            if (stateBefore.ymm[index]! >> 128n !== stateAfter.ymm[index]! >> 128n) {
+                mutations.push({
+                    type: 'WriteRegister',
+                    value: {
+                        register: X86_YMM_REGISTERS[index]!,
+                        old: stateBefore.ymm[index]!,
+                        new: stateAfter.ymm[index]!,
+                        size: RegisterSize.Oct
+                    }
+                })
+                writes?.push({
+                    type: 'register',
+                    name: X86_YMM_REGISTERS[index]!,
+                    old: stateBefore.ymm[index]!,
+                    new: stateAfter.ymm[index]!
+                })
+                continue
+            }
             mutations.push({
                 type: 'WriteRegister',
                 value: {

@@ -78,6 +78,8 @@ static void ResetSse(struct Machine *m) {
   //         0b00000000000000000001111110000000
   m->mxcsr = 0x1f80;
   memset(m->xmm, 0, sizeof(m->xmm));
+  memset(m->ymmh, 0, sizeof(m->ymmh));
+  m->vexundo.active = false;
 }
 
 void ResetCpu(struct Machine *m) {

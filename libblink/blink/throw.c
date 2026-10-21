@@ -61,6 +61,7 @@ void DeliverSignalToUser(struct Machine *m, int sig, int code) {
 }
 
 void HaltMachine(struct Machine *m, int code) {
+  if (m->vexundo.active) UndoVex(m);
   SIG_LOGF("HaltMachine(%d) at %#" PRIx64, code, m->ip);
   switch ((m->trapno = code)) {
     case kMachineDivideError:

@@ -904,8 +904,12 @@ void blinkenlib_clear_input() {
 }
 
 _Static_assert(BLINKENLIB_FPU_STATE_SIZE ==
+                   BLINKENLIB_FPU_STATE_YMMH_OFFSET +
+                       sizeof(((struct Machine *)0)->ymmh),
+               "the fpu state block must end just past ymmh");
+_Static_assert(BLINKENLIB_FPU_STATE_YMMH_OFFSET ==
                    BLINKENLIB_FPU_STATE_DP_OFFSET + 8,
-               "the fpu state block must end just past dp");
+               "ymmh must follow dp");
 
 /*
  * The two bulk fields are copied by size rather than field by field, so the
@@ -937,6 +941,7 @@ bool blinkenlib_get_fpu_state(u8 *out) {
   int i;
   if (!m || !out) return false;
   memcpy(out + BLINKENLIB_FPU_STATE_XMM_OFFSET, m->xmm, sizeof(m->xmm));
+  memcpy(out + BLINKENLIB_FPU_STATE_YMMH_OFFSET, m->ymmh, sizeof(m->ymmh));
   Write32(out + BLINKENLIB_FPU_STATE_MXCSR_OFFSET, m->mxcsr);
 #ifndef DISABLE_X87
   for (i = 0; i < 8; ++i) {
@@ -977,6 +982,7 @@ bool blinkenlib_set_fpu_state(const u8 *in) {
   int i;
   if (!m || !in) return false;
   memcpy(m->xmm, in + BLINKENLIB_FPU_STATE_XMM_OFFSET, sizeof(m->xmm));
+  memcpy(m->ymmh, in + BLINKENLIB_FPU_STATE_YMMH_OFFSET, sizeof(m->ymmh));
   m->mxcsr = Read32(in + BLINKENLIB_FPU_STATE_MXCSR_OFFSET);
 #ifndef DISABLE_X87
   for (i = 0; i < 8; ++i) {

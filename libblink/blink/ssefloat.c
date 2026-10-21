@@ -107,7 +107,7 @@ void OpUnpckhpsd(P) {
   b = GetModrmRegisterXmmPointerRead16(A);
   IGNORE_RACES_START();
   if (Osz(rde)) {
-    memcpy(a + 0, b + 8, 8);
+    memcpy(a + 0, a + 8, 8);
     memcpy(a + 8, b + 8, 8);
   } else {
     memcpy(a + 4 * 0, a + 4 * 2, 4);
@@ -122,7 +122,7 @@ void OpPextrwGdqpUdqIb(P) {
   u8 i;
   i = uimm0;
   i &= Osz(rde) ? 7 : 3;
-  Put16(RegRexrReg(m, rde), Get16(XmmRexbRm(m, rde) + i * 2));
+  Put64(RegRexrReg(m, rde), Get16(XmmRexbRm(m, rde) + i * 2));
 }
 
 void OpPinsrwVdqEwIb(P) {
@@ -276,12 +276,12 @@ void OpSqrtpsd(P) {
       u8 *p;
       union DoublePun u[2];
       p = GetModrmRegisterXmmPointerRead16(A);
-      u[0].i = Read32(p + 0 * 8);
-      u[1].i = Read32(p + 1 * 8);
+      u[0].i = Read64(p + 0 * 8);
+      u[1].i = Read64(p + 1 * 8);
       for (i = 0; i < 2; ++i) u[i].f = sqrt(u[i].f);
       p = XmmRexrReg(m, rde);
-      Write32(p + 0 * 8, u[0].i);
-      Write32(p + 1 * 8, u[1].i);
+      Write64(p + 0 * 8, u[0].i);
+      Write64(p + 1 * 8, u[1].i);
       break;
     }
     case 2: {

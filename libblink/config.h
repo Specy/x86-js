@@ -28,6 +28,7 @@
 #define DISABLE_BCD
 #define DISABLE_ROM
 #define DISABLE_BMI2
+// #define DISABLE_VEX
 
 // #define HAVE_FORK
 #define HAVE_SYNC

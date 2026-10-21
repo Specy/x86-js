@@ -109,10 +109,10 @@ describe('glibc executables', () => {
         expect(output).toBe('ptrace=0 errno=0\nptrace=-1 errno=1\n')
         expect(stop?.kind).toBe('exit')
     })
-    it('reports the faulting address for unsupported AVX', async () => {
-        const { stop } = await runFixture('avx', ['1', '2', '3', '4', '5'])
-        expect(stop).toMatchObject({ kind: 'signal', signal: { name: 'SIGILL' } })
-        expect(stop?.address).toBeTypeOf('bigint')
+    it('runs AVX2 code', async () => {
+        const { output, stop } = await runFixture('avx', ['1', '2', '3', '4', '5'])
+        expect(output).toBe('value=12\n')
+        expect(stop).toMatchObject({ kind: 'exit', exitCode: 0 })
     })
 })
 

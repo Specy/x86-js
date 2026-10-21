@@ -2073,7 +2073,9 @@ static const nexgen32e_f kNexgen32e[] = {
 };
 
 nexgen32e_f GetOp(long op) {
-  if (op < ARRAYLEN(kNexgen32e)) {
+  if (op >= (XED_ILD_MAP1 | XED_VEX_MAP) << 8) {
+    return GetVexOp(op);
+  } else if (op < ARRAYLEN(kNexgen32e)) {
     return kNexgen32e[op];
   } else {
     switch (op) {

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- The emulator runs VEX-encoded instructions: AVX, AVX2, FMA3, F16C, BMI1,
+  BMI2, AES-NI, PCLMULQDQ and the SSE4.1 and SSE4.2 instructions (a legacy
+  encoding of those still raises SIGILL, as `CPUID` reports none of them). A
+  VEX instruction runs the legacy SSE handler for each 128-bit lane, or a
+  handler of its own where the lanes are not independent. AVX-512 is not
+  supported. Every VEX opcode, prefix, length, width and form was compared
+  with the host's answer on whether it runs.
+- The state block grew from 356 to 612 bytes: the upper halves of
+  `ymm0..ymm15` follow `dp`. `X86FpuState` has `ymm`, `X86_YMM_REGISTERS` names
+  them, and a step that writes an upper half reports a `ymmN` register write.
+- `unpckhpd` copied the wrong half into the low half of its destination;
+  `sqrtpd` read and wrote 32 bits of each double; float to integer conversions
+  (`cvtss2si`, `cvttsd2si`, `cvtps2dq`, `cvttpd2dq` and the rest) produced
+  saturated or undefined values instead of the integer indefinite for a NaN or
+  an out-of-range value, and `cvtss2si` ignored the rounding mode; `pextrw`
+  left the upper bits of its destination register alone.
 - A download (a bundled library, `nasm.wasm`, a blink-hosted tool) reads its
   body as it arrives and throws a `ResourceDownloadError` naming the resource
   when the request fails, the server answers with an error status, or nothing

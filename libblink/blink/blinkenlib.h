@@ -172,6 +172,7 @@ bool blinkenlib_get_syscall(u32 index, u32 *number, u32 *arity,
  *      336     4  fpu.cw   (x87 control word)
  *      340     8  fpu.ip   (last x87 instruction pointer)
  *      348     8  fpu.dp   (last x87 data pointer)
+ *      356   256  ymmh[16][16], the upper 128 bits of ymm0..ymm15, 16 bytes each
  *
  * st[] is stored in PHYSICAL order, exactly as struct MachineFpu holds it.
  * The logical stack register st(i) the programmer sees lives at
@@ -188,7 +189,8 @@ bool blinkenlib_get_syscall(u32 index, u32 *number, u32 *arity,
 #define BLINKENLIB_FPU_STATE_CW_OFFSET    336
 #define BLINKENLIB_FPU_STATE_IP_OFFSET    340
 #define BLINKENLIB_FPU_STATE_DP_OFFSET    348
-#define BLINKENLIB_FPU_STATE_SIZE         356
+#define BLINKENLIB_FPU_STATE_YMMH_OFFSET  356
+#define BLINKENLIB_FPU_STATE_SIZE         612
 
 bool blinkenlib_get_fpu_state(u8 *out);
 bool blinkenlib_set_fpu_state(const u8 *in);

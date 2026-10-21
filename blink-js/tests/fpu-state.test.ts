@@ -15,6 +15,7 @@ import {
     X86_FPU_STATE_SW_OFFSET,
     X86_FPU_STATE_TW_OFFSET,
     X86_FPU_STATE_XMM_OFFSET,
+    X86_FPU_STATE_YMMH_OFFSET,
     X86_SSE_REGISTERS,
     X86_X87_REGISTERS,
     decodeFpuState,
@@ -35,6 +36,10 @@ function makeBlock(options: { top?: number } = {}): Uint8Array {
         view.setBigUint64(X86_FPU_STATE_XMM_OFFSET + index * 16, BigInt(index + 1), true)
         view.setBigUint64(X86_FPU_STATE_XMM_OFFSET + index * 16 + 8, BigInt(index + 1) << 56n, true)
     }
+    for (let index = 0; index < 16; index += 1) {
+        view.setBigUint64(X86_FPU_STATE_YMMH_OFFSET + index * 16, BigInt(index + 100), true)
+        view.setBigUint64(X86_FPU_STATE_YMMH_OFFSET + index * 16 + 8, BigInt(index + 200), true)
+    }
     view.setUint32(X86_FPU_STATE_MXCSR_OFFSET, 0x1f80, true)
     for (let physical = 0; physical < 8; physical += 1) {
         view.setFloat64(X86_FPU_STATE_ST_OFFSET + physical * 8, physical + 1, true)
@@ -49,6 +54,22 @@ function makeBlock(options: { top?: number } = {}): Uint8Array {
 }
 
 describe('x86 FPU state block', () => {
+    it('reads each ymm register as its xmm register with the upper half above it', () => {
+        const state = decodeFpuState(makeBlock())
+        expect(state.ymm[3]).toBe((((203n << 64n) | 103n) << 128n) | state.xmm[3]!)
+        expect(state.ymm[15]! >> 128n).toBe((215n << 64n) | 115n)
+    })
+    it('writes ymm over both halves and xmm over the lower half only', () => {
+        const base = makeBlock()
+        const state = decodeFpuState(base)
+        state.xmm[2] = 5n
+        expect(decodeFpuState(encodeFpuState(state, base)).ymm[2]! >> 128n).toBe(state.ymm[2]! >> 128n)
+        const wide = decodeFpuState(base)
+        wide.ymm[2] = (9n << 128n) | 5n
+        const rewritten = decodeFpuState(encodeFpuState(wide, base))
+        expect(rewritten.xmm[2]).toBe(5n)
+        expect(rewritten.ymm[2]).toBe((9n << 128n) | 5n)
+    })
     it('names the SSE and x87 registers in the order the decoded values come in', () => {
         expect(X86_SSE_REGISTERS).toHaveLength(17)
         expect(X86_SSE_REGISTERS[0]).toBe('xmm0')
@@ -155,8 +176,8 @@ describe('x86 FPU state block', () => {
     })
 
     it('rejects a block that is not the documented size', () => {
-        expect(() => decodeFpuState(new Uint8Array(8))).toThrow(/356 bytes/)
-        expect(() => encodeFpuState(decodeFpuState(makeBlock()), new Uint8Array(8))).toThrow(/356 bytes/)
+        expect(() => decodeFpuState(new Uint8Array(8))).toThrow(/612 bytes/)
+        expect(() => encodeFpuState(decodeFpuState(makeBlock()), new Uint8Array(8))).toThrow(/612 bytes/)
         expect(fpuStateBlocksEqual(new Uint8Array(8), makeBlock())).toBe(false)
     })
 })

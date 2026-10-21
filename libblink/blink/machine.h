@@ -216,6 +216,17 @@ struct DescriptorCache {
   u64 base;  // base linear address
 };
 
+// What a VEX instruction would leave half written if it faulted: the
+// destination and the scratch register its operands are rebound through.
+// HaltMachine() restores them, so a fault looks the same as on hardware.
+struct VexUndo {
+  bool active;
+  u8 count;
+  u8 reg[4];
+  u8 lo[4][16];
+  u8 hi[4][16];
+};
+
 struct MachineState {
   u64 ip;
   struct DescriptorCache cs;
@@ -422,6 +433,8 @@ struct Machine {               //
     };  //
   };  //
   _Alignas(16) u8 xmm[16][16];      // 128-BIT VECTOR REGISTER FILE
+  _Alignas(16) u8 ymmh[16][16];     // UPPER 128 BITS OF EACH YMM REGISTER
+  struct VexUndo vexundo;           // registers a VEX op restores if it faults
   struct XedDecodedInst *xedd;      // ->opcache->icache if non-jit
   i64 readaddr;                     // so tui can show memory reads
   i64 writeaddr;                    // so tui can show memory write
@@ -515,6 +528,9 @@ void ResetTlb(struct Machine *);
 void CollectGarbage(struct Machine *, size_t);
 void ResetInstructionCache(struct Machine *);
 nexgen32e_f GetOp(long);
+nexgen32e_f GetVexOp(long);
+nexgen32e_f GetVexNativeOp(long, u8 *);
+void UndoVex(struct Machine *);
 void LoadInstruction(struct Machine *, u64);
 int LoadInstruction2(struct Machine *, u64);
 void ExecuteInstruction(struct Machine *);

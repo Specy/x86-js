@@ -56,7 +56,9 @@ export enum RegisterSize {
     Long = 4,
     Double = 8,
     /** 16 bytes, the width of an SSE register. */
-    Quad = 16
+    Quad = 16,
+    /** 32 bytes, the width of an AVX register. */
+    Oct = 32
 }
 
 /**

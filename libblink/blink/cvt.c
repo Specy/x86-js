@@ -51,12 +51,23 @@ static double SseRoundDouble(struct Machine *m, double x) {
   }
 }
 
+// x86 answers a NaN, or a value the integer cannot hold, with the "integer
+// indefinite" (the most negative integer). C leaves that undefined and
+// WebAssembly saturates instead.
+static i32 ToI32(double x) {
+  return x >= -2147483648.0 && x < 2147483648.0 ? (i32)x : INT32_MIN;
+}
+
+static i64 ToI64(double x) {
+  return x >= -9223372036854775808.0 && x < 9223372036854775808.0 ? (i64)x
+                                                                  : INT64_MIN;
+}
+
 static void OpGdqpWssCvttss2si(P) {
   i64 n;
   union FloatPun f;
   f.i = Read32(GetModrmRegisterXmmPointerRead4(A));
-  n = f.f;
-  if (!Rexw(rde)) n &= 0xffffffff;
+  n = Rexw(rde) ? ToI64(f.f) : (u32)ToI32(f.f);
   Put64(RegRexrReg(m, rde), n);
 }
 
@@ -64,26 +75,27 @@ static void OpGdqpWsdCvttsd2si(P) {
   i64 n;
   union DoublePun d;
   d.i = Read64(GetModrmRegisterXmmPointerRead8(A));
-  n = d.f;
-  if (!Rexw(rde)) n &= 0xffffffff;
+  n = Rexw(rde) ? ToI64(d.f) : (u32)ToI32(d.f);
   Put64(RegRexrReg(m, rde), n);
 }
 
 static void OpGdqpWssCvtss2si(P) {
   i64 n;
+  double x;
   union FloatPun f;
   f.i = Read32(GetModrmRegisterXmmPointerRead4(A));
-  n = rintf(f.f);
-  if (!Rexw(rde)) n &= 0xffffffff;
+  x = SseRoundDouble(m, f.f);
+  n = Rexw(rde) ? ToI64(x) : (u32)ToI32(x);
   Put64(RegRexrReg(m, rde), n);
 }
 
 static void OpGdqpWsdCvtsd2si(P) {
   i64 n;
+  double x;
   union DoublePun d;
   d.i = Read64(GetModrmRegisterXmmPointerRead8(A));
-  n = SseRoundDouble(m, d.f);
-  if (!Rexw(rde)) n &= 0xffffffff;
+  x = SseRoundDouble(m, d.f);
+  n = Rexw(rde) ? ToI64(x) : (u32)ToI32(x);
   Put64(RegRexrReg(m, rde), n);
 }
 
@@ -323,10 +335,10 @@ static void OpVdqWpsCvttps2dq(P) {
   f[1].i = Read32(p + 1 * 4);
   f[2].i = Read32(p + 2 * 4);
   f[3].i = Read32(p + 3 * 4);
-  n[0] = f[0].f;
-  n[1] = f[1].f;
-  n[2] = f[2].f;
-  n[3] = f[3].f;
+  n[0] = ToI32(f[0].f);
+  n[1] = ToI32(f[1].f);
+  n[2] = ToI32(f[2].f);
+  n[3] = ToI32(f[3].f);
   Put32(XmmRexrReg(m, rde) + 0 * 4, n[0]);
   Put32(XmmRexrReg(m, rde) + 1 * 4, n[1]);
   Put32(XmmRexrReg(m, rde) + 2 * 4, n[2]);
@@ -343,22 +355,7 @@ static void OpVdqWpsCvtps2dq(P) {
   f[1].i = Read32(p + 1 * 4);
   f[2].i = Read32(p + 2 * 4);
   f[3].i = Read32(p + 3 * 4);
-  switch ((m->mxcsr & kMxcsrRc) >> 13) {
-    case 0:
-      for (i = 0; i < 4; ++i) n[i] = rintf(f[i].f);
-      break;
-    case 1:
-      for (i = 0; i < 4; ++i) n[i] = floorf(f[i].f);
-      break;
-    case 2:
-      for (i = 0; i < 4; ++i) n[i] = ceilf(f[i].f);
-      break;
-    case 3:
-      for (i = 0; i < 4; ++i) n[i] = truncf(f[i].f);
-      break;
-    default:
-      __builtin_unreachable();
-  }
+  for (i = 0; i < 4; ++i) n[i] = ToI32(SseRoundDouble(m, f[i].f));
   Put32(XmmRexrReg(m, rde) + 0 * 4, n[0]);
   Put32(XmmRexrReg(m, rde) + 1 * 4, n[1]);
   Put32(XmmRexrReg(m, rde) + 2 * 4, n[2]);
@@ -372,8 +369,8 @@ static void OpVdqWpdCvttpd2dq(P) {
   p = GetModrmRegisterXmmPointerRead16(A);
   d[0].i = Read64(p + 0);
   d[1].i = Read64(p + 8);
-  n[0] = d[0].f;
-  n[1] = d[1].f;
+  n[0] = ToI32(d[0].f);
+  n[1] = ToI32(d[1].f);
   Put32(XmmRexrReg(m, rde) + 0, n[0]);
   Put32(XmmRexrReg(m, rde) + 4, n[1]);
 }
@@ -386,7 +383,7 @@ static void OpVdqWpdCvtpd2dq(P) {
   p = GetModrmRegisterXmmPointerRead16(A);
   d[0].i = Read64(p + 0);
   d[1].i = Read64(p + 8);
-  for (i = 0; i < 2; ++i) n[i] = SseRoundDouble(m, d[i].f);
+  for (i = 0; i < 2; ++i) n[i] = ToI32(SseRoundDouble(m, d[i].f));
   Put32(XmmRexrReg(m, rde) + 0, n[0]);
   Put32(XmmRexrReg(m, rde) + 4, n[1]);
 }

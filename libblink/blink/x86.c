@@ -401,9 +401,35 @@ static void xed_set_vex_prefix(struct XedDecodedInst *x, unsigned prefix) {
   }
 }
 
-static int xed_vex_opcode_scanner(struct XedDecodedInst *x, int map) {
-  xed_set_mopcode(x, map << 8 | x->bytes[x->length]);
+// A VEX instruction is dispatched under its own opcode map (see XED_VEX_MAP).
+// No table indexed by Opmap() covers those, so the length decoder below states
+// what the tables would have said.
+// VEX map 1 opcodes that take an imm8: pshufd, the shift groups, cmpps, pinsrw,
+// pextrw, shufps and their relatives. Every map 3 opcode takes one.
+static int xed_vex_has_imm8(int map, int opcode) {
+  if (map == XED_ILD_MAP3) return 1;
+  if (map != XED_ILD_MAP1) return 0;
+  switch (opcode) {
+    case 0x70:
+    case 0x71:
+    case 0x72:
+    case 0x73:
+    case 0xC2:
+    case 0xC4:
+    case 0xC5:
+    case 0xC6:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+static int xed_vex_opcode_scanner(struct XedDecodedInst *x, int map,
+                                  int *imm_width) {
+  u8 opcode = x->bytes[x->length];
+  xed_set_mopcode(x, (map | XED_VEX_MAP) << 8 | opcode);
   x->op.pos_opcode = x->length++;
+  if (xed_vex_has_imm8(map, opcode)) *imm_width = xed_bytes2bits(1);
 #ifndef TINY
   if (Mode(x->op.rde) == XED_MODE_LONG && Rex(x->op.rde)) {
     return XED_ERROR_BAD_REX_PREFIX;
@@ -443,9 +469,6 @@ static int xed_vex_c4_scanner(struct XedDecodedInst *x, int *imm_width,
     ymm = !!(b2 & 4);
     xed_set_vex_prefix(x, b2 & 3);
     map = b1 & 31;
-    if ((b1 & 3) == XED_ILD_MAP3) {
-      *imm_width = xed_bytes2bits(1);
-    }
     x->op.rde |= (u64)vrex << 63 | rexx << 17 | rexb << 15 | rexb << 10 |
                  rexw << 6 | rexr << 3;
     x->op.rde |= ymm << 30;
@@ -453,14 +476,15 @@ static int xed_vex_c4_scanner(struct XedDecodedInst *x, int *imm_width,
     *vexvalid = 1;
     length += 2;
     x->length = length;
-    return xed_vex_opcode_scanner(x, map);
+    return xed_vex_opcode_scanner(x, map, imm_width);
   } else {
     x->length = length;
     return xed_too_short(x);
   }
 }
 
-static int xed_vex_c5_scanner(struct XedDecodedInst *x, int *vexvalid) {
+static int xed_vex_c5_scanner(struct XedDecodedInst *x, int *imm_width,
+                              int *vexvalid) {
   unsigned length, b;
   int rexr, ymm, vrex, vexdest210;
   length = x->length;
@@ -474,7 +498,7 @@ static int xed_vex_c5_scanner(struct XedDecodedInst *x, int *vexvalid) {
     // rex.r:         1-bit
     b = x->bytes[length];
     rexr = !(b & 128);
-    vrex = !!(b & 64);
+    vrex = !(b & 64);
     vexdest210 = (~b >> 3) & 7;
     ymm = (b >> 2) & 1;
     xed_set_vex_prefix(x, b & 3);
@@ -484,7 +508,7 @@ static int xed_vex_c5_scanner(struct XedDecodedInst *x, int *vexvalid) {
     *vexvalid = 1;
     length++;
     x->length = length;
-    return xed_vex_opcode_scanner(x, XED_ILD_MAP1);
+    return xed_vex_opcode_scanner(x, XED_ILD_MAP1, imm_width);
   } else {
     x->length = length;
     return xed_too_short(x);
@@ -496,7 +520,16 @@ static int xed_vex_scanner(struct XedDecodedInst *x, int *imm_width,
   if (Mode(x->op.rde) != XED_MODE_LONG) return 0;
   switch (x->bytes[x->length]) {
     case 0xC5:
-      return xed_vex_c5_scanner(x, vexvalid);
+    case 0xC4:
+      // 66, F2 and F3 before a VEX prefix are #UD; the prefix has its own pp.
+      if (Osz(x->op.rde) || Rep(x->op.rde)) return XED_ERROR_BAD_LEGACY_PREFIX;
+      break;
+    default:
+      return 0;
+  }
+  switch (x->bytes[x->length]) {
+    case 0xC5:
+      return xed_vex_c5_scanner(x, imm_width, vexvalid);
     case 0xC4:
       return xed_vex_c4_scanner(x, imm_width, vexvalid);
     default:
@@ -584,6 +617,8 @@ static u64 xed_read_number(u8 *p, size_t n, unsigned s) {
 static void xed_set_has_modrm(struct XedDecodedInst *x) {
   if (Opmap(x->op.rde) < ARRAYLEN(kXed.has_modrm_2d)) {
     x->op.has_modrm = kXed.has_modrm_2d[Opmap(x->op.rde)][Opcode(x->op.rde)];
+  } else if (Mopcode(x->op.rde) == ((XED_ILD_MAP1 | XED_VEX_MAP) << 8 | 0x77)) {
+    x->op.has_modrm = 0;  // vzeroupper, vzeroall
   } else {
     x->op.has_modrm = 1;
   }
@@ -728,7 +763,7 @@ static int xed_decode_instruction_length(struct XedDecodedInst *x) {
   int imm_width = 0;
   int disp_width = 0;
   if ((e = xed_prefix_scanner(x))) return e;
-#ifndef DISABLE_BMI2
+#ifndef DISABLE_VEX
   if ((e = xed_vex_scanner(x, &imm_width, &vexvalid))) return e;
 #endif
   if (!vexvalid && (e = xed_opcode_scanner(x, &imm_width))) return e;

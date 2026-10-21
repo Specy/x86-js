@@ -25,6 +25,9 @@
 #define XED_ILD_MAP2    2  // Core2+ 0x0F,0x38,...
 #define XED_ILD_MAP3    3  // Core2+ 0x0F,0x3A,...
 #define XED_ILD_MAP4    4
+// A VEX instruction is dispatched under the legacy opcode map it belongs to
+// (1, 2 or 3) with this bit added, so that 0f 58 as VEX is a different key.
+#define XED_VEX_MAP     4
 #define XED_ILD_MAP5    5
 #define XED_ILD_MAP6    6
 #define XED_ILD_BAD_MAP 7

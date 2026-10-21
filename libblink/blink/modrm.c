@@ -300,6 +300,11 @@ static u8 *GetVectorAddress(P, size_t n) {
     p = XmmRexbRm(m, rde);
   } else {
     v = ComputeAddress(A);
+    if (Opmap(rde) & XED_VEX_MAP) {
+      // VEX operands may be unaligned, apart from the aligned moves, which
+      // check for themselves, so one may straddle two pages
+      return ReserveAddress(m, v, n, false);
+    }
     SetReadAddr(m, v, n);
     if ((v & (n - 1)) || !(p = LookupAddress(m, v))) {
       ThrowSegmentationFault(m, v);
