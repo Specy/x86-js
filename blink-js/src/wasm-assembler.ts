@@ -1,9 +1,9 @@
 import createNasm from './wasm/nasm.mjs'
 import { loadDisassembler, type Disassembler } from './disassembler'
 import { selectX86Source, stageX86Project } from './project'
-import { readResourceBytes } from './resources'
+import { readResourceBytes, ResourceDownloadError } from './resources'
 import { parseDependencyList, x86TranslationUnitCandidates } from './translation-units'
-import type { X86Project } from './types'
+import type { X86BuildOptions, X86Project } from './types'
 import type { NasmModule } from './wasm/nasm.d.mts'
 
 /**
@@ -16,7 +16,8 @@ import type { NasmModule } from './wasm/nasm.d.mts'
  * linker expects them, so the linker can keep running inside blink unchanged.
  */
 export interface WasmAssembler {
-    assemble(project: X86Project): Promise<WasmAssemblyResult>
+    /** `onProgress` hears of a download of the assembler it waits for, then `assemble`. */
+    assemble(project: X86Project, options?: X86BuildOptions): Promise<WasmAssemblyResult>
 }
 
 /** One translation unit's object, and the Project File it was assembled from. */
@@ -56,19 +57,37 @@ const DEPENDENCIES_PATH = '/unit.d'
 const NASM_ARGS = ['-g', '-F', 'dwarf', '-felf64']
 
 const NASM_WASM = new URL('./wasm/nasm.wasm', import.meta.url)
+/** What a download of `nasm.wasm` is called in progress and in errors. */
+const NASM_RESOURCE = 'the assembler'
 let compiledNasm: Promise<WebAssembly.Module | null> | null = null
+/** Whether `compiledNasm` has its answer, so that nothing waits on a download any more. */
+let nasmReady = false
 
 /**
  * `nasm.wasm` compiled once for every instance. Left to itself, Emscripten compiles the 1.2MB
  * module again for each instance it creates, which for a Project with a Runtime library, hundreds
- * of units, cost more than assembling them. Null when the module cannot be loaded from here, and
- * each instance then loads its own as Emscripten would.
+ * of units, cost more than assembling them. Null when the module cannot be compiled from here, and
+ * each instance then loads its own as Emscripten would. A download that fails or stalls throws
+ * instead and is forgotten, so the next assembly downloads it again: Emscripten would wait on the
+ * same network with no limit.
  */
 function compiledNasmModule(): Promise<WebAssembly.Module | null> {
-    compiledNasm ??= readResourceBytes(NASM_WASM)
+    if (compiledNasm) return compiledNasm
+    const pending: Promise<WebAssembly.Module | null> = readResourceBytes(NASM_WASM, {
+        name: NASM_RESOURCE
+    })
         .then((bytes) => WebAssembly.compile(bytes as Uint8Array<ArrayBuffer>))
-        .catch(() => null)
-    return compiledNasm
+        .catch((error: unknown) => {
+            if (!(error instanceof ResourceDownloadError)) return null
+            if (compiledNasm === pending) compiledNasm = null
+            throw error
+        })
+        .then((module) => {
+            if (compiledNasm === pending) nasmReady = true
+            return module
+        })
+    compiledNasm = pending
+    return pending
 }
 
 async function createNasmModule(): Promise<{
@@ -207,7 +226,15 @@ function withLibraryUnit(project: X86Project, path: string): X86Project {
 }
 
 export const nasmWasmAssembler: WasmAssembler = {
-    async assemble(project: X86Project): Promise<WasmAssemblyResult> {
+    async assemble(
+        project: X86Project,
+        options: X86BuildOptions = {}
+    ): Promise<WasmAssemblyResult> {
+        if (!nasmReady) {
+            options.onProgress?.({ phase: 'download', resource: NASM_RESOURCE })
+            await compiledNasmModule()
+        }
+        options.onProgress?.({ phase: 'assemble' })
         const candidates = x86TranslationUnitCandidates(project)
         const included = await scanIncludedFiles(project, candidates)
         const [entry, ...others] = candidates.filter(

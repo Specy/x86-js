@@ -48,12 +48,14 @@ import {
     X86EnvironmentError,
     type StopReason,
     type X86CompilationDiagnostic,
+    type X86BuildOptions,
     type X86CompileResult,
     type X86ImplementedSyscall,
     type X86Input,
     type X86InputRequest,
     type X86WaitRequest,
     type X86Environment,
+    type X86Progress,
     type X86Project,
     type X86SourceLocation
 } from './types'
@@ -199,6 +201,8 @@ export class BlinkRuntime {
     private unitDiagnostics: X86CompilationDiagnostic[] = []
     /** What the linker said, kept apart from the assembler's log so `ld`'s own parser reads it. */
     private linkerLogs: string | null = null
+    /** The build in progress's `onProgress`, which hears nothing once another has superseded it. */
+    private buildProgress: ((progress: X86Progress) => void) | undefined
 
     private readonly defaultArgc = '/program'
     private readonly defaultArgv = ''
@@ -309,10 +313,18 @@ export class BlinkRuntime {
         this.setState(BlinkState.NotReady)
         this.tools.clear()
         if (this.mode.binaries.assembler) {
-            this.tools.set('/assembler', await readResourceBytes(this.mode.binaries.assembler.file))
+            this.tools.set(
+                '/assembler',
+                await readResourceBytes(this.mode.binaries.assembler.file, {
+                    name: 'the assembler'
+                })
+            )
         }
         if (this.mode.binaries.linker) {
-            this.tools.set('/linker', await readResourceBytes(this.mode.binaries.linker.file))
+            this.tools.set(
+                '/linker',
+                await readResourceBytes(this.mode.binaries.linker.file, { name: 'the linker' })
+            )
         }
         this.setState(BlinkState.Ready)
     }
@@ -321,8 +333,11 @@ export class BlinkRuntime {
         return this.compileProject({ entry: 'assembly.s', files: { 'assembly.s': code } })
     }
 
-    async compileProject(project: X86Project): Promise<X86CompileResult> {
-        return this.buildProject(project, { link: true })
+    async compileProject(
+        project: X86Project,
+        options: X86BuildOptions = {}
+    ): Promise<X86CompileResult> {
+        return this.buildProject(project, { link: true, onProgress: options.onProgress })
     }
 
     /**
@@ -356,7 +371,7 @@ export class BlinkRuntime {
 
     private async buildProject(
         project: X86Project,
-        options: { link: boolean }
+        options: { link: boolean } & X86BuildOptions
     ): Promise<X86CompileResult> {
         this.assertReadyForCompile()
         // Before anything changes, so that a Project the build cannot take leaves the previous
@@ -365,6 +380,12 @@ export class BlinkRuntime {
         // A later load or build supersedes this one: it stops at its next await (see
         // `throwIfSuperseded`), leaving the newer program as it is.
         const replacement = ++this.programReplacements
+        const onProgress = options.onProgress
+        this.buildProgress =
+            onProgress &&
+            ((progress) => {
+                if (replacement === this.programReplacements) onProgress(progress)
+            })
         this.detachProjectFileSystem()
         const sourceProject = copyX86Project(project)
         this.layoutUnits = []
@@ -396,8 +417,20 @@ export class BlinkRuntime {
             } else {
                 await this.assembleInBlink(sourceProject, replacement)
             }
+        } catch (error) {
+            // A build that throws part way, such as one whose assembler could not be downloaded,
+            // leaves no program, and the next build can start.
+            if (
+                replacement === this.programReplacements &&
+                (this.state === BlinkState.Assembling || this.state === BlinkState.Linking)
+            )
+                this.setState(BlinkState.Ready)
+            throw error
         } finally {
-            if (replacement === this.programReplacements) this.assembleOnly = false
+            if (replacement === this.programReplacements) {
+                this.assembleOnly = false
+                this.buildProgress = undefined
+            }
             this.module.FS.chdir('/')
         }
 
@@ -584,6 +617,7 @@ export class BlinkRuntime {
     private async assembleInBlink(sourceProject: X86Project, replacement: number): Promise<void> {
         stageX86Project(this.module.FS, sourceProject)
         this.setState(BlinkState.Assembling)
+        this.buildProgress?.({ phase: 'assemble' })
         await defer()
         this.throwIfSuperseded(replacement)
         this.runTool('/assembler', this.mode.binaries.assembler!.commands)
@@ -612,7 +646,9 @@ export class BlinkRuntime {
         replacement: number
     ): Promise<void> {
         this.setState(BlinkState.Assembling)
-        const assembled = await this.mode.wasmAssembler!.assemble(sourceProject)
+        const assembled = await this.mode.wasmAssembler!.assemble(sourceProject, {
+            onProgress: this.buildProgress
+        })
         this.throwIfSuperseded(replacement)
 
         // What the assembler said goes into the report, as a blink-hosted tool's does.
@@ -720,6 +756,7 @@ export class BlinkRuntime {
     private beginLinking(): void {
         this.linkerLogs = ''
         this.setState(BlinkState.Linking)
+        this.buildProgress?.({ phase: 'link' })
     }
 
     private collectAssemblerDiagnostics(): void {
@@ -757,11 +794,18 @@ export class BlinkRuntime {
         // Taken once the load's own checks pass and before anything is awaited: a later load or
         // build supersedes this one, whichever finishes first.
         const replacement = ++this.programReplacements
-        const libraries = await resolveLinuxLibraries(info.needed, info.interpreter)
+        const libraries = await resolveLinuxLibraries(
+            info.needed,
+            info.interpreter,
+            (progress) => {
+                if (replacement === this.programReplacements) options.onProgress?.(progress)
+            }
+        )
         if (replacement !== this.programReplacements)
             throw new Error(
                 'This load was superseded: another program was loaded or built while its libraries were fetched'
             )
+        options.onProgress?.({ phase: 'load' })
         this.loadElf(bytes)
         this.systemFiles = libraries.files
         if (options.argv0 !== undefined || options.arguments !== undefined)

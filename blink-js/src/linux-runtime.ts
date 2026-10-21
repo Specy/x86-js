@@ -1,5 +1,6 @@
 import { analyze } from './elf'
 import { readResourceBytes } from './resources'
+import type { X86Progress } from './types'
 
 const libraries = [
     {
@@ -29,9 +30,43 @@ const libraries = [
     }
 ] as const
 
-/** Each runtime retains only the libraries it needs; network fetches are shared. */
-const fetched = new Map<string, Promise<Uint8Array>>()
-export async function resolveLinuxLibraries(needed: string[], interpreter?: string) {
+type Library = (typeof libraries)[number]
+
+/**
+ * Each runtime retains only the libraries it needs; downloads, and the bytes they bring, are
+ * shared: a promise while its download goes on, the bytes once it is done.
+ */
+const fetched = new Map<string, Uint8Array | Promise<Uint8Array>>()
+
+function libraryBytes(library: Library): Uint8Array | Promise<Uint8Array> {
+    const known = fetched.get(library.soname)
+    if (known) return known
+    const promise: Promise<Uint8Array> = readResourceBytes(library.url, {
+        name: library.soname
+    }).then(
+        (bytes) => {
+            if (fetched.get(library.soname) === promise) fetched.set(library.soname, bytes)
+            return bytes
+        },
+        (error: unknown) => {
+            // forgotten, so that the next load downloads it again
+            if (fetched.get(library.soname) === promise) fetched.delete(library.soname)
+            throw error
+        }
+    )
+    fetched.set(library.soname, promise)
+    return promise
+}
+
+/**
+ * The bundled libraries a program needs, its interpreter's first, and what it needs that none of
+ * them is. `onProgress` hears of each one the load has to wait for.
+ */
+export async function resolveLinuxLibraries(
+    needed: string[],
+    interpreter?: string,
+    onProgress?: (progress: X86Progress) => void
+) {
     const files = new Map<string, Uint8Array>()
     const missing = new Set<string>()
     const visited = new Set<string>()
@@ -50,15 +85,11 @@ export async function resolveLinuxLibraries(needed: string[], interpreter?: stri
             missing.add(soname)
             continue
         }
-        let promise = fetched.get(soname)
-        if (!promise) {
-            promise = readResourceBytes(library.url)
-            fetched.set(soname, promise)
-            promise.catch(() => {
-                if (fetched.get(soname) === promise) fetched.delete(soname)
-            })
+        let bytes = libraryBytes(library)
+        if (bytes instanceof Promise) {
+            onProgress?.({ phase: 'download', resource: soname })
+            bytes = await bytes
         }
-        const bytes = await promise
         files.set(library.path, bytes)
         queue.push(...analyze(bytes).needed)
     }

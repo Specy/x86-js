@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- A download (a bundled library, `nasm.wasm`, a blink-hosted tool) reads its
+  body as it arrives and throws a `ResourceDownloadError` naming the resource
+  when the request fails, the server answers with an error status, or nothing
+  arrives for 20 s (`RESOURCE_STALL_TIMEOUT_MS`). `readResourceBytes` takes a
+  `name` for its errors.
+- A failed download of `nasm.wasm` ends the build and is forgotten, so the next
+  build downloads it again, instead of falling back to Emscripten's own loader,
+  which waited on the network with no limit. Libraries were already forgotten.
+- A build that throws part way leaves the runtime `Ready` rather than
+  `Assembling`, so the next build can start.
+- `loadExecutable` and `compileProject` take `onProgress`, told each `download`
+  they wait for, then `load`, or `assemble` and `link`; `WasmAssembler.assemble`
+  takes it too.
+
 ## 7.0.0
 
 The Linux memory layout changes for every program: PIEs start at

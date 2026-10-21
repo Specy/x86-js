@@ -583,6 +583,29 @@ read it, and is removed before the first instruction. `getLoadedObjectBytes(path
 returns a copy for inspection, which can be changed freely. Debugger addresses,
 `getMemoryLayout()` and `resolveMemoryLabel()` include the main program's bias.
 
+A library is downloaded the first time any load needs it, and NASM's
+`nasm.wasm` the first time anything is assembled. A download throws a
+`ResourceDownloadError` naming what it could not get when the request fails, the
+server answers with an error status, or nothing arrives for 20 seconds
+(`RESOURCE_STALL_TIMEOUT_MS`), however long the whole download takes, as in
+"Could not download libc.so.6: no data for 20 s". A failed download is forgotten,
+so the next load or build downloads it again. A build that throws this way leaves
+no program, and the next build can start.
+
+`onProgress` reports what a load or a build is waiting for: a `download` of a
+resource it lacks (a library by its soname, NASM as `the assembler`), then `load`
+once a load has its libraries, or `assemble` and `link` for a build. It hears
+nothing once a later load or build has superseded its own.
+
+```ts
+await emulator.loadExecutable(bytes, {
+    onProgress: (progress) => {
+        if (progress.phase === 'download') status(`Downloading ${progress.resource}…`)
+    }
+})
+await emulator.compileProject(project, { onProgress })
+```
+
 `loadExecutable` copies the bytes it is given (a Node `Buffer` too) and checks its
 options before it replaces the loaded program, so a load that throws leaves the
 previous one in place. A load is superseded by any later load or build that starts

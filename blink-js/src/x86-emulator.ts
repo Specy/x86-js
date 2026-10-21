@@ -24,9 +24,11 @@ import {
     type X86Input,
     type X86RegisterName,
     type X86Project,
+    type X86BuildOptions,
     type X86ExecutableInfo,
     type X86ExecutableOptions,
-    type X86ProcessStart
+    type X86ProcessStart,
+    type X86Progress
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
@@ -211,12 +213,17 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * the library's ahead of the rest, as a member of an archive from which `ld` takes a member
      * only for a symbol still undefined (see {@link X86Emulator.projectLinking}). A unit nothing
      * needs is assembled, and its mistakes reported, but left out of the program. Throws for a
-     * Project it cannot take, such as one whose library path is also a File's.
+     * Project it cannot take, such as one whose library path is also a File's, and with a
+     * `ResourceDownloadError` when the assembler could not be downloaded. `options.onProgress`
+     * hears of each phase as it starts (see {@link X86Progress}).
      */
-    async compileProject(project: X86Project): Promise<X86CompileResult> {
+    async compileProject(
+        project: X86Project,
+        options: X86BuildOptions = {}
+    ): Promise<X86CompileResult> {
         this.clearExecutionTrace()
         this.lastSourceCode = x86ProjectText(project, project.entry)
-        this.lastCompileResult = await this.runtime.compileProject(project)
+        this.lastCompileResult = await this.runtime.compileProject(project, options)
         return this.lastCompileResult
     }
 
@@ -250,6 +257,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.runtime.getProcessStart()
     }
 
+    /**
+     * Loads an ELF executable with the bundled libraries it needs, downloading each the first time
+     * any load needs it; throws a `ResourceDownloadError` for one that could not be downloaded.
+     * `options.onProgress` hears of each download it waits for, then `load`.
+     */
     async loadExecutable(
         data: ArrayBuffer | Uint8Array,
         options?: X86ExecutableOptions

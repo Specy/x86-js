@@ -260,7 +260,25 @@ export type X86ProcessStart = {
     path?: X86ProcessStartBytes
 }
 
-export type X86ExecutableOptions = {
+/**
+ * What a build or a load is doing, told to its `onProgress` as it moves on. `download` waits for a
+ * file the Core downloads the first time it needs it, which over a slow network is where the time
+ * goes: `resource` is what it is called, as a `ResourceDownloadError` names it, a Bundled library
+ * by its soname (`libc.so.6`) and NASM as `the assembler`. A build then reports `assemble` and
+ * `link`, and a load `load` once its libraries are at hand.
+ */
+export type X86Progress =
+    | { phase: 'download'; resource: string }
+    | { phase: 'assemble' }
+    | { phase: 'link' }
+    | { phase: 'load' }
+
+export type X86BuildOptions = {
+    /** Told each phase of this build or load as it starts; never after a later one supersedes it. */
+    onProgress?: (progress: X86Progress) => void
+}
+
+export type X86ExecutableOptions = X86BuildOptions & {
     argv0?: string
     arguments?: string[]
     protectedPath?: string | null
