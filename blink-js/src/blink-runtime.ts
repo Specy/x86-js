@@ -1974,8 +1974,15 @@ function copyX86Project(project: X86Project): X86Project {
     }
 }
 
+/**
+ * The host's time for a Linux clock, in milliseconds. The real-time clocks count from the same
+ * high-resolution source as the monotonic ones: `Date.now()` drops the fraction of a millisecond,
+ * so a deadline taken on CLOCK_REALTIME could fall up to a millisecond early on CLOCK_MONOTONIC.
+ */
 function hostNow(clock: number): number {
-    return clock === 0 || clock === 5 ? Date.now() : performance.now()
+    return clock === 0 || clock === 5
+        ? performance.timeOrigin + performance.now()
+        : performance.now()
 }
 function hostRandom(length: number): Uint8Array {
     const bytes = new Uint8Array(length)
