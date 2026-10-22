@@ -6,7 +6,7 @@ import type { BlinkenlibModule } from './wasm-types'
 import { makeFrameColor, toHistoryPc } from './x86-emulator-utils'
 
 /** The version of debughistory.c's packets this reader decodes. */
-const PACKET_VERSION = 1
+const PACKET_VERSION = 2
 
 type FpuMutations = (
     before: Uint8Array,

@@ -191,7 +191,8 @@ The features, `DISABLE_*`:
 | `DISABLE_ANCILLARY` | Control messages ride on sockets, which are off. |
 | `DISABLE_DISASSEMBLER`, `DISABLE_BACKTRACE`, `DISABLE_STRACE` | Crash reports and system call traces print to the host's stderr, which nothing reads in a browser; the debugger has its own disassembly. |
 | `DISABLE_METAL`, `DISABLE_BCD`, `DISABLE_ROM` | Real mode, ring 0, BCD arithmetic and the BIOS ROM, which a 64-bit Linux program never reaches. |
-| `DISABLE_MMX`, `DISABLE_BMI2` | Kept from the earlier configuration: MMX and BMI2 instructions raise SIGILL, and `cpuid` does not report them, as on a processor without them. |
+| `DISABLE_MMX` | Kept from the earlier configuration: every instruction on an MMX register raises SIGILL (`emms` runs and does nothing), although `cpuid` reports MMX as every x86-64 processor has it. |
+| `DISABLE_BMI2` | Kept from the earlier configuration: Blink's own BMI2 and ADX handlers are left out and `cpuid` reports neither. BMI1 and BMI2 run through the VEX handlers (`avx.c`, `avx2.c`), which `DISABLE_VEX` would leave out; `adcx` and `adox` raise SIGILL. |
 
 The host facilities, `HAVE_*`, turned on where Emscripten provides them faithfully:
 

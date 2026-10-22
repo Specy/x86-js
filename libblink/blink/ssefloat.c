@@ -120,6 +120,7 @@ void OpUnpckhpsd(P) {
 
 void OpPextrwGdqpUdqIb(P) {
   u8 i;
+  if (!Osz(rde)) RefuseMmx(m);
   i = uimm0;
   i &= Osz(rde) ? 7 : 3;
   Put64(RegRexrReg(m, rde), Get16(XmmRexbRm(m, rde) + i * 2));
@@ -127,6 +128,7 @@ void OpPextrwGdqpUdqIb(P) {
 
 void OpPinsrwVdqEwIb(P) {
   u8 i;
+  if (!Osz(rde)) RefuseMmx(m);
   i = uimm0;
   i &= Osz(rde) ? 7 : 3;
   IGNORE_RACES_START();
@@ -141,6 +143,7 @@ void OpShuffle(P) {
   IGNORE_RACES_START();
   switch (Rep(rde) | Osz(rde)) {
     case 0:
+      RefuseMmx(m);
       memcpy(q16, GetModrmRegisterXmmPointerRead8(A), 8);
       pshufw(q16, q16, uimm0);
       memcpy(XmmRexrReg(m, rde), q16, 8);

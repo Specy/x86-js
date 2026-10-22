@@ -102,7 +102,7 @@ static void MovdqaVdqWdq(P) {
 static void MovdqaWdqVdq(P) {
   u8 *dst;
   IGNORE_RACES_START();
-  dst = GetXmmAddress(A);
+  dst = GetXmmAddressWrite(A);
   if (!IsRomAddress(m, dst)) {
     memcpy(dst, XmmRexrReg(m, rde), 16);
   }
@@ -130,12 +130,14 @@ void OpMovntdqaVdqMdq(P) {
 }
 
 static void MovqPqQq(P) {
+  RefuseMmx(m);
   IGNORE_RACES_START();
   memcpy(MmReg(m, rde), GetModrmRegisterMmPointerRead8(A), 8);
   IGNORE_RACES_END();
 }
 
 static void MovqQqPq(P) {
+  RefuseMmx(m);
   IGNORE_RACES_START();
   memcpy(GetModrmRegisterMmPointerWrite8(A), MmReg(m, rde), 8);
   IGNORE_RACES_END();
@@ -163,12 +165,14 @@ static void MovdVdqEd(P) {
 }
 
 static void MovqPqEqp(P) {
+  RefuseMmx(m);
   IGNORE_RACES_START();
   memcpy(MmReg(m, rde), GetModrmRegisterWordPointerRead8(A), 8);
   IGNORE_RACES_END();
 }
 
 static void MovdPqEd(P) {
+  RefuseMmx(m);
   IGNORE_RACES_START();
   memcpy(MmReg(m, rde), GetModrmRegisterWordPointerRead4(A), 4);
   IGNORE_RACES_END();
@@ -196,6 +200,7 @@ static void MovqEqpVdq(P) {
 }
 
 static void MovdEdPq(P) {
+  RefuseMmx(m);
   if (IsModrmRegister(rde)) {
     Put64(RegRexbRm(m, rde), Read32(MmReg(m, rde)));
   } else {
@@ -206,12 +211,14 @@ static void MovdEdPq(P) {
 }
 
 static void MovqEqpPq(P) {
+  RefuseMmx(m);
   IGNORE_RACES_START();
   memcpy(GetModrmRegisterWordPointerWrite8(A), MmReg(m, rde), 8);
   IGNORE_RACES_END();
 }
 
 static void MovntqMqPq(P) {
+  RefuseMmx(m);
   IGNORE_RACES_START();
   memcpy(ComputeReserveAddressWrite8(A), MmReg(m, rde), 8);
   IGNORE_RACES_END();
@@ -374,11 +381,13 @@ static void MovqWqVq(P) {
 }
 
 static void Movq2dqVdqNq(P) {
+  RefuseMmx(m);
   memcpy(XmmRexrReg(m, rde), MmRm(m, rde), 8);
   memset(XmmRexrReg(m, rde) + 8, 0, 8);
 }
 
 static void Movdq2qPqUq(P) {
+  RefuseMmx(m);
   memcpy(MmReg(m, rde), XmmRexbRm(m, rde), 8);
 }
 
@@ -595,6 +604,7 @@ void OpMov0fD6(P) {
 }
 
 void OpPmovmskbGdqpNqUdq(P) {
+  if (!Osz(rde)) RefuseMmx(m);
   Put64(RegRexrReg(m, rde),
         pmovmskb(XmmRexbRm(m, rde)) & (Osz(rde) ? 0xffff : 0xff));
 }
@@ -604,6 +614,7 @@ void OpMaskMovDiXmmRegXmmRm(P) {
   u64 v;
   unsigned i, n;
   u8 *mem, b[16];
+  if (!Osz(rde)) RefuseMmx(m);
   v = AddressDi(A);
   n = Osz(rde) ? 16 : 8;
   mem = BeginStore(m, v, n, p, b);

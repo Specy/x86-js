@@ -1057,7 +1057,7 @@ static int ImplicitLength(const u8 *p, int n, bool word) {
 }
 
 static int ExplicitLength(i64 x, int n) {
-  if (x < 0) x = -(x == INT64_MIN ? INT64_MAX : x);
+  if (x < 0) x = x == INT64_MIN ? INT64_MAX : -x;
   return x > n ? n : x;
 }
 
@@ -1170,6 +1170,26 @@ static void OpStringCompare(P) {
 ////////////////////////////////////////////////////////////////////////////////
 // fused multiply-add
 
+// a * b + c rounded once. The C library's fmaf() rounds twice when the result
+// is a denormal float. The product of two floats is exact in a double, and the
+// sum is rounded to odd (its last bit set when it is inexact), which keeps
+// enough of the exact value for the one rounding to float to be right.
+static float FmaF32(float a, float b, float c) {
+  double p, s, t, e;
+  u64 bits;
+  p = (double)a * b;
+  s = p + c;
+  if (!isfinite(s)) return s;
+  t = s - p;
+  e = (p - (s - t)) + (c - t);
+  if (e != 0) {
+    memcpy(&bits, &s, 8);
+    if (!(bits & 1)) bits += (e > 0) == (s > 0) ? 1 : -1;
+    memcpy(&s, &bits, 8);
+  }
+  return s;
+}
+
 // vfmadd, vfmsub, vfnmadd, vfnmsub, vfmaddsub and vfmsubadd, in the 132, 213
 // and 231 orders. The low nibble of the opcode picks the operation and the high
 // nibble the order, after the operands are named dst, src2 (vvvv) and src3.
@@ -1244,7 +1264,7 @@ static void OpFma(P) {
         PutF32(out + i * 4, QuietF32(isnan(af) ? af : isnan(bf) ? bf : cf));
         continue;
       }
-      rf = fmaf(negate_product ? -af : af, bf, negate_addend ? -cf : cf);
+      rf = FmaF32(negate_product ? -af : af, bf, negate_addend ? -cf : cf);
       if (isnan(rf)) Write32(out + i * 4, 0xffc00000);
       else PutF32(out + i * 4, rf);
     }
@@ -1257,12 +1277,19 @@ static void OpFma(P) {
 
 // vpgatherdd and its relatives. The index is a vector register in the SIB
 // byte, so the address is worked out here from the base alone.
+//
+// As on hardware, the mask is first made all ones or all zeros per element and
+// the bits past the last element are cleared in the destination and the mask,
+// then each selected element is loaded and its mask cleared. An element that
+// faults leaves the ones before it loaded, which the restarted instruction
+// skips.
 static void OpGather(P) {
   u8 idx[32];
   u8 *dst, *mask, *p;
   int lanes, i, ne, esize, isize, d, k, x, ilanes, total, scale;
-  i64 base, index;
-  u64 base_rde;
+  i64 index;
+  u64 base_rde, addr;
+  struct AddrSeg base;
   if (IsModrmRegister(rde) || ModrmRm(rde) != 4) OpUdImpl(m);
   lanes = Lanes(A, kUseV);
   esize = Rexw(rde) ? 8 : 4;
@@ -1276,24 +1303,29 @@ static void OpGather(P) {
   total = ne * esize;
   scale = 1 << SibScale(rde);
   base_rde = (rde & ~(u64)(0x7ull << 35 | 1ull << 17)) | 4ull << 35;
-  base = ComputeAddress(m, base_rde, disp, uimm0);
+  base = LoadEffectiveAddress(m, base_rde, disp, uimm0);
   LoadVec(m, x, idx, ilanes);
   for (i = 0; i < ne; ++i) {
-    dst = VexReg(m, d, i * esize / 16) + (i * esize) % 16;
     mask = VexReg(m, k, i * esize / 16) + (i * esize) % 16;
-    if (!(mask[esize - 1] & 0x80)) {
-      memset(mask, 0, esize);
-      continue;
-    }
-    index = isize == 8 ? (i64)Read64(idx + i * 8) : (i64)(i32)Read32(idx + i * 4);
-    p = ReserveAddress(m, base + index * scale, esize, false);
-    memcpy(dst, p, esize);
-    if (m->stashaddr) CommitStash(m);
-    memset(mask, 0, esize);
+    memset(mask, mask[esize - 1] & 0x80 ? 0xff : 0, esize);
   }
   for (i = total; i < 32; ++i) {
     VexReg(m, d, i / 16)[i % 16] = 0;
     VexReg(m, k, i / 16)[i % 16] = 0;
+  }
+  for (i = 0; i < ne; ++i) {
+    dst = VexReg(m, d, i * esize / 16) + (i * esize) % 16;
+    mask = VexReg(m, k, i * esize / 16) + (i * esize) % 16;
+    if (!mask[0]) continue;
+    index = isize == 8 ? (i64)Read64(idx + i * 8) : (i64)(i32)Read32(idx + i * 4);
+    addr = base.addr + index * scale;
+    // a 32-bit address wraps, as the base did
+    if (Eamode(rde) == XED_MODE_LEGACY) addr &= 0xffffffff;
+    p = ReserveAddress(m, AddSegment(m, rde, disp, uimm0, addr, base.seg),
+                       esize, false);
+    memcpy(dst, p, esize);
+    if (m->stashaddr) CommitStash(m);
+    memset(mask, 0, esize);
   }
 }
 

@@ -456,7 +456,19 @@ const ROOT_EXPORTS_2_8_0 = [
 ]
 // The token provideInput() takes for End of input, and where programs start.
 const ROOT_EXPORTS_5_0_0 = ['END_OF_INPUT', 'X86_WORKING_DIRECTORY', 'X86EnvironmentError']
-const ROOT_EXPORTS = [...ROOT_EXPORTS_2_8_0, ...ROOT_EXPORTS_5_0_0, 'assembleInstruction']
+// A download that stalls ends with this error after this long; the upper halves of ymm0-ymm15.
+const ROOT_EXPORTS_UNRELEASED = [
+    'RESOURCE_STALL_TIMEOUT_MS',
+    'ResourceDownloadError',
+    'X86_FPU_STATE_YMMH_OFFSET',
+    'X86_YMM_REGISTERS'
+]
+const ROOT_EXPORTS = [
+    ...ROOT_EXPORTS_2_8_0,
+    ...ROOT_EXPORTS_5_0_0,
+    'assembleInstruction',
+    ...ROOT_EXPORTS_UNRELEASED
+]
 
 const root = await import(dist)
 const rootNames = Object.keys(root)
@@ -466,7 +478,7 @@ assert.deepEqual(
         removed: ROOT_EXPORTS.filter((name) => !rootNames.includes(name))
     },
     { added: [], removed: [] },
-    'the root module exports exactly the names 2.8.0 did and the ones 5.0.0 adds'
+    'the root module exports exactly the names 2.8.0 did and the ones added since'
 )
 
 const {
@@ -692,8 +704,9 @@ assert.equal(X86_SSE_REGISTERS.length, 17, 'xmm0..xmm15 plus mxcsr')
 assert.equal(X86_SSE_REGISTERS[0], 'xmm0')
 assert.equal(X86_SSE_REGISTERS[16], 'mxcsr')
 assert.deepEqual([...X86_X87_REGISTERS].slice(8), ['fctrl', 'fstat', 'ftag'])
-assert.equal(X86_FPU_STATE_SIZE, 356)
+assert.equal(X86_FPU_STATE_SIZE, 612)
 assert.equal(RegisterSize.Quad, 16, 'an SSE register is 16 bytes wide')
+assert.equal(RegisterSize.Oct, 32, 'an AVX register is 32 bytes wide')
 
 const fpu = await createX86Emulator({ mode: 'GNU_trunk' })
 const fpuBuilt = await fpu.compile(

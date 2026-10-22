@@ -3,21 +3,39 @@
 ## Unreleased
 
 - The emulator runs VEX-encoded instructions: AVX, AVX2, FMA3, F16C, BMI1,
-  BMI2, AES-NI, PCLMULQDQ and the SSE4.1 and SSE4.2 instructions (a legacy
-  encoding of those still raises SIGILL, as `CPUID` reports none of them). A
-  VEX instruction runs the legacy SSE handler for each 128-bit lane, or a
-  handler of its own where the lanes are not independent. AVX-512 is not
-  supported. Every VEX opcode, prefix, length, width and form was compared
-  with the host's answer on whether it runs.
+  BMI2, AES-NI, PCLMULQDQ and the SSE4.1 and SSE4.2 instructions. Of their
+  legacy encodings, `pmulld`, `movntdqa`, `crc32` and `pclmulqdq` ran before
+  and still do; the others still raise SIGILL. A VEX instruction runs the
+  legacy SSE handler for each 128-bit lane, or a handler of its own where the
+  lanes are not independent. AVX-512, VAES and the 256-bit `vpclmulqdq` are
+  not supported, and `CPUID` reports none of the new extensions. Every VEX
+  opcode, prefix, length, width and form, with `vvvv` both unused and naming a
+  register, was compared with the host's answer on whether it runs.
 - The state block grew from 356 to 612 bytes: the upper halves of
   `ymm0..ymm15` follow `dp`. `X86FpuState` has `ymm`, `X86_YMM_REGISTERS` names
   them, and a step that writes an upper half reports a `ymmN` register write.
+  The undo history packets carry the larger block, so their version is now 2.
 - `unpckhpd` copied the wrong half into the low half of its destination;
   `sqrtpd` read and wrote 32 bits of each double; float to integer conversions
-  (`cvtss2si`, `cvttsd2si`, `cvtps2dq`, `cvttpd2dq` and the rest) produced
-  saturated or undefined values instead of the integer indefinite for a NaN or
-  an out-of-range value, and `cvtss2si` ignored the rounding mode; `pextrw`
-  left the upper bits of its destination register alone.
+  (`cvtss2si`, `cvttsd2si`, `cvtps2dq` and the rest) produced saturated or
+  undefined values instead of the integer indefinite for a NaN or an
+  out-of-range value, and `cvtss2si` ignored the rounding mode; `pextrw` left
+  the upper bits of its destination register alone.
+- `cvtpd2dq` truncated and `cvttpd2dq` rounded, the reverse of what each
+  does, and both, with `cvtpd2ps`, left bits 64 to 127 of the destination
+  alone instead of clearing them.
+- A store that straddles two pages and faults on the second no longer writes
+  the bytes it had staged into the first page when the next instruction runs.
+  A legacy aligned store (`movdqa`, `movaps`, `movntdq` and relatives) checks
+  that its page is writable, and Undo restores what it overwrote. A misaligned
+  operand of an aligned move raises SIGSEGV with code `SI_KERNEL` and no
+  address, as Linux reports the processor's general protection fault.
+- `crc32` with a 16-bit source raised SIGILL, and `8f` with a ModRM reg field
+  other than 0 ran as `pop` instead of raising SIGILL.
+- Every instruction on an MMX register raises SIGILL, as `DISABLE_MMX` intends;
+  the moves, conversions and `pshufw`, `pextrw`, `pinsrw` and `pmovmskb` on MMX
+  registers used to run on the `xmm` register of the same number. `emms` still
+  runs.
 - A download (a bundled library, `nasm.wasm`, a blink-hosted tool) reads its
   body as it arrives and throws a `ResourceDownloadError` naming the resource
   when the request fails, the server answers with an error status, or nothing

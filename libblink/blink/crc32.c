@@ -68,7 +68,8 @@ static void OpCrc32(P) {
 void Op2f01(P) {
   if (!Rep(rde) && !Osz(rde)) {
     OpUdImpl(m);  // TODO: movbe
-  } else if (Rep(rde) == 2 && !Osz(rde)) {
+  } else if (Rep(rde) == 2) {
+    // 66 makes the source 16 bits: crc32 r32, r/m16
     OpCrc32(A);
   } else {
     OpUdImpl(m);

@@ -62,6 +62,10 @@ void DeliverSignalToUser(struct Machine *m, int sig, int code) {
 
 void HaltMachine(struct Machine *m, int code) {
   if (m->vexundo.active) UndoVex(m);
+  // Whatever the halted instruction staged for a write that straddles two
+  // pages is dropped, or the next instruction would commit it. Traps that end
+  // a completed instruction commit theirs before they get here.
+  m->stashaddr = 0;
   SIG_LOGF("HaltMachine(%d) at %#" PRIx64, code, m->ip);
   switch ((m->trapno = code)) {
     case kMachineDivideError:

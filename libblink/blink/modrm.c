@@ -293,7 +293,7 @@ u8 *GetModrmRegisterXmmPointerWrite16(P) {
   return GetModrmRegisterXmmPointerWrite(A, 16);
 }
 
-static u8 *GetVectorAddress(P, size_t n) {
+static u8 *GetVectorAddress(P, size_t n, bool writable) {
   u8 *p;
   i64 v;
   if (IsModrmRegister(rde)) {
@@ -303,10 +303,13 @@ static u8 *GetVectorAddress(P, size_t n) {
     if (Opmap(rde) & XED_VEX_MAP) {
       // VEX operands may be unaligned, apart from the aligned moves, which
       // check for themselves, so one may straddle two pages
-      return ReserveAddress(m, v, n, false);
+      return ReserveAddress(m, v, n, writable);
     }
+    // a misaligned operand is #GP, which Linux reports without an address
+    if (v & (n - 1)) ThrowProtectionFault(m);
+    if (writable) return ReserveAddress(m, v, n, true);
     SetReadAddr(m, v, n);
-    if ((v & (n - 1)) || !(p = LookupAddress(m, v))) {
+    if (!(p = LookupAddress(m, v))) {
       ThrowSegmentationFault(m, v);
     }
   }
@@ -314,11 +317,17 @@ static u8 *GetVectorAddress(P, size_t n) {
 }
 
 u8 *GetMmxAddress(P) {
-  return GetVectorAddress(A, 8);
+  return GetVectorAddress(A, 8, false);
 }
 
 u8 *GetXmmAddress(P) {
-  return GetVectorAddress(A, 16);
+  return GetVectorAddress(A, 16, false);
+}
+
+// An aligned 128-bit store's destination, checked for writing and recorded as
+// written.
+u8 *GetXmmAddressWrite(P) {
+  return GetVectorAddress(A, 16, true);
 }
 
 u8 *GetModrmReadBW(P) {

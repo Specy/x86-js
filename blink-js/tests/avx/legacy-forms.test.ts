@@ -171,6 +171,56 @@ describe.skipIf(!NATIVE_AVX)('VEX forms of legacy SSE instructions', () => {
             { asm: 'vcvtss2si eax, xmm1', kind: 'f32' }, { asm: 'vcvtsd2si rax, xmm1', kind: 'f64' })
         await checkAgainstNative(cases)
     })
+    it('general register operands numbered like the destination', async () => {
+        // rax is register 0 like xmm0 and rdx register 2 like xmm2: the general register must be
+        // read, not a vector register standing in for an aliased one
+        await checkAgainstNative([
+            { asm: 'vpinsrw xmm0, xmm1, eax, 3' }, { asm: 'vpinsrw xmm2, xmm1, edx, 5' },
+            { asm: 'vpinsrw xmm0, xmm0, eax, 1' }, { asm: 'vpinsrw xmm1, xmm2, ecx, 7' },
+            { asm: 'vcvtsi2sd xmm0, xmm1, rax' }, { asm: 'vcvtsi2sd xmm2, xmm1, rdx' },
+            { asm: 'vcvtsi2ss xmm0, xmm1, eax' }, { asm: 'vcvtsi2ss xmm2, xmm3, edx' },
+            { asm: 'vcvtsi2sd xmm0, xmm0, rax' },
+        ])
+    })
+    it('conversions that narrow doubles, legacy and VEX', async () => {
+        // halves and fractions, where rounding and truncation part ways; the destination starts
+        // with random bytes so that bits 127:64 must be cleared
+        const load = [
+            'mov rax, 0x3ffb333333333333', 'vmovq xmm1, rax', 'mov rax, 0xbffb333333333333', 'vpinsrq xmm1, xmm1, rax, 1',
+            'mov rax, 0x4004000000000000', 'vmovq xmm3, rax', 'mov rax, 0xc00c000000000000', 'vpinsrq xmm3, xmm3, rax, 1',
+            'vinsertf128 ymm1, ymm1, xmm3, 1',
+        ].join('\n')
+        const cases: VectorCase[] = []
+        for (const name of ['cvtpd2dq', 'cvttpd2dq', 'cvtpd2ps']) {
+            cases.push({ asm: `${load}\n${name} xmm0, xmm1` }, { asm: `${load}\nvmovupd [rel mem], ymm1\n${name} xmm0, [rel mem]` },
+                { asm: `${load}\nv${name} xmm0, xmm1` }, { asm: `${load}\nv${name} xmm0, ymm1` },
+                { asm: `${load}\nvmovupd [rel mem], ymm1\nv${name} xmm0, yword [rel mem]` },
+                { asm: `${load}\nv${name} xmm1, ymm1` })
+        }
+        cases.push({ asm: 'vcvtpd2dq xmm0, ymm1', kind: 'f64' }, { asm: 'vcvttpd2dq xmm0, ymm1', kind: 'f64' },
+            { asm: 'cvtpd2dq xmm0, xmm1', kind: 'f64' }, { asm: 'cvttpd2dq xmm0, xmm1', kind: 'f64' })
+        await checkAgainstNative(cases)
+    })
+    it('scalar instructions with VEX.L set, which they ignore', async () => {
+        const at = 'lea rbx, [rel mem]\n'
+        await checkAgainstNative([
+            { asm: 'db 0xc5, 0xf6, 0x58, 0xc2', kind: 'f32' }, // vaddss xmm0, xmm1, xmm2
+            { asm: 'db 0xc5, 0xf7, 0x51, 0xc2', kind: 'f64' }, // vsqrtsd xmm0, xmm1, xmm2
+            { asm: 'db 0xc5, 0xf6, 0x10, 0xc2' }, // vmovss xmm0, xmm1, xmm2
+            { asm: 'db 0xc5, 0xf7, 0x5f, 0xc2', kind: 'f64' }, // vmaxsd xmm0, xmm1, xmm2
+            { asm: 'db 0xc5, 0xf2, 0x5c, 0xc2', kind: 'f32' }, // vsubss with L clear, for contrast
+            { asm: `${at}db 0xc5, 0xf6, 0x58, 0x03`, kind: 'f32' }, // vaddss xmm0, xmm1, [rbx]
+            { asm: `${at}db 0xc5, 0xfe, 0x10, 0x03` }, // vmovss xmm0, [rbx]
+            { asm: `${at}db 0xc5, 0xfe, 0x11, 0x03` }, // vmovss [rbx], xmm0
+            { asm: `${at}db 0xc5, 0xff, 0x11, 0x03` }, // vmovsd [rbx], xmm0
+            { asm: `${at}db 0xc5, 0xf7, 0x59, 0x43, 0x08`, kind: 'f64' }, // vmulsd xmm0, xmm1, [rbx + 8]
+        ])
+    })
+    it('crc32 at every source width, which runs without VEX', async () => {
+        await checkAgainstNative([{ asm: 'crc32 eax, cl' }, { asm: 'crc32 eax, cx' }, { asm: 'crc32 eax, ecx' },
+            { asm: 'crc32 rax, cl' }, { asm: 'crc32 rax, rcx' }, { asm: 'crc32 eax, word [rel mem]' },
+            { asm: 'crc32 rax, qword [rel mem]' }, { asm: 'crc32 edx, byte [rel mem + 1]' }])
+    })
     it('zeroes the upper halves', async () => {
         await checkAgainstNative([{ asm: 'vzeroupper' }, { asm: 'vzeroall' },
             { asm: 'vpxor xmm0, xmm0, xmm0' }, { asm: 'vmovdqa xmm1, xmm2' },

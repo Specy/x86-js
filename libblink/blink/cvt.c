@@ -163,6 +163,7 @@ static void OpVpsQpiCvtpi2ps(P) {
   u8 *p;
   i32 i[2];
   union FloatPun f[2];
+  RefuseMmx(m);
   p = GetModrmRegisterMmPointerRead8(A);
   i[0] = Read32(p + 0);
   i[1] = Read32(p + 4);
@@ -176,6 +177,7 @@ static void OpVpdQpiCvtpi2pd(P) {
   u8 *p;
   i32 n[2];
   union DoublePun f[2];
+  RefuseMmx(m);
   p = GetModrmRegisterMmPointerRead8(A);
   n[0] = Read32(p + 0);
   n[1] = Read32(p + 4);
@@ -190,6 +192,7 @@ static void OpPpiWpsqCvtps2pi(P) {
   unsigned i;
   i32 n[2];
   union FloatPun f[2];
+  RefuseMmx(m);
   p = GetModrmRegisterXmmPointerRead8(A);
   f[0].i = Read32(p + 0 * 4);
   f[1].i = Read32(p + 1 * 4);
@@ -217,6 +220,7 @@ static void OpPpiWpsqCvttps2pi(P) {
   u8 *p;
   i32 n[2];
   union FloatPun f[2];
+  RefuseMmx(m);
   p = GetModrmRegisterXmmPointerRead8(A);
   f[0].i = Read32(p + 0);
   f[1].i = Read32(p + 4);
@@ -231,6 +235,7 @@ static void OpPpiWpdCvtpd2pi(P) {
   unsigned i;
   i32 n[2];
   union DoublePun d[2];
+  RefuseMmx(m);
   p = GetModrmRegisterXmmPointerRead16(A);
   d[0].i = Read64(p + 0);
   d[1].i = Read64(p + 8);
@@ -243,6 +248,7 @@ static void OpPpiWpdCvttpd2pi(P) {
   u8 *p;
   i32 n[2];
   union DoublePun d[2];
+  RefuseMmx(m);
   p = GetModrmRegisterXmmPointerRead16(A);
   d[0].i = Read64(p + 0);
   d[1].i = Read64(p + 8);
@@ -276,6 +282,7 @@ static void OpVpsWpdCvtpd2ps(P) {
   f[1].f = d[1].f;
   Put32(XmmRexrReg(m, rde) + 0, f[0].i);
   Put32(XmmRexrReg(m, rde) + 4, f[1].i);
+  Put64(XmmRexrReg(m, rde) + 8, 0);
 }
 
 static void OpVssWsdCvtsd2ss(P) {
@@ -373,6 +380,7 @@ static void OpVdqWpdCvttpd2dq(P) {
   n[1] = ToI32(d[1].f);
   Put32(XmmRexrReg(m, rde) + 0, n[0]);
   Put32(XmmRexrReg(m, rde) + 4, n[1]);
+  Put64(XmmRexrReg(m, rde) + 8, 0);
 }
 
 static void OpVdqWpdCvtpd2dq(P) {
@@ -386,6 +394,7 @@ static void OpVdqWpdCvtpd2dq(P) {
   for (i = 0; i < 2; ++i) n[i] = ToI32(SseRoundDouble(m, d[i].f));
   Put32(XmmRexrReg(m, rde) + 0, n[0]);
   Put32(XmmRexrReg(m, rde) + 4, n[1]);
+  Put64(XmmRexrReg(m, rde) + 8, 0);
 }
 
 static void OpCvt(P, unsigned long op) {
@@ -448,11 +457,11 @@ static void OpCvt(P, unsigned long op) {
     case kOpCvt0f5b + 3:
       OpVdqWpsCvttps2dq(A);
       break;
-    case kOpCvt0fE6 + 1:
-      OpVdqWpdCvtpd2dq(A);
-      break;
-    case kOpCvt0fE6 + 2:
+    case kOpCvt0fE6 + 1:  // 66: cvttpd2dq
       OpVdqWpdCvttpd2dq(A);
+      break;
+    case kOpCvt0fE6 + 2:  // F2: cvtpd2dq
+      OpVdqWpdCvtpd2dq(A);
       break;
     case kOpCvt0fE6 + 3:
       OpVpdWdqCvtdq2pd(A);

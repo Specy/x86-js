@@ -71,7 +71,48 @@ describe('ymm registers', () => {
             low.xmm[5] = 7n
             low.ymm[5] = emulator.getFpuState().ymm[5]!
             emulator.setFpuState(low)
-            expect(emulator.getFpuState().ymm[5]! >> 128n).toBe((WIDE ^ (0xffn << 200n)) >> 128n)
+            expect(emulator.getFpuState().xmm[5]).toBe(7n)
+            expect(emulator.getFpuState().ymm[5]).toBe((((WIDE ^ (0xffn << 200n)) >> 128n) << 128n) | 7n)
+        } finally {
+            emulator.dispose()
+        }
+    })
+
+    it('records aligned 128-bit stores, so undo puts the bytes back', async () => {
+        const emulator = await createX86Emulator()
+        try {
+            const result = await emulator.compile(`
+bits 64
+global _start
+section .bss
+alignb 32
+buffer: resb 64
+section .text
+_start:
+lea rbx, [rel buffer]
+vpcmpeqd ymm1, ymm1, ymm1
+movdqa [rbx], xmm1
+vmovdqa [rbx + 16], xmm1
+vmovntdq [rbx + 32], ymm1
+mov eax, 60
+xor edi, edi
+syscall
+`)
+            expect(result.ok, result.report).toBe(true)
+            emulator.initialize(8)
+            await emulator.step()
+            await emulator.step()
+            const buffer = emulator.getRegisterValue('rbx')
+            for (const [offset, size] of [[0, 16], [16, 16], [32, 32]] as const) {
+                await emulator.step()
+                const stores = emulator.getUndoHistory(1)[0]!.mutations.filter((m) => m.type !== 'WriteRegister')
+                expect(stores.length, `the store at +${offset}`).toBeGreaterThan(0)
+                expect([...emulator.readMemoryBytes(buffer + BigInt(offset), BigInt(size))].every((b) => b === 0xff)).toBe(true)
+            }
+            emulator.undo()
+            emulator.undo()
+            emulator.undo()
+            expect([...emulator.readMemoryBytes(buffer, 64n)].every((b) => b === 0)).toBe(true)
         } finally {
             emulator.dispose()
         }

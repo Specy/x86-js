@@ -308,5 +308,7 @@ void OpPushEvq(P) {
 
 void OpPopEvq(P) {
   unsigned osz = kStackOsz[Osz(rde)][Mode(rde)];
+  // 8f /1 to /7 is #UD (AMD's XOP prefix, which no processor of today has)
+  if (ModrmReg(rde)) OpUdImpl(m);
   WriteMemWord(GetModrmRegisterWordPointerWrite(A, osz), rde, osz, Pop(A, 0));
 }

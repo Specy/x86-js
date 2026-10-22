@@ -44,6 +44,9 @@
 #define kVexMem    0x0400  // the r/m operand must be memory
 #define kVexMemOsz 0x0800  // the r/m operand must be memory when prefixed 66
 #define kVexRegOnly 0x1000  // the r/m operand must be a register
+#define kVexScalar 0x2000  // with F3 or F2 a scalar op, which ignores VEX.L
+#define kVexMovs   0x4000  // vmovss and vmovsd: the memory forms take no vvvv
+#define kVexGpr    0x10000  // a register r/m operand is a general register
 
 // The legacy handler for a VEX key.
 #define Legacy(op) ((op) & ~(XED_VEX_MAP << 8))
@@ -55,14 +58,14 @@
 #define SIMPLE(x)  (kVexOk | (x))
 #define ARITH      SIMPLE(kVexV)
 #define UNARY      SIMPLE(0)
-#define SCALAR     SIMPLE(kVexVs)
+#define SCALAR     SIMPLE(kVexVs | kVexScalar)
 #define LOAD       SIMPLE(0)
 #define STORE      SIMPLE(kVexStore)
 #define SHIFT      SIMPLE(kVexV | kVexCount)
 
 // The VEX opcodes that run a legacy handler, indexed by map - 1. The bits above
 // the flags say which of the four prefixes (none, 66, F3, F2) the opcode takes.
-#define PP(x) ((x) << 16)
+#define PP(x) ((x) << 24)
 #define kPpNone 1
 #define kPp66   2
 #define kPpF3   4
@@ -71,8 +74,8 @@
 
 static const u32 kVexLegacy[3][256] = {
     {
-        [0x10] = SIMPLE(kVexVs) | PP(kPpAny),
-        [0x11] = SIMPLE(kVexVs | kVexStore) | PP(kPpAny),
+        [0x10] = SIMPLE(kVexVs | kVexScalar | kVexMovs) | PP(kPpAny),
+        [0x11] = SIMPLE(kVexVs | kVexScalar | kVexMovs | kVexStore) | PP(kPpAny),
         [0x12] = SIMPLE(kVexVn | kVexMemOsz) | PP(kPpAny),
         [0x13] = SIMPLE(kVexStore | kVexMem | kVexL0) | PP(kPpNone | kPp66),
         [0x14 ... 0x15] = ARITH | PP(kPpNone | kPp66),
@@ -80,16 +83,16 @@ static const u32 kVexLegacy[3][256] = {
         [0x17] = SIMPLE(kVexStore | kVexMem | kVexL0) | PP(kPpNone | kPp66),
         [0x28] = SIMPLE(kVexAlign) | PP(kPpNone | kPp66),
         [0x29] = SIMPLE(kVexStore | kVexAlign) | PP(kPpNone | kPp66),
-        [0x2A] = SIMPLE(kVexV | kVexLig) | PP(kPpF3 | kPpF2),
+        [0x2A] = SIMPLE(kVexV | kVexLig | kVexGpr) | PP(kPpF3 | kPpF2),
         [0x2B] = SIMPLE(kVexStore | kVexAlign | kVexMem) | PP(kPpNone | kPp66),
         [0x2C ... 0x2D] = SIMPLE(kVexNodest | kVexLig) | PP(kPpF3 | kPpF2),
         [0x2E ... 0x2F] = SIMPLE(kVexNodest | kVexLig) | PP(kPpNone | kPp66),
         [0x51] = SCALAR | PP(kPpAny),
         [0x52 ... 0x53] = SCALAR | PP(kPpNone | kPpF3),
         [0x54 ... 0x57] = ARITH | PP(kPpNone | kPp66),
-        [0x58 ... 0x59] = ARITH | PP(kPpAny),
+        [0x58 ... 0x59] = SIMPLE(kVexV | kVexScalar) | PP(kPpAny),
         [0x5B] = UNARY | PP(kPpNone | kPp66 | kPpF3),
-        [0x5C ... 0x5F] = ARITH | PP(kPpAny),
+        [0x5C ... 0x5F] = SIMPLE(kVexV | kVexScalar) | PP(kPpAny),
         [0x60 ... 0x6D] = ARITH | PP(kPp66),
         [0x6E] = SIMPLE(kVexL0) | PP(kPp66),
         [0x6F] = SIMPLE(kVexAlign) | PP(kPp66 | kPpF3),
@@ -97,7 +100,7 @@ static const u32 kVexLegacy[3][256] = {
         [0x74 ... 0x76] = ARITH | PP(kPp66),
         [0x7C ... 0x7D] = ARITH | PP(kPp66 | kPpF2),
         [0x7F] = SIMPLE(kVexStore | kVexAlign) | PP(kPp66 | kPpF3),
-        [0xC4] = SIMPLE(kVexV | kVexL0) | PP(kPp66),
+        [0xC4] = SIMPLE(kVexV | kVexL0 | kVexGpr) | PP(kPp66),
         [0xC5] = SIMPLE(kVexNodest | kVexL0 | kVexRegOnly) | PP(kPp66),
         [0xC6] = ARITH | PP(kPpNone | kPp66),
         [0xD0] = ARITH | PP(kPp66 | kPpF2),
@@ -172,7 +175,8 @@ static void CheckAligned(P, int lanes) {
   i64 v;
   if (!IsModrmRegister(rde)) {
     v = ComputeAddress(A);
-    if (v & (16 * lanes - 1)) ThrowSegmentationFault(m, v);
+    // #GP, which Linux reports without an address
+    if (v & (16 * lanes - 1)) ThrowProtectionFault(m);
   }
 }
 
@@ -193,9 +197,12 @@ static bool IsShufpd(u64 rde) {
 static void OpVexAs(P, nexgen32e_f legacy, u32 attr) {
   u8 saved[16], count[16], value[16];
   u64 rde2;
+  i64 addr;
   int k, h, lanes, d, v, r, y, bind, other, regs[4], nregs;
-  bool regform, usev, store, nodest;
-  lanes = Ymm(rde) && !(attr & kVexLig) ? 2 : 1;
+  bool regform, usev, store, nodest, whole;
+  lanes = Ymm(rde) && !(attr & kVexLig) && !((attr & kVexScalar) && Rep(rde))
+              ? 2
+              : 1;
   if (lanes == 2 && (attr & kVexL0)) OpUdImpl(m);
   if (lanes == 2 && (attr & kVexVn) && !Rep(rde)) OpUdImpl(m);
   if (!IsModrmRegister(rde) && (attr & kVexRegOnly)) OpUdImpl(m);
@@ -208,25 +215,34 @@ static void OpVexAs(P, nexgen32e_f legacy, u32 attr) {
   nodest = attr & kVexNodest;
   usev = (attr & kVexV) || ((attr & kVexVs) && Rep(rde)) ||
          ((attr & kVexVn) && !Rep(rde));
+  if ((attr & kVexMovs) && !regform) usev = false;
   if (!usev && v) OpUdImpl(m);
   if ((attr & kVexAlign) && !Rep(rde)) CheckAligned(A, lanes);
-  // a 256-bit store must not write its first half and then fault on the second
-  if (lanes == 2 && store && !regform) {
-    ReserveAddress(m, ComputeAddress(A), 32, true);
+  // a 256-bit store must not write its first half and then fault on the
+  // second, and a 256-bit load faults on any of its bytes even when the legacy
+  // handler reads fewer of them (vmovddup)
+  whole = lanes == 2 && !regform && !(attr & kVexCount);
+  if (whole) {
+    addr = ComputeAddress(A);
+    ReserveAddress(m, addr, 32, store);
     m->stashaddr = 0;
   }
   bind = nodest || (store && !regform) ? -1 : store ? r : d;
   other = store ? d : r;
   if (bind < 0) usev = false;
   y = -1;
-  if (regform && ((usev && other == bind && v != bind) || (attr & kVexCount))) {
+  // a general register r/m operand cannot be the vector register bind
+  if (regform && ((usev && other == bind && v != bind && !(attr & kVexGpr)) ||
+                  (attr & kVexCount))) {
     y = 0;
     while (y == d || y == v || y == r) ++y;
   }
   nregs = 0;
   regs[nregs++] = d;
   if (usev && v != d) regs[nregs++] = v;
-  if (regform && r != d && !(usev && r == v)) regs[nregs++] = r;
+  if (regform && r != d && !(usev && r == v) && !(attr & kVexGpr)) {
+    regs[nregs++] = r;
+  }
   if (y >= 0) regs[nregs++] = y;
   m->vexundo.count = 0;
   for (k = 0; k < nregs; ++k) KeepVex(m, regs[k]);
@@ -257,6 +273,14 @@ static void OpVexAs(P, nexgen32e_f legacy, u32 attr) {
     }
   }
   m->vexundo.active = false;
+  // the handler recorded only the second lane's access
+  if (whole && store) {
+    m->writeaddr = addr;
+    m->writesize = 32;
+  } else if (whole) {
+    m->readaddr = addr;
+    m->readsize = 32;
+  }
   if (lanes == 1 && !nodest && (!store || regform)) {
     memset(m->ymmh[store ? r : d], 0, 16);
   }
@@ -378,14 +402,18 @@ static void OpVexNarrow(P) {
   d = RexrReg(rde);
   r = RexbRm(rde);
   if (Vreg(rde)) OpUdImpl(m);
-  CallLegacy(A, legacy, 0);
-  if (Ymm(rde)) {
+  if (!Ymm(rde)) {
+    CallLegacy(A, legacy, 0);
+  } else {
+    // the first half is written before the second is read, so a fault on the
+    // second must put the destination back
     y = 0;
     while (y == d || y == r) ++y;
     regs[0] = d;
     regs[1] = y;
     regs[2] = r;
     BeginVex(m, regs, 3);
+    CallLegacy(A, legacy, 0);
     memcpy(saved, m->xmm[y], 16);
     if (IsModrmRegister(rde)) SwapLanes(m, r);
     rde2 = rde;
@@ -541,7 +569,7 @@ static void OpVexTop(P) {
     handler(A);
   } else {
     attr = VexAttr(op);
-    if (!(((attr >> 16) >> pp) & 1)) OpUdImpl(m);
+    if (!(((attr >> 24) >> pp) & 1)) OpUdImpl(m);
     OpVexAs(A, GetOp(Legacy(op)), attr);
   }
 }

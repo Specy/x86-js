@@ -18,6 +18,19 @@ describe.skipIf(!NATIVE_AVX)('fused multiply-add', () => {
         for (const name of ['vfmadd213sd', 'vfnmsub231sd']) cases.push({ asm: `${name} xmm0, xmm1, xmm2`, kind: 'f64n' })
         await checkAgainstNative(cases.flatMap((c, i) => [c, ...[1, 2, 3, 4, 5, 6].map((seed) => ({ ...c, seed: seed * 977 + i }))]))
     })
+    it('single precision results that are denormal, rounded once', async () => {
+        // the product is tiny and the sum lands halfway between two denormal floats once rounded to
+        // a double, so a sum rounded to double and then to float comes out one unit too high
+        const set = (reg: string, bits: number) => `mov eax, 0x${bits.toString(16)}\nvmovd ${reg}, eax\nvbroadcastss ymm${reg.slice(3)}, ${reg}`
+        const operands = [set('xmm0', 0x1a000008), set('xmm1', 0x19fffff0), set('xmm2', 0x00400001)].join('\n')
+        const negated = [set('xmm0', 0x9a000008), set('xmm1', 0x19fffff0), set('xmm2', 0x80400001)].join('\n')
+        const cases: VectorCase[] = []
+        for (const setup of [operands, negated]) {
+            cases.push({ asm: `${setup}\nvfmadd213ss xmm0, xmm1, xmm2` }, { asm: `${setup}\nvfmadd213ps ymm0, ymm1, ymm2` },
+                { asm: `${setup}\nvfmadd231ps xmm2, xmm0, xmm1` }, { asm: `${setup}\nvfnmsub213ss xmm0, xmm1, xmm2` })
+        }
+        await checkAgainstNative(cases)
+    })
     it('packed and scalar forms in every order', async () => {
         const cases: VectorCase[] = []
         for (const order of ORDERS) {
@@ -81,6 +94,12 @@ describe.skipIf(!NATIVE_AVX)('gathers', () => {
             )
         }
         await checkAgainstNative(cases)
+    })
+    it('a 32-bit address wraps at 4 GiB', async () => {
+        // eax + 0x40000000 * 4 wraps around to eax
+        const setup = 'lea rax, [rel mem]\nmov ecx, 0x40000000\nvmovd xmm1, ecx\nvpbroadcastd ymm1, xmm1\nvpcmpeqd ymm2, ymm2, ymm2'
+        await checkAgainstNative([{ asm: `${setup}\nvpgatherdd xmm0, [eax + xmm1*4], xmm2`, kind: 'i32' },
+            { asm: `${setup}\nvpgatherdd ymm0, [eax + ymm1*4 + 4], ymm2`, kind: 'i32' }])
     })
 })
 

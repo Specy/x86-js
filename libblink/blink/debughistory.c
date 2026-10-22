@@ -124,7 +124,8 @@ void DebugHistoryClear(void) {
   DebugHistoryCancel();
 }
 EMSCRIPTEN_KEEPALIVE
-u32 blinkenlib_history_version(void) { return 1; }
+// 2: the FPU blocks grew from 356 to 612 bytes with the ymm upper halves
+u32 blinkenlib_history_version(void) { return 2; }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_history_capacity(u32 size) {
   DebugHistoryClear();
@@ -294,7 +295,7 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
   e->exited = exited;
   u8 *p = e->bytes;
   memset(p, 0, 88);
-  Write32(p, 1);
+  Write32(p, blinkenlib_history_version());
   Write32(p + 4, bytes);
   ++serial;
   Write64(p + 8, is_poke ? blinkenlib_next_identity() : blinkenlib_active_instruction());

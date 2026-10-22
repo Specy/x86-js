@@ -499,7 +499,7 @@ cell: dq 0
 
     it.each([
         ['no history at all', undefined, 'records no undo history'],
-        ['history of another version', 2, 'records undo history version 2']
+        ['history of another version', 3, 'records undo history version 3']
     ])('refuses a wasm with %s when the emulator is created', async (_, version, message) => {
         const create = BlinkRuntime.create.bind(BlinkRuntime)
         vi.spyOn(BlinkRuntime, 'create').mockImplementationOnce(async (options) => {

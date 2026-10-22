@@ -469,6 +469,11 @@ static int xed_vex_c4_scanner(struct XedDecodedInst *x, int *imm_width,
     ymm = !!(b2 & 4);
     xed_set_vex_prefix(x, b2 & 3);
     map = b1 & 31;
+    // maps 1, 2 and 3 are the only ones VEX defines; the others are #UD
+    if (map < XED_ILD_MAP1 || map > XED_ILD_MAP3) {
+      x->length = length + 2;
+      return XED_ERROR_BAD_MAP;
+    }
     x->op.rde |= (u64)vrex << 63 | rexx << 17 | rexb << 15 | rexb << 10 |
                  rexw << 6 | rexr << 3;
     x->op.rde |= ymm << 30;
@@ -521,8 +526,11 @@ static int xed_vex_scanner(struct XedDecodedInst *x, int *imm_width,
   switch (x->bytes[x->length]) {
     case 0xC5:
     case 0xC4:
-      // 66, F2 and F3 before a VEX prefix are #UD; the prefix has its own pp.
-      if (Osz(x->op.rde) || Rep(x->op.rde)) return XED_ERROR_BAD_LEGACY_PREFIX;
+      // 66, F2, F3 and LOCK before a VEX prefix are #UD; the prefix has its
+      // own pp.
+      if (Osz(x->op.rde) || Rep(x->op.rde) || (x->op.rde & 020000000000)) {
+        return XED_ERROR_BAD_LEGACY_PREFIX;
+      }
       break;
     default:
       return 0;

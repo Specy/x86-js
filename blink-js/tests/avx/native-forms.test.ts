@@ -238,6 +238,14 @@ describe.skipIf(!NATIVE_AVX)('string compares', () => {
                     { asm: `mov eax, ${length}\nmov edx, ${length - 3}\nvpcmpestrm xmm1, xmm2, ${imm}` } )
             }
         }
+        // with VEX.W1 the lengths are rax and rdx; the most negative one saturates like the others
+        for (const [rax, rdx] of [['0x8000000000000000', '5'], ['3', '0x8000000000000000'], ['-1', '0x7fffffffffffffff']]) {
+            for (const imm of [0x00, 0x0c, 0x18, 0x41]) {
+                // vpcmpestri xmm1, xmm2, imm and vpcmpestrm xmm1, xmm2, imm with W1
+                cases.push({ asm: `mov rax, ${rax}\nmov rdx, ${rdx}\ndb 0xc4, 0xe3, 0xf9, 0x61, 0xca, ${imm}` },
+                    { asm: `mov rax, ${rax}\nmov rdx, ${rdx}\ndb 0xc4, 0xe3, 0xf9, 0x60, 0xca, ${imm}` })
+            }
+        }
         await checkAgainstNative(cases)
     })
 })

@@ -12,7 +12,7 @@ import { createX86Emulator } from '../../src/x86-emulator'
 import { linkedProgram } from '../compiler-output/helpers'
 import { NATIVE_AVX } from './harness'
 
-import { slots, source, type Slot } from './coverage-lib'
+import { deliberatelyMissing, slots, source, undefinedSlots, vendorDependent, type Slot } from './coverage-lib'
 
 async function inBlink(src: string, count: number): Promise<{ program: Uint8Array; results: Uint8Array }> {
     const bytes: number[] = []
@@ -52,21 +52,40 @@ function summarize(list: Slot[], flags: boolean[]): string[] {
     const groups = new Map<string, string[]>()
     list.forEach((slot, i) => {
         if (!flags[i]) return
-        const key = `map${slot.map} pp${slot.pp} ${slot.opcode.toString(16).padStart(2, '0')} /${slot.reg}`
+        const key = `${slot.lock ? 'lock ' : ''}map${slot.map} pp${slot.pp} ${slot.opcode.toString(16).padStart(2, '0')} /${slot.reg}`
         groups.set(key, [...(groups.get(key) ?? []), `L${slot.l}W${slot.w}${slot.form === 'reg' ? 'r' : 'm'}`])
     })
     return [...groups].map(([key, forms]) => `${key} ${forms.length === 8 ? 'all' : forms.join(',')}`)
 }
 
+/**
+ * The slots that raise SIGILL on one machine and not the other. An encoding the host runs and Blink
+ * refuses is missing unless Blink leaves it out on purpose or the processor makers disagree on it.
+ */
+async function compare(list: Slot[]): Promise<{ missing: string[]; extra: string[] }> {
+    const { program, results } = await inBlink(source(list), list.length)
+    const host = natively(program)
+    const missing = summarize(
+        list,
+        list.map((slot, i) => host[i] !== 1 && results[i] === 1 && !deliberatelyMissing(slot) && !vendorDependent(slot)),
+    )
+    const extra = summarize(list, list.map((_, i) => host[i] === 1 && results[i] !== 1))
+    return { missing, extra }
+}
+
 describe.skipIf(!NATIVE_AVX)('VEX encodings', () => {
     for (const map of [1, 2, 3]) {
         it(`map ${map} runs where the host's does`, async () => {
-            const list = slots(map)
-            const { program, results } = await inBlink(source(list), list.length)
-            const host = natively(program)
-            const missing = summarize(list, list.map((_, i) => host[i] !== 1 && results[i] === 1))
-            const extra = summarize(list, list.map((_, i) => host[i] === 1 && results[i] !== 1))
-            expect({ missing, extra }).toEqual({ missing: [], extra: [] })
+            expect(await compare(slots(map))).toEqual({ missing: [], extra: [] })
+        })
+
+        // vvvv must be 1111 where an instruction has no use for it
+        it(`map ${map} with vvvv naming xmm1 runs where the host's does`, async () => {
+            expect(await compare(slots(map, 1))).toEqual({ missing: [], extra: [] })
         })
     }
+
+    it('refuses the maps VEX does not define and a LOCK prefix', async () => {
+        expect(await compare(undefinedSlots())).toEqual({ missing: [], extra: [] })
+    })
 })

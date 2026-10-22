@@ -20,6 +20,14 @@
 #define MmRm(m, x)         m->xmm[(x & 00000001600) >> 7]
 #define MmReg(m, x)        m->xmm[(x & 00000000007) >> 0]
 #define XmmRexbRm(m, x)    m->xmm[RexbRm(x)]
+
+// The build leaves MMX out (DISABLE_MMX), and MmReg() would write the xmm
+// register of the same number, so an instruction on an MMX register is #UD.
+#ifdef DISABLE_MMX
+#define RefuseMmx(m) OpUdImpl(m)
+#else
+#define RefuseMmx(m) (void)0
+#endif
 #define XmmRexrReg(m, x)   m->xmm[RexrReg(x)]
 
 #ifdef HAVE_THREADS
@@ -84,6 +92,7 @@ u8 *GetModrmRegisterXmmPointerWrite16(P);
 u8 *GetModrmRegisterXmmPointerWrite4(P);
 u8 *GetModrmRegisterXmmPointerWrite8(P);
 u8 *GetXmmAddress(P) returnsaligned((16));
+u8 *GetXmmAddressWrite(P);
 u8 *GetMmxAddress(P) returnsaligned((8));
 
 #endif /* BLINK_MODRM_H_ */
