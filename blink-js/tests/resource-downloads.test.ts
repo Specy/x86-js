@@ -12,8 +12,6 @@ const LIBRARY_URL = 'https://assets.test/assets/linux/libstdc%2B%2B.so.6'
 afterEach(() => {
     vi.useRealTimers()
     vi.unstubAllGlobals()
-    vi.doUnmock('../src/resources')
-    vi.resetModules()
 })
 
 /** A response whose body sends `chunks`, each after the delay before it, and then ends or stalls. */
@@ -98,13 +96,17 @@ describe('a download', () => {
         })
         const failed = readResourceBytes(LIBRARY_URL, { name: 'libstdc++.so.6' })
         await expect(failed).rejects.toThrow('Could not download libstdc++.so.6: Failed to fetch')
-        await expect(failed).rejects.toMatchObject({ cause: expect.any(TypeError) })
+        await expect(failed).rejects.toMatchObject({
+            cause: expect.any(TypeError),
+            status: undefined
+        })
 
         vi.stubGlobal('fetch', async () => new Response('', { status: 404, statusText: 'Not Found' }))
         //without a name, the URL's last part names it
-        await expect(readResourceBytes(LIBRARY_URL)).rejects.toThrow(
-            'Could not download libstdc++.so.6: 404 Not Found'
-        )
+        const refused = readResourceBytes(LIBRARY_URL)
+        await expect(refused).rejects.toThrow('Could not download libstdc++.so.6: 404 Not Found')
+        //the status says it was the server, which a retry on the same URL will not change
+        await expect(refused).rejects.toMatchObject({ status: 404 })
     })
 })
 
@@ -132,6 +134,14 @@ async function withFailingDownloads(failing: Set<string>) {
 }
 
 describe('a failed download', () => {
+    //the unmock waits for the next import, as the mock does: made there, it would race the next
+    //test's mock at that import and could undo it, so it is made now
+    afterEach(async () => {
+        vi.doUnmock('../src/resources')
+        await import('../src/resources')
+        vi.resetModules()
+    })
+
     it("ends a load, and the next load of the library downloads it again", async () => {
         const failing = new Set(['libc.so.6'])
         const reads = await withFailingDownloads(failing)

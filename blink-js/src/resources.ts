@@ -9,15 +9,22 @@ export const RESOURCE_STALL_TIMEOUT_MS = 20_000
  * why, as in "Could not download libc.so.6: no data for 20 s".
  */
 export class ResourceDownloadError extends Error {
+    /**
+     * The HTTP status the server refused the request with, such as 404 for a file a newer version
+     * of the site no longer has; undefined when the request failed or stalled.
+     */
+    readonly status: number | undefined
+
     constructor(
         /** What the resource is called, as `ResourceReadOptions.name` gave it. */
         readonly resource: string,
         /** Why: "no data for 20 s", the network's own error, or the server's status. */
         readonly reason: string,
-        options?: ErrorOptions
+        options?: ErrorOptions & { status?: number }
     ) {
         super(`Could not download ${resource}: ${reason}`, options)
         this.name = 'ResourceDownloadError'
+        this.status = options?.status
     }
 }
 
@@ -119,7 +126,8 @@ async function download(url: URL, name: string): Promise<Uint8Array> {
             void response.body?.cancel().catch(() => undefined)
             throw new ResourceDownloadError(
                 name,
-                `${response.status} ${response.statusText}`.trim()
+                `${response.status} ${response.statusText}`.trim(),
+                { status: response.status }
             )
         }
         awaitData()

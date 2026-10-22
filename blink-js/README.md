@@ -594,7 +594,9 @@ A library is downloaded the first time any load needs it, and NASM's
 `ResourceDownloadError` naming what it could not get when the request fails, the
 server answers with an error status, or nothing arrives for 20 seconds
 (`RESOURCE_STALL_TIMEOUT_MS`), however long the whole download takes, as in
-"Could not download libc.so.6: no data for 20 s". A failed download is forgotten,
+"Could not download libc.so.6: no data for 20 s". Its `status` is the server's
+HTTP status when the server answered with an error, which trying the same URL
+again does not change, and undefined otherwise. A failed download is forgotten,
 so the next load or build downloads it again. A build that throws this way leaves
 no program, and the next build can start.
 
