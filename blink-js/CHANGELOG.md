@@ -50,6 +50,15 @@
 - `loadExecutable` and `compileProject` take `onProgress`, told each `download`
   they wait for, then `load`, or `assemble` and `link`; `WasmAssembler.assemble`
   takes it too.
+- Creating a runtime, or `setMode`, downloads nothing. A build downloads a
+  blink-hosted assembler (GNU as, fasm) before it runs it, and GNU ld (2.7 MB)
+  only when it links: with NASM once the program has assembled, with GNU as
+  before it runs. Each reports `download` the first time, so a runtime that only
+  checks code never downloads the linker. Downloads are shared by every runtime
+  and forgotten when they fail, as the libraries are. A failed download of
+  either now fails the build that needed it rather than `createX86Emulator`.
+  `setMode` throws during a build, which would otherwise go on with the other
+  mode's tools.
 
 ## 7.0.0
 

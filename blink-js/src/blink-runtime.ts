@@ -9,7 +9,7 @@ import {
     type AssemblerMode
 } from './assemblers'
 import { writeArchive } from './archive'
-import { readResourceBytes } from './resources'
+import { readResourceBytes, type ResourceSource } from './resources'
 import { analyze } from './elf'
 import { loadDisassembler, type Disassembler } from './disassembler'
 import { LINUX_SYSCALL_NAMES } from './syscall-names'
@@ -88,6 +88,37 @@ const ARCHIVE_MEMBER = /^\/(?:program|support)\.a\(u(\d+)\.o\)$/
 /** The name of the archive's member at `position`: short enough to need no long-name table. */
 function archiveMemberName(position: number): string {
     return `u${position}.o`
+}
+
+/**
+ * The assemblers' and the linker's executables, downloaded the first time a build needs them and
+ * shared by every runtime, as the bundled libraries are: a promise while the download goes on, the
+ * bytes once it is done. A failed download is forgotten, so that the next build downloads it again.
+ * Keyed by URL, so the modes that link with GNU ld share one download of it.
+ */
+const toolDownloads = new Map<
+    string | ArrayBuffer | Uint8Array,
+    Uint8Array | Promise<Uint8Array>
+>()
+
+const toolKey = (file: ResourceSource) => (file instanceof URL ? file.href : file)
+
+function toolBytes(file: ResourceSource, name: string): Uint8Array | Promise<Uint8Array> {
+    const key = toolKey(file)
+    const known = toolDownloads.get(key)
+    if (known) return known
+    const promise: Promise<Uint8Array> = readResourceBytes(file, { name }).then(
+        (bytes) => {
+            if (toolDownloads.get(key) === promise) toolDownloads.set(key, bytes)
+            return bytes
+        },
+        (error: unknown) => {
+            if (toolDownloads.get(key) === promise) toolDownloads.delete(key)
+            throw error
+        }
+    )
+    toolDownloads.set(key, promise)
+    return promise
 }
 
 /** The wasm Core uses guest page tables; no guest range is ASan host shadow. */
@@ -189,8 +220,6 @@ export class BlinkRuntime {
     private projectMountUsed = false
     /** The executable the last build linked, or `loadElf()` was given, written out at each start. */
     private programBytes: Uint8Array | null = null
-    /** The assembler's and the linker's executables, by path, written out before each of their runs. */
-    private readonly tools = new Map<string, Uint8Array>()
     private sourceMap: SourceMap | null = null
     private sourceProject: X86Project | null = null
     private assembleOnly = false
@@ -306,26 +335,19 @@ export class BlinkRuntime {
         return runtime
     }
 
+    /**
+     * Downloads nothing: a build downloads the tools it runs the first time it needs them
+     * (`downloadTool`). A runtime that only checks code never links, and the linker, at 2.7 MB,
+     * is the largest file a build needs.
+     */
     async setMode(mode: AssemblerMode | AssemblerId): Promise<void> {
+        // A build waiting on a download would go on with the other mode's tools.
+        if (this.state === BlinkState.Assembling || this.state === BlinkState.Linking)
+            throw new Error(`Cannot change the assembler while emulator is ${this.state}`)
         this.mode = resolveAssemblerMode(mode)
         this.assemblerLogs = ''
         this.assemblerErrors = []
         this.setState(BlinkState.NotReady)
-        this.tools.clear()
-        if (this.mode.binaries.assembler) {
-            this.tools.set(
-                '/assembler',
-                await readResourceBytes(this.mode.binaries.assembler.file, {
-                    name: 'the assembler'
-                })
-            )
-        }
-        if (this.mode.binaries.linker) {
-            this.tools.set(
-                '/linker',
-                await readResourceBytes(this.mode.binaries.linker.file, { name: 'the linker' })
-            )
-        }
         this.setState(BlinkState.Ready)
     }
 
@@ -615,8 +637,15 @@ export class BlinkRuntime {
     }
 
     private async assembleInBlink(sourceProject: X86Project, replacement: number): Promise<void> {
-        stageX86Project(this.module.FS, sourceProject)
         this.setState(BlinkState.Assembling)
+        // Before staging, which enters the Entry's directory: a build this one superseded leaves
+        // the root as its last act when the same download lands, which must not be this build's
+        // working directory. The link follows the assembler's exit at once
+        // (`handleAssemblerExit`), so the linker is downloaded here too.
+        await this.downloadTool(this.mode.binaries.assembler, 'the assembler', replacement)
+        if (!this.assembleOnly)
+            await this.downloadTool(this.mode.binaries.linker, 'the linker', replacement)
+        stageX86Project(this.module.FS, sourceProject)
         this.buildProgress?.({ phase: 'assemble' })
         await defer()
         this.throwIfSuperseded(replacement)
@@ -673,6 +702,8 @@ export class BlinkRuntime {
             this.setState(BlinkState.Ready)
             return
         }
+        // Only now: a program that does not assemble has nothing to link.
+        await this.downloadTool(this.mode.binaries.linker, 'the linker', replacement)
         this.writeExecutableSync(ENTRY_OBJECT, entry!.object)
         const inputs = [ENTRY_OBJECT]
         const starts = others.filter((unit) =>
@@ -738,6 +769,20 @@ export class BlinkRuntime {
                     })
             }
         }
+    }
+
+    /** Waits for a tool's download when this is the first build to need it, and says so. */
+    private async downloadTool(
+        binary: { file: ResourceSource } | undefined,
+        resource: string,
+        replacement: number
+    ): Promise<void> {
+        if (!binary) return
+        const bytes = toolBytes(binary.file, resource)
+        if (!(bytes instanceof Promise)) return
+        this.buildProgress?.({ phase: 'download', resource })
+        await bytes
+        this.throwIfSuperseded(replacement)
     }
 
     /** A build stops where it resumes once a later load or build has replaced its program. */
@@ -1555,14 +1600,17 @@ export class BlinkRuntime {
      * way a shell echoes it, so it says which tool wrote what follows; neither reaches the
      * `stdout` and `stderr` callbacks, which are the program's.
      */
-    private runTool(progname: string, command: string): void {
+    private runTool(progname: '/assembler' | '/linker', command: string): void {
         this.clearWaitTransport()
         ++this.generation
         this.programSources = false
         this.assemblerLogs += `\n$ ${command}\n`
-        // Written each time: a program may have left a file of that name.
-        const tool = this.tools.get(progname)
-        if (tool) this.writeExecutableSync(progname, tool)
+        // Written each time: a program may have left a file of that name. The build downloaded it
+        // before it got here (`downloadTool`).
+        const binary =
+            progname === '/assembler' ? this.mode.binaries.assembler : this.mode.binaries.linker
+        const tool = binary && toolDownloads.get(toolKey(binary.file))
+        if (tool instanceof Uint8Array) this.writeExecutableSync(progname, tool)
         this.setEmulationArgs(progname, command, '')
         this.module._blinkenlib_run_fast()
     }

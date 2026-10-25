@@ -264,8 +264,10 @@ export type X86ProcessStart = {
  * What a build or a load is doing, told to its `onProgress` as it moves on. `download` waits for a
  * file the Core downloads the first time it needs it, which over a slow network is where the time
  * goes: `resource` is what it is called, as a `ResourceDownloadError` names it, a Bundled library
- * by its soname (`libc.so.6`) and NASM as `the assembler`. A build then reports `assemble` and
- * `link`, and a load `load` once its libraries are at hand.
+ * by its soname (`libc.so.6`), an assembler (NASM or a blink-hosted one) as `the assembler` and
+ * GNU ld as `the linker`. A build reports `assemble` and `link`, and a load `load` once its
+ * libraries are at hand. With NASM, the linker's download comes between `assemble` and `link`,
+ * once the program assembled; a blink-hosted assembler's build downloads both before `assemble`.
  */
 export type X86Progress =
     | { phase: 'download'; resource: string }

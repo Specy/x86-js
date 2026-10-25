@@ -215,8 +215,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * only for a symbol still undefined (see {@link X86Emulator.projectLinking}). A unit nothing
      * needs is assembled, and its mistakes reported, but left out of the program. Throws for a
      * Project it cannot take, such as one whose library path is also a File's, and with a
-     * `ResourceDownloadError` when the assembler could not be downloaded. `options.onProgress`
-     * hears of each phase as it starts (see {@link X86Progress}).
+     * `ResourceDownloadError` when the assembler or the linker could not be downloaded.
+     * `options.onProgress` hears of each phase as it starts (see {@link X86Progress}).
      */
     async compileProject(
         project: X86Project,

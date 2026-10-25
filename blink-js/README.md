@@ -591,21 +591,26 @@ read it, and is removed before the first instruction. `getLoadedObjectBytes(path
 returns a copy for inspection, which can be changed freely. Debugger addresses,
 `getMemoryLayout()` and `resolveMemoryLabel()` include the main program's bias.
 
-A library is downloaded the first time any load needs it, and NASM's
-`nasm.wasm` the first time anything is assembled. A download throws a
-`ResourceDownloadError` naming what it could not get when the request fails, the
-server answers with an error status, or nothing arrives for 20 seconds
-(`RESOURCE_STALL_TIMEOUT_MS`), however long the whole download takes, as in
-"Could not download libc.so.6: no data for 20 s". Its `status` is the server's
-HTTP status when the server answered with an error, which trying the same URL
-again does not change, and undefined otherwise. A failed download is forgotten,
-so the next load or build downloads it again. A build that throws this way leaves
-no program, and the next build can start.
+A library is downloaded the first time any load needs it, NASM's `nasm.wasm` the
+first time anything is assembled, a blink-hosted assembler (GNU as, fasm) the
+first time a build runs it, and GNU ld the first time a build that links needs
+it: with NASM once the program has assembled, with GNU as before it runs.
+Creating an emulator downloads nothing, and checking code never downloads the
+linker. A download throws a `ResourceDownloadError` naming what it could not get
+when the request fails, the server answers with an error status, or nothing
+arrives for 20 seconds (`RESOURCE_STALL_TIMEOUT_MS`), however long the whole
+download takes, as in "Could not download libc.so.6: no data for 20 s". Its
+`status` is the server's HTTP status when the server answered with an error,
+which trying the same URL again does not change, and undefined otherwise. A
+failed download is forgotten, so the next load or build downloads it again. A
+build that throws this way leaves no program, and the next build can start.
 
 `onProgress` reports what a load or a build is waiting for: a `download` of a
-resource it lacks (a library by its soname, NASM as `the assembler`), then `load`
-once a load has its libraries, or `assemble` and `link` for a build. It hears
-nothing once a later load or build has superseded its own.
+resource it lacks (a library by its soname, an assembler as `the assembler`, GNU
+ld as `the linker`), then `load` once a load has its libraries, or `assemble`
+and `link` for a build. With NASM the linker's download comes between `assemble`
+and `link`; a blink-hosted assembler's build downloads both before `assemble`.
+It hears nothing once a later load or build has superseded its own.
 
 ```ts
 await emulator.loadExecutable(bytes, {
