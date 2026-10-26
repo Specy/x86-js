@@ -337,6 +337,37 @@ describe('wait lifecycle and Linux readiness', () => {
         expect(quadwords(Uint8Array.from(bytes))).toEqual([0n, 1n, 500000000n])
         emulator.dispose()
     })
+    it('gives the remaining time of a short wait exactly on a real-time clock far from zero', async () => {
+        // A Testcase's calendar starts at 2000-01-01, about 9.5e17 ns, where a double keeps only
+        // every 128th nanosecond: taken in floating point, a 10 ns sleep had no time left at all,
+        // and a virtual clock advanced by that never reached the deadline.
+        let elapsed = 0
+        const waits: { clock: number; remainingMilliseconds: number | null }[] = []
+        const emulator = await make(
+            ['mov qword [buf+8], 10', 'sys 230, 0, 0, buf, 0', 'save', 'finish'],
+            {
+                now: (clock) => (clock === 0 ? 946_684_800_000 + elapsed : elapsed),
+                wait: async ({ clock, remainingMilliseconds }) => {
+                    waits.push({ clock, remainingMilliseconds })
+                    if (waits.length > 10) throw new Error('the wait never ends')
+                    elapsed += remainingMilliseconds!
+                }
+            }
+        )
+        const bytes: number[] = []
+        emulator.on('stderr', (chunk) => {
+            bytes.push(...chunk)
+        })
+        for (let slice = 0; slice < 20 && !emulator.hasTerminated(); slice++) {
+            await emulator.run(100000)
+            await new Promise((resolve) => setTimeout(resolve, 0))
+        }
+        expect(waits[0]).toEqual({ clock: 0, remainingMilliseconds: 0.00001 })
+        // the calendar itself moves only a double's step at a time, so the wait may ask again
+        expect(waits.every(({ remainingMilliseconds }) => remainingMilliseconds! > 0)).toBe(true)
+        expect(quadwords(Uint8Array.from(bytes))).toEqual([0n])
+        emulator.dispose()
+    })
     it('invalid ppoll timeout unwinds its mask before the next syscall', async () => {
         await expectLinux(
             [

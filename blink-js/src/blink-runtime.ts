@@ -1700,9 +1700,7 @@ export class BlinkRuntime {
                 clock,
                 deadlineNanoseconds: deadline < 0n ? null : deadline,
                 remainingMilliseconds:
-                    deadline < 0n
-                        ? null
-                        : Math.max(0, Number(deadline) / 1e6 - this.hostNow(clock)),
+                    deadline < 0n ? null : millisecondsUntil(deadline, this.hostNow(clock)),
                 acceptsInput: Boolean(this.module._blinkenlib_wait_input()),
                 instructionSerial: this.getCurrentInstructionSerial()!
             }
@@ -2064,6 +2062,20 @@ function copyX86Project(project: X86Project): X86Project {
         ...(project.library ? { library: copy(project.library) } : {}),
         ...(project.startUnits ? { startUnits: copy(project.startUnits) } : {})
     }
+}
+
+/**
+ * Milliseconds from `now`, a clock's time as the environment gives it, to `deadline`, nanoseconds
+ * on that clock. The difference is taken in whole nanoseconds after turning `now` into them as the
+ * native HostNow does, so it is above zero for exactly as long as the guest still waits. In floating
+ * point, a real-time deadline (about 1.7e18 ns) keeps only every 256th nanosecond, so a short wait
+ * could read as already over, and a virtual clock advanced by it would never reach the deadline.
+ */
+function millisecondsUntil(deadline: bigint, now: number): number {
+    const seconds = Math.trunc(now / 1000)
+    const nanoseconds = Math.trunc((now - seconds * 1000) * 1e6)
+    const remaining = deadline - (BigInt(seconds) * 1_000_000_000n + BigInt(nanoseconds))
+    return remaining > 0n ? Number(remaining) / 1e6 : 0
 }
 
 /**

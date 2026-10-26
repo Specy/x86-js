@@ -59,6 +59,10 @@
   either now fails the build that needed it rather than `createX86Emulator`.
   `setMode` throws during a build, which would otherwise go on with the other
   mode's tools.
+- A wait request's `remainingMilliseconds` is taken in whole nanoseconds, as
+  the guest compares its deadline. In floating point, a short wait on a
+  real-time clock far from zero could come out as 0 while the guest still
+  waited, so a virtual clock advanced by it never reached the deadline.
 
 ## 7.0.0
 
