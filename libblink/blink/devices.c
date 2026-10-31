@@ -33,6 +33,7 @@
 #include "blink/endian.h"
 #include "blink/environment.h"
 #include "blink/errno.h"
+#include "blink/fbdev.h"
 #include "blink/linux.h"
 #include "blink/macros.h"
 #include "blink/syscall.h"
@@ -436,7 +437,7 @@ static int IoctlInput(struct Machine *m, int fildes, u64 request, i64 addr) {
   }
 
 static const struct FdCb kFdCbFramebuffer =
-    DEVICE_CB(ReadNothing, WriteNothing, PollReady, IoctlUnknown);
+    DEVICE_CB(ReadFramebuffer, WriteFramebuffer, PollReady, IoctlFramebuffer);
 static const struct FdCb kFdCbInput =
     DEVICE_CB(ReadInput, WriteInput, PollWritable, IoctlInput);
 static const struct FdCb kFdCbDsp =
@@ -478,6 +479,10 @@ int OpenDevice(struct Machine *m, struct Fd *fd, const struct DeviceNode *node) 
   df->status = fd->oflags & SETFL_FLAGS;
   if (node->kind == DEVICE_MIDI) {
     DeviceDrainSet(&df->drain, MIDI_BUFFER_BYTES, MIDI_BYTES_PER_SECOND);
+  }
+  if (node->kind == DEVICE_FRAMEBUFFER && OpenFramebuffer() == -1) {
+    free(df);
+    return -1;
   }
   fd->cb = GetDeviceCb(node);
   fd->device = df;

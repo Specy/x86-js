@@ -42,6 +42,7 @@ import {
 } from './file-system'
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
 import { decodeTerminalMode, decodeWakeSources, installDevices } from './devices'
+import { checkDisplayMode, FramebufferView } from './framebuffer'
 import {
     BlinkState,
     END_OF_INPUT,
@@ -59,7 +60,10 @@ import {
     type X86Progress,
     type X86Project,
     type X86SourceLocation,
-    type X86TerminalMode
+    type X86TerminalMode,
+    type X86DisplayMode,
+    type X86Framebuffer,
+    type X86FramebufferPresent
 } from './types'
 import { observeCallbackResult, type MaybePromise } from './callbacks'
 import { X86_FPU_STATE_SIZE, emptyFpuStateBlock } from './fpu-state'
@@ -166,6 +170,8 @@ export type BlinkRuntimeCallbacks = {
     terminalMode?: (mode: X86TerminalMode) => MaybePromise<void>
     /** A program opened a device node the machine does not cover; the open failed with ENODEV. */
     unsupportedDevice?: (event: { path: string }) => MaybePromise<void>
+    /** The program panned, synced or blanked the framebuffer, or Undo moved its scanout. */
+    framebufferPresent?: (event: X86FramebufferPresent) => MaybePromise<void>
 }
 
 export type BlinkRuntimeOptions = {
@@ -337,6 +343,9 @@ export class BlinkRuntime {
         }
         module.blinkUnsupportedDevice = (path) => {
             if (runtime?.programSources) runtime.report(callbacks.unsupportedDevice, { path })
+        }
+        module.blinkFramebufferPresent = (yoffset) => {
+            if (runtime?.programSources) runtime.report(callbacks.framebufferPresent, { yoffset })
         }
         module.onUnimplementedSyscall = (number) => {
             if (runtime?.programSources)
@@ -1197,6 +1206,20 @@ export class BlinkRuntime {
         return true
     }
 
+    /** The display mode the next program starts with, the guest's `video=`. */
+    setDisplayMode(mode: X86DisplayMode): void {
+        checkDisplayMode(mode)
+        if (!this.module._blinkenlib_set_display_mode?.(mode.width, mode.height))
+            throw new Error('This Core has no framebuffer')
+    }
+
+    /** The framebuffer the program opened, which lasts until the next program starts; or null. */
+    getFramebuffer(): X86Framebuffer | null {
+        if (!FramebufferView.exists(this.module)) return null
+        return (this.framebuffer ??= new FramebufferView(this.module))
+    }
+    private framebuffer: FramebufferView | null = null
+
     /**
      * A host callback a system call reached, reported as an asynchronous callback's failure is
      * when it throws, so that nothing unwinds the wasm in the middle of the call.
@@ -2003,7 +2026,8 @@ function withDefaultCallbacks(
         unimplementedSyscall: callbacks.unimplementedSyscall ?? (() => undefined),
         waitRequest: callbacks.waitRequest ?? (() => undefined),
         terminalMode: callbacks.terminalMode ?? (() => undefined),
-        unsupportedDevice: callbacks.unsupportedDevice ?? (() => undefined)
+        unsupportedDevice: callbacks.unsupportedDevice ?? (() => undefined),
+        framebufferPresent: callbacks.framebufferPresent ?? (() => undefined)
     }
 }
 

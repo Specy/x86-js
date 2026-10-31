@@ -85,6 +85,7 @@ struct DeviceFile {
   u64 progress_identity;
   u64 progress;
   struct DeviceDrain drain;
+  i64 position;  // the file offset, for a device that has one: fbdev.c
 };
 
 const struct DeviceNode *GetDeviceNodes(int *);

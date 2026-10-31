@@ -186,6 +186,9 @@ emulator.on('terminalMode', (mode) => {
 emulator.on('unsupportedDevice', ({ path }) => {
     /* the program opened /dev/dri/card0 or another node the machine does not cover */
 })
+emulator.on('framebufferPresent', ({ yoffset }) => {
+    /* the program panned, synced or blanked /dev/fb0: show getFramebuffer().visible() now */
+})
 ```
 
 Callbacks passed to `createX86Emulator()` and handlers registered with `on()` may return either `void` or `Promise<void>`. Async callbacks are observed but not awaited by the emulator, so UI work can be scheduled without blocking execution. A `stdout`, `stderr`, `terminalMode` or `unsupportedDevice` callback that throws is reported as a rejected promise is, asynchronously, and the call that raised it still succeeds. [Standard streams](#standard-streams) says what `stdout`, `stderr`, `inputRequest` and `terminalMode` carry, and [Devices](#devices) what `unsupportedDevice` does.
@@ -252,9 +255,43 @@ What `open()` makes is an open file description, which `dup()` shares, with its 
 - the input devices answer `EVIOCGVERSION`, `EVIOCGID`, `EVIOCGNAME`, `EVIOCGPHYS` and `EVIOCGUNIQ`; a read takes whole 24-byte events (EINVAL for a smaller buffer) and none ever comes, so a blocking read waits, with the keyboard or the tablet in its `waitRequest`'s `wakeSources.inputDevices`, and an `O_NONBLOCK` one answers EAGAIN;
 - the raw MIDI port takes bytes at MIDI's 31,250 baud on Program time behind a 4 KiB buffer: a write queues what fits and, unless `O_NONBLOCK`, waits for room until every byte is queued, and `poll` waits for room with the moment a byte drains as its deadline. Nothing plays them yet;
 - `/dev/tty0` takes writes and never yields a read;
-- `/dev/fb0`, `/dev/dsp` and `/dev/mixer` open and answer EINVAL to a read or a write.
+- `/dev/fb0` is the framebuffer, below;
+- `/dev/dsp` and `/dev/mixer` open and answer EINVAL to a read or a write.
 
 A wait's `wakeSources` say what can end it besides its deadline: `terminal`, input given to the terminal, and `inputDevices`, events reaching the keyboard or the tablet, the only input devices a host delivers events to. A device that keeps time, such as the MIDI port draining, folds the moment it is ready into the deadline. A blocking write Blink starts over after a wait goes on from what it already queued, which the open file description keeps for that instruction alone.
+
+### The framebuffer
+
+`/dev/fb0` answers as Linux's DRM fbdev emulation does on the guest's bochs display (`drm_fbdev_ttm` behind `fb_chrdev.c`, Linux 6.12): one little-endian `0x00RRGGBB` word a pixel, XRGB8888, over two pages. Its size is the machine's display mode, which `setDisplayMode({ width, height })` sets for the next program start, as the guest's `video=` does: a width that is a multiple of 8 and a height, both 8 to 1024, 320×240 until set. A program reads it and never changes it.
+
+```ts
+emulator.setDisplayMode({ width: 320, height: 240 }) // from the next start on
+await emulator.run()
+const framebuffer = emulator.getFramebuffer() // null until the program opens /dev/fb0
+if (framebuffer) {
+    const page = framebuffer.visible() // height × lineLength bytes, a view of the wasm heap
+    const xrgb = new Uint32Array(page.buffer, page.byteOffset, page.length / 4)
+    const rgba = new Uint32Array(image.data.buffer) // an ImageData of width × height
+    for (let i = 0; i < rgba.length; i++) {
+        const word = framebuffer.blanked ? 0 : xrgb[i]! // lineLength is width × 4
+        rgba[i] = 0xff000000 | ((word & 0xff) << 16) | (word & 0xff00) | ((word >> 16) & 0xff)
+    }
+}
+```
+
+- `FBIOGET_FSCREENINFO` gives `id` `bochs-drmdrmfb`, `smem_start` 0 (hidden, as DRM hides it), `smem_len` the buffer's size, `width × 4 × height × 2` rounded up to whole pages, `FB_TYPE_PACKED_PIXELS`, `FB_VISUAL_TRUECOLOR`, `xpanstep` and `ypanstep` 1, `ywrapstep` 0, `line_length` `width × 4` and `FB_ACCEL_NONE`.
+- `FBIOGET_VSCREENINFO` gives the mode as `xres` and `yres`, `xres_virtual` the width and `yres_virtual` twice the height (`drm_fbdev_overalloc=200`), the offsets, 32 bits a pixel with red at 16, green at 8 and blue at 0, eight bits each and no transparency, and the display's size in mm, 320 by 200 (QEMU's EDID), with every timing 0.
+- `FBIOPUT_VSCREENINFO` answers as `drm_fb_helper_check_var()` does: a size up to the buffer's and at least 8 by 8 is accepted and read back while the scanout keeps showing the whole mode, a depth of 32 or less reads back as 32, a pixel clock is cleared, and a larger size, a larger virtual size, grayscale, `nonstd` or a pixel format other than the device's, explicit or not, answers EINVAL; all fields zero takes the device's. A new `yoffset` pans. `FB_ACTIVATE_TEST` checks without setting, and `FB_ACTIVATE_INV_MODE` refuses the mode in use.
+- `FBIOPAN_DISPLAY` pans within what the screen information's size leaves of the buffer (EINVAL past it, and for `FB_VMODE_YWRAP`), and answers ENOSPC where the whole mode would not fit, as DRM's commit does. A double-buffering program draws on the page it does not show and pans to it.
+- `FBIO_WAITFORVSYNC` waits until the next 1/60 s boundary of Program time, a wait with that deadline and no wake source that a signal does not end; in a Testcase the virtual clock moves to it. It reads no argument.
+- `FBIOBLANK` takes `FB_BLANK_UNBLANK` to `FB_BLANK_POWERDOWN` (EINVAL above): anything but unblank turns the display off, `blanked` says so, and the next pan or size set turns it on again. `FBIO_CURSOR` answers EINVAL, and any other request ENOTTY, `FBIOGETCMAP`, `FBIOPUTCMAP` and the console map requests included, which the guest would answer.
+- `mmap` of `MAP_SHARED` points the guest's pages into the one buffer, every page present, so every mapping, `read` and `write` see the same bytes, and `munmap` never gives its pages back. A range past `smem_len` answers EINVAL, where the guest would map it and raise SIGBUS at the first touch past the end. `MAP_PRIVATE` is a copy made at `mmap`, as a private mapping of a file is here; the guest's is copy-on-write, so a page not yet written there still shows later changes.
+- `read`, `write`, `pread64`, `pwrite64`, `readv` and `writev` reach the same buffer at the open file description's offset, which `dup()` shares, as `fb_sys_read()` and `fb_sys_write()` do: short at the end of `smem_len`, a read past it 0, a write at it ENOSPC and past it EFBIG. `lseek` takes any offset from 0 on (`SEEK_END` counts from 0, `SEEK_DATA` and `SEEK_HOLE` find no data), and `preadv2` and `pwritev2` take no flag but `RWF_HIPRI`. `fsync` and `fdatasync` present.
+- The buffer is made black when the program first opens `/dev/fb0` and lasts, as the program left it, until the next program starts or the session is cleared; a program that opens it again finds it as it was.
+
+The `framebufferPresent` event, with the line the scanout starts at, comes at every pan that took, `FBIOPUT_VSCREENINFO` included, at `fsync` and `fdatasync`, when `FBIOBLANK` turns the display off or on, and when Undo moves the scanout or blanks it. A host shows the visible page then, at the end of every run slice and at every wait; nothing else marks what changed, so it reads the whole page, which the view gives without a copy. `visible()` is made again when the wasm heap has grown or the scanout moved, and the object `getFramebuffer()` returns reads every property from the Core when asked.
+
+**Undo.** A store through a mapping is an ordinary memory write, and a `rep stosd` clearing a whole page stays one undoable step. What a `write` replaces, the offset `read`, `write` and `lseek` move, and the screen information, pan and blank the ioctls change are journaled too, so none of them is an Undo barrier; a read into memory larger than the 64 KiB one instruction keeps is, as for any File. Opening `/dev/fb0` and mapping it stay barriers, as every descriptor and mapping change is.
 
 ### Each run starts afresh
 

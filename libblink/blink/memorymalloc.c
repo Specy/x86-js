@@ -30,6 +30,7 @@
 #include "blink/debug.h"
 #ifdef __EMSCRIPTEN__
 #include "blink/debughistory.h"
+#include "blink/fbdev.h"
 #endif
 #include "blink/errno.h"
 #include "blink/fds.h"
@@ -842,7 +843,7 @@ static void FreeCopiedPages(struct System *s, u64 *copies, i64 from, i64 to) {
 // is, so a large mapping of a small file costs no memory until touched.
 // Returns how many pages were copied, or -1 with errno set.
 static i64 CopyFilePages(struct System *s, int fd, i64 offset, i64 pages,
-                         i64 filesize, u64 **out) {
+                         i64 filesize, const u8 *device, u64 **out) {
   u8 *page;
   u64 *copies;
   i64 i, count, copied;
@@ -859,6 +860,11 @@ static i64 CopyFilePages(struct System *s, int fd, i64 offset, i64 pages,
     }
     page = (u8 *)(uintptr_t)(copies[i] & PAGE_TA);
     memset(page, 0, 4096);
+    // a device's memory, which a read of its descriptor would not give
+    if (device) {
+      memcpy(page, device + i * 4096, 4096);
+      continue;
+    }
     for (copied = 0; copied < 4096;) {
       received = pread(fd, page + copied, 4096 - copied,
                        offset + i * 4096 + copied);
@@ -899,6 +905,9 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
   // call has mapped so far (see CopyFilePages()).
   u64 *copies = 0;
   i64 filepages = 0, copiesmapped = 0;
+  // The host bytes of a device's own memory the mapping shows, the
+  // framebuffer's: a shared mapping's pages point into them.
+  u8 *device = 0;
 #endif
 
   // we determine these
@@ -942,13 +951,20 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
 #ifdef __EMSCRIPTEN__
   // Everything that can refuse the mapping does so before the existing one
   // is removed. Linux maps only regular files here: a directory, a pipe, a
-  // terminal or a device such as /dev/null answers ENODEV.
+  // terminal or a device such as /dev/null answers ENODEV. The framebuffer
+  // maps its own memory, whole pages it never gives back; a private mapping
+  // of it is a copy, as one of a file is.
   if (fd != -1) {
     struct stat st;
     if (fstat(fd, &st) == -1) return -1;
-    if (!S_ISREG(st.st_mode)) return enodev();
-    if (copyfile && (filepages = CopyFilePages(s, fd, offset, pages,
-                                               st.st_size, &copies)) == -1) {
+    if (S_ISCHR(st.st_mode)) {
+      if (!(device = MapFramebuffer(s, fd, offset, size))) return -1;
+      st.st_size = offset + pages * 4096;
+    } else if (!S_ISREG(st.st_mode)) {
+      return enodev();
+    }
+    if (copyfile && (filepages = CopyFilePages(s, fd, offset, pages, st.st_size,
+                                               device, &copies)) == -1) {
       return -1;
     }
   }
@@ -1044,6 +1060,13 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
       s->memstat.committed += filepages;
       s->memstat.reserved += pages - filepages;
       flags |= PAGE_HOST;
+    } else if (device) {
+      // every page present, and PAGE_MAP without PAGE_MUG, which FreePage()
+      // leaves to its owner: munmap() never puts one on the free list
+      vss_delta += pages;
+      rss_delta += pages;
+      s->memstat.committed += pages;
+      flags |= PAGE_HOST | PAGE_MAP;
     } else
 #endif
     {
@@ -1093,6 +1116,10 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
             // wholly past the end of the file: a zero page on first touch
             entry = (flags & ~PAGE_HOST) | PAGE_RSRV | PAGE_V;
           }
+        } else if (device) {
+          real = (uintptr_t)device + (virt - result);
+          unassert(!(real & ~PAGE_TA));
+          entry = real | flags | PAGE_V;
         } else
 #endif
         if (flags & PAGE_MAP) {
@@ -1188,6 +1215,9 @@ OutOfMemory:
       s->memstat.reserved -= unmapped - (filepages - copiesmapped);
       FreeCopiedPages(s, copies, copiesmapped, filepages);
       free(copies);
+    } else if (device) {
+      s->memstat.committed -= unmapped;
+      rss_delta -= unmapped;
     } else
 #endif
     if (flags & PAGE_RSRV) {
