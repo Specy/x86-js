@@ -195,6 +195,16 @@ void SetWriteAddr(struct Machine *m, i64 addr, u32 size) {
   }
 }
 
+// Whether a rep string instruction that writes `size` more bytes would
+// outgrow what the write journal keeps for one instruction, having written
+// something already: it then stops between iterations, so that the history
+// can take the part it did, and goes on at once (see StringOp()).
+bool ShouldSplitString(struct Machine *m, u64 size) {
+  return m->recordwrites && m->writeoldcount &&
+         (size > MACHINE_WRITE_OLD_BYTES_MAX - m->writeoldbytesused ||
+          m->writeoldcount >= MACHINE_WRITE_RECORD_MAX);
+}
+
 // SetWriteAddr() for a write whose record the caller cuts to the length
 // actually written, or drops, once it's done (see SysRead), so it always
 // opens a record of its own instead of extending the last one.

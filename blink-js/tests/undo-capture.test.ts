@@ -275,7 +275,7 @@ describe('the first write into a page the program has not touched', () => {
         }
     })
 
-    it('captures a read into untouched .bss as one irreversible instruction', async () => {
+    it('captures a read into untouched .bss as one instruction, which Undo takes back', async () => {
         const lines = program(
             [
                 '  xor eax, eax',
@@ -297,7 +297,7 @@ describe('the first write into a page the program has not touched', () => {
             emulator.provideInput('hello\n')
             expect(emulator.getRegisterValue('rax')).toBe(6n)
             expect(emulator.getUndoHistory(100)).toHaveLength(depth + 1)
-            expect(emulator.canUndo()).toBe(false)
+            expect(emulator.canUndo()).toBe(true)
             expect(memoryMutations(emulator)).toEqual([
                 {
                     type: 'WriteMemoryBytes',
@@ -308,14 +308,10 @@ describe('the first write into a page the program has not touched', () => {
                     }
                 }
             ])
-            const after = emulator.runtime.getRegisterSnapshot()
-            expect(after).not.toEqual(registers)
-            expect(() => emulator.undo()).toThrow('cannot be undone')
-            expect(read(emulator, buffer, 16)).toEqual([
-                ...Array.from('hello\n', (c) => c.charCodeAt(0)),
-                ...filled(10, 0)
-            ])
-            expect(emulator.runtime.getRegisterSnapshot()).toEqual(after)
+            expect(emulator.runtime.getRegisterSnapshot()).not.toEqual(registers)
+            emulator.undo()
+            expect(read(emulator, buffer, 16)).toEqual(filled(16, 0))
+            expect(emulator.runtime.getRegisterSnapshot()).toEqual(registers)
         } finally {
             emulator.dispose()
         }
@@ -681,8 +677,10 @@ describe('the 64 KiB a step can capture', () => {
         }
     })
 
+    // Past 64 KiB the instruction stops between iterations for the history and goes on at once
+    // (x86-devices-plan.md, decision 6): still one row and one instruction, which Undo takes back
     it.each([false, true])(
-        'leaves rep stosq over more than 64 KiB irreversible (downward: %s)',
+        'undoes rep stosq over more than 64 KiB as one row (downward: %s)',
         async (down) => {
             const count = KiB64 / 8 + 1
             const lines = stosq(count, down)
@@ -692,30 +690,46 @@ describe('the 64 KiB a step can capture', () => {
                 const area =
                     emulator.getRegisterValue('rdi') - (down ? BigInt((count - 1) * 8) : 0n)
                 const depth = emulator.getUndoHistory(100).length
+                const executed = emulator.getInstructionsExecuted()
                 await emulator.step()
                 expect(emulator.getRegisterValue('rcx')).toBe(0n)
                 expect(read(emulator, area, count * 8)).toEqual(filled(count * 8, 0xff))
                 expect(emulator.getUndoHistory(100)).toHaveLength(depth + 1)
-                expect(emulator.canUndo()).toBe(false)
-                expect(() => emulator.undo()).toThrow(/cannot be undone/)
-                // The first 64 KiB, in the direction of the string, are one record
-                // with both sides; the rest is only counted.
-                const captured = down ? area + 8n : area
-                const rest = down ? area : area + BigInt(KiB64)
-                expect(memoryMutations(emulator)).toEqual([
-                    {
-                        type: 'WriteMemoryBytes',
-                        value: {
-                            address: captured,
-                            old: filled(KiB64, 0),
-                            new: filled(KiB64, 0xff)
-                        }
-                    },
-                    { type: 'Other', value: `Wrote 8 bytes to 0x${rest.toString(16)}` }
-                ])
-                // The refused undo changed nothing.
-                expect(read(emulator, area, count * 8)).toEqual(filled(count * 8, 0xff))
-                expect(emulator.getRegisterValue('rcx')).toBe(0n)
+                expect(emulator.getInstructionsExecuted()).toBe(executed + 1n)
+                expect(emulator.canUndo()).toBe(true)
+                // The first 64 KiB, in the direction of the string, are one part; the second,
+                // going on upward, extends it, and going on downward is a record of its own.
+                expect(memoryMutations(emulator)).toEqual(
+                    down
+                        ? [
+                              {
+                                  type: 'WriteMemoryBytes',
+                                  value: {
+                                      address: area + 8n,
+                                      old: filled(KiB64, 0),
+                                      new: filled(KiB64, 0xff)
+                                  }
+                              },
+                              {
+                                  type: 'WriteMemoryBytes',
+                                  value: { address: area, old: filled(8, 0), new: filled(8, 0xff) }
+                              }
+                          ]
+                        : [
+                              {
+                                  type: 'WriteMemoryBytes',
+                                  value: {
+                                      address: area,
+                                      old: filled(KiB64 + 8, 0),
+                                      new: filled(KiB64 + 8, 0xff)
+                                  }
+                              }
+                          ]
+                )
+                emulator.undo()
+                expect(read(emulator, area, count * 8)).toEqual(filled(count * 8, 0))
+                expect(emulator.getRegisterValue('rcx')).toBe(BigInt(count))
+                expect(emulator.getInstructionsExecuted()).toBe(executed)
             } finally {
                 emulator.dispose()
             }

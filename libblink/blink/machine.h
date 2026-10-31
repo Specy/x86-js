@@ -53,6 +53,7 @@
 #define kMachineWaitTrap             -14
 #define kMachineFakeTTYtrap          -12
 #define kMachineSingleStep           -13
+#define kMachineRepSplit             -15
 
 #define CR0_PE 0x01        // protected mode enabled
 #define CR0_MP 0x02        // monitor coprocessor
@@ -602,6 +603,7 @@ int GetDescriptor(struct Machine *, int, u64 *);
 void ResetRam(struct Machine *);
 void SetReadAddr(struct Machine *, i64, u32);
 void SetWriteAddr(struct Machine *, i64, u32);
+bool ShouldSplitString(struct Machine *, u64);
 void SetWriteAddrUnmerged(struct Machine *, i64, u32);
 int SyncVirtual(struct System *, i64, i64, int);
 int ProtectVirtual(struct System *, i64, i64, int, bool);

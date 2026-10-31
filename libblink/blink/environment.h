@@ -7,7 +7,9 @@ int HostNow(int, struct timespec *);
 struct timespec GuestWaitDeadline(struct timespec);
 void GuestWaitMask(struct Machine *, u64);
 void GuestWaitFinish(struct Machine *);
-_Noreturn void GuestWaitHalt(struct Machine *, struct timespec, bool);
+_Noreturn void GuestWaitHalt(struct Machine *, struct timespec, u32);
+_Noreturn void GuestWaitHaltWake(struct Machine *, struct timespec, u32,
+                                 struct timespec);
 bool GuestWaitCancelled(void);
 bool GuestWaitInterrupted(struct Machine *);
 bool GuestWaitInterruptedRestartable(struct Machine *);

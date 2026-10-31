@@ -28,7 +28,8 @@ import {
     type X86ExecutableInfo,
     type X86ExecutableOptions,
     type X86ProcessStart,
-    type X86Progress
+    type X86Progress,
+    type X86TerminalMode
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
@@ -81,7 +82,9 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         signal: new Set(),
         inputRequest: new Set(),
         waitRequest: new Set(),
-        unimplementedSyscall: new Set()
+        unimplementedSyscall: new Set(),
+        terminalMode: new Set(),
+        unsupportedDevice: new Set()
     }
 
     private lastCompileResult: X86CompileResult | null = null
@@ -150,6 +153,16 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 inputRequest: (event) => {
                     const result = options.callbacks?.inputRequest?.(event)
                     emulator?.emit('inputRequest', event)
+                    return result
+                },
+                terminalMode: (event) => {
+                    const result = options.callbacks?.terminalMode?.(event)
+                    emulator?.emit('terminalMode', event)
+                    return result
+                },
+                unsupportedDevice: (event) => {
+                    const result = options.callbacks?.unsupportedDevice?.(event)
+                    emulator?.emit('unsupportedDevice', event)
                     return result
                 }
             }
@@ -320,6 +333,39 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     setEnvironment(environment: import('./types').X86Environment): void {
         this.runtime.setEnvironment(environment)
     }
+
+    /**
+     * The settings the program set on its terminal, which the host's line discipline follows:
+     * canonical or raw, echo, signals and the carriage return and line feed conversions. Every
+     * program starts in canonical mode; the `terminalMode` event reports each change.
+     */
+    getTerminalMode(): X86TerminalMode {
+        return this.runtime.getTerminalMode()
+    }
+
+    /**
+     * Whether the terminal converts what `provideInput()` gives as `ICRNL`, `INLCR` and `IGNCR`
+     * say, and what the program writes as `OPOST`'s `ONLCR` and `OCRNL` say, as Linux's line
+     * discipline does: with both on, a program's `\n` reaches `stdout` as `\r\n` until it turns
+     * `ONLCR` off. Both are off unless asked for, until 8.0.0; a Testcase's scripted input, piped
+     * on Linux, has no line discipline to go through.
+     */
+    setTerminalProcessing(processing: { input?: boolean; output?: boolean }): void {
+        this.runtime.setTerminalProcessing(processing)
+    }
+
+    /**
+     * Queues a signal for the program, as the terminal does for Ctrl+C (`SIGINT`, 2) and Ctrl+\
+     * (`SIGQUIT`, 3) under `ISIG` (see `getTerminalMode().signals`). Like the terminal, it
+     * discards the input no read took, unless the program set `NOFLSH`. A running program takes
+     * it at its next instruction, a waiting one at once: its wait ends and the call starts over,
+     * finding the signal. A signal from outside the program cannot be undone, so the instruction
+     * it reached is an Undo barrier. Nothing happens when no program is running.
+     */
+    sendSignal(signal: number): void {
+        const waiting = this.runtime.isWaiting()
+        if (this.runtime.sendSignal(signal) && waiting) this.resumedByInput = true
+    }
     getInstructionsExecuted(): bigint {
         return this.runtime.getInstructionsExecuted()
     }
@@ -370,6 +416,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         this.eventHandlers.signal.clear()
         this.eventHandlers.inputRequest.clear()
         this.eventHandlers.waitRequest.clear()
+        this.eventHandlers.terminalMode.clear()
+        this.eventHandlers.unsupportedDevice.clear()
     }
 
     /** End the debug session before stopping its FileSystem capability; callbacks remain usable. */

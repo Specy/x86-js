@@ -50,6 +50,8 @@ export type EmscriptenFS = {
     mkdir(path: string, mode?: number): void
     mkdirTree(path: string): void
     mkdev(path: string, mode: number, dev: number): void
+    /** Gives the character devices numbered `dev` their stream operations. */
+    registerDevice(dev: number, ops: object): void
     symlink(target: string, path: string): void
     readlink(path: string): string
     readdir(path: string): string[]
@@ -143,6 +145,27 @@ export type BlinkenlibModule = {
     blinkHostNow?: (clock: number) => number
     blinkHostRandom?: (pointer: number, length: number) => void
     blinkHostError?: unknown
+    /** The terminal's mode changed, as `TERMINAL_MODE_*` bits. */
+    blinkTerminalMode?: (mode: number) => void
+    /** A program opened a device node the machine does not cover, named by its path. */
+    blinkUnsupportedDevice?: (path: string) => void
+    UTF8ToString(pointer: number): string
+    /** What can end the pending wait, as `WAKE_*` bits: 1 the terminal, 2 the keyboard, 4 the tablet. */
+    _blinkenlib_wait_wake_sources?(): number
+    /** The terminal's mode as `TERMINAL_MODE_*` bits (terminal.h). */
+    _blinkenlib_terminal_mode?(): number
+    _blinkenlib_set_terminal_processing?(input: boolean, output: boolean): void
+    _blinkenlib_send_signal?(signal: number): boolean
+    /** The device table (devices.c): each node's path, number, permissions and kind. */
+    _blinkenlib_device_count?(): number
+    _blinkenlib_device_path?(index: number): number
+    _blinkenlib_device_number?(index: number): number
+    _blinkenlib_device_mode?(index: number): number
+    _blinkenlib_device_kind?(index: number): number
+    _blinkenlib_device_link_count?(): number
+    _blinkenlib_device_link_path?(index: number): number
+    _blinkenlib_device_link_target?(index: number): number
+    _blinkenlib_input_devices_text?(): number
     _blinkenlib_get_brk(): bigint
     _blinkenlib_get_brk_start(): bigint
     _blinkenlib_get_stack_top(): bigint

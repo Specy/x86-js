@@ -13,6 +13,7 @@ const S_IFMT = 0o170000
 const S_IFDIR = 0o040000
 const S_IFCHR = 0o020000
 const S_IFLNK = 0o120000
+const S_IFREG = 0o100000
 
 type SkeletonEntry = {
     path: string
@@ -22,12 +23,14 @@ type SkeletonEntry = {
     rdev: number
     /** A symbolic link's target. */
     link?: string
+    /** A file's contents, such as `/proc/bus/input/devices`. */
+    content?: Uint8Array
 }
 
 /**
  * The file system a program starts with: `/dev`, `/proc` and an empty `/tmp`, as Emscripten made
- * them before anything ran, and the root's own permissions. A mount point is kept, and what is
- * under it belongs to the file system mounted there.
+ * them and the Core added its devices before anything ran, and the root's own permissions. A mount
+ * point is kept, and what is under it belongs to the file system mounted there.
  */
 export type FileSystemSkeleton = {
     readonly rootMode: number
@@ -41,6 +44,7 @@ export function captureFileSystemSkeleton(fs: EmscriptenFS): FileSystemSkeleton 
         const node = entryNode(fs, path)
         const entry: SkeletonEntry = { path, mode: node.mode, rdev: node.rdev ?? 0 }
         if (isType(node.mode, S_IFLNK)) entry.link = fs.readlink(path)
+        if (isType(node.mode, S_IFREG)) entry.content = readContent(fs, path)
         entries.push(entry)
         if (isType(node.mode, S_IFDIR) && !isMounted(fs, node)) {
             for (const name of children(fs, path)) visit(`${path}/${name}`)
@@ -79,6 +83,10 @@ export function resetFileSystem(fs: EmscriptenFS, skeleton: FileSystemSkeleton):
                 if (fs.readlink(child) !== entry.link) removeTree(fs, child)
                 continue
             }
+            if (entry.content && !sameBytes(readContent(fs, child), entry.content)) {
+                removeTree(fs, child)
+                continue
+            }
             if ((node.mode & 0o7777) !== (entry.mode & 0o7777)) fs.chmod(child, entry.mode & 0o7777)
             if (isType(node.mode, S_IFDIR) && !isMounted(fs, node)) prune(child)
         }
@@ -89,6 +97,10 @@ export function resetFileSystem(fs: EmscriptenFS, skeleton: FileSystemSkeleton):
         if (isType(entry.mode, S_IFDIR)) fs.mkdir(entry.path, entry.mode & 0o7777)
         else if (isType(entry.mode, S_IFCHR)) fs.mkdev(entry.path, entry.mode & 0o7777, entry.rdev)
         else if (entry.link !== undefined) fs.symlink(entry.link, entry.path)
+        else if (entry.content) {
+            fs.writeFile(entry.path, entry.content)
+            fs.chmod(entry.path, entry.mode & 0o7777)
+        }
     }
     if (!exists(fs, X86_WORKING_DIRECTORY)) fs.mkdir(X86_WORKING_DIRECTORY, 0o777)
     fs.chdir(X86_WORKING_DIRECTORY)
@@ -119,6 +131,21 @@ function exists(fs: EmscriptenFS, path: string): boolean {
     } catch {
         return false
     }
+}
+
+/** A file's bytes, whatever permissions a program left it with. */
+function readContent(fs: EmscriptenFS, path: string): Uint8Array {
+    const mode = entryNode(fs, path).mode
+    if (!(mode & 0o444)) fs.chmod(path, mode | 0o444)
+    try {
+        return Uint8Array.from(fs.readFile(path) as Uint8Array)
+    } finally {
+        if (!(mode & 0o444)) fs.chmod(path, mode & 0o7777)
+    }
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    return a.length === b.length && a.every((byte, index) => byte === b[index])
 }
 
 function isType(mode: number, type: number): boolean {

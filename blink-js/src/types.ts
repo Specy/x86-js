@@ -170,8 +170,47 @@ export type X86InputRequest = {
     maxBytes: bigint
 }
 
+/**
+ * The termios settings the program set on its terminal that the host's line discipline follows,
+ * the flag each is named after on, or off. Every program starts in canonical mode with all of them
+ * on.
+ */
+export type X86TerminalMode = {
+    /** `ICANON`: a read takes a line; off, the bytes typed so far, as `VMIN` and `VTIME` say. */
+    canonical: boolean
+    /** `ECHO`: what is typed is echoed. */
+    echo: boolean
+    /** `ISIG`: Ctrl+C and Ctrl+\ send `SIGINT` and `SIGQUIT` (see `sendSignal()`). */
+    signals: boolean
+    /** `ICRNL`: a carriage return typed is read as a line feed. */
+    crToNl: boolean
+    /** `OPOST`: output is processed, as the next flag says. */
+    outputProcessing: boolean
+    /** `ONLCR`: under `OPOST`, a line feed leaves as a carriage return and a line feed. */
+    nlToCrNl: boolean
+}
+
+/** The input devices the host delivers events to; the guest's others never receive any. */
+export type X86InputDeviceId = 'keyboard' | 'tablet'
+
+/** What can end a wait besides its deadline and a signal. */
+export type X86WakeSources = {
+    /** Input given to the terminal (`provideInput()`). */
+    terminal: boolean
+    /** Events reaching these input devices. */
+    inputDevices: X86InputDeviceId[]
+}
+
 export type X86EmulatorEventMap = {
     stateChange: { state: BlinkState; oldState: BlinkState }
+    /** The terminal's mode at each start of a program, and whenever the program changes it. */
+    terminalMode: X86TerminalMode
+    /**
+     * A program opened a device node the machine has but does not cover, such as
+     * `/dev/dri/card0`: the open failed with `ENODEV`. `path` is the node's own path, whatever
+     * link the program opened it through.
+     */
+    unsupportedDevice: { path: string }
     /** The bytes of one write to standard output, or to the terminal opened by another name. */
     stdout: Uint8Array
     /** The bytes of one write to standard error. */
@@ -188,11 +227,18 @@ export type X86EmulatorEventHandler<T extends X86EmulatorEventName> = (
     event: X86EmulatorEventMap[T]
 ) => MaybePromise<void>
 
-/** A pending syscall. Null deadline means an external wake source is required. */
+/**
+ * A pending syscall. A null deadline means only one of its wake sources, or a signal, can end it.
+ * A device that keeps time (a buffer draining, a port sending) folds the moment it is ready into
+ * the deadline.
+ */
 export type X86WaitRequest = {
     clock: number
     deadlineNanoseconds: bigint | null
     remainingMilliseconds: number | null
+    /** What can end the wait besides its deadline. */
+    wakeSources: X86WakeSources
+    /** `wakeSources.terminal`, kept until 8.0.0, which removes it. */
     acceptsInput: boolean
     instructionSerial: string
 }

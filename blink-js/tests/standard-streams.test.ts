@@ -286,7 +286,9 @@ describe('standard input', () => {
 })
 
 describe('a read that waits, in the history', () => {
-    it('records one read with memory mutations and refuses Undo across consumed input', async () => {
+    // ADR 0069: what a read waited for is not put back, so the read asks again, and neither is
+    // the rest of the line it waited for
+    it('records one read with memory mutations, which Undo asks again for', async () => {
         const emulator = await build(['sys 0, 0, buf, 64', 'save', 'finish'])
         try {
             emulator.initialize(64)
@@ -297,17 +299,21 @@ describe('a read that waits, in the history', () => {
             expect(emulator.getRecordedEntryCount() - before).toBe(1)
             expect(emulator.getRegisterValue('rax')).toBe(3n)
             expect(Array.from(emulator.readMemoryBytes(buffer, 3n))).toEqual([0x61, 0x62, 0x0a])
-            expect(emulator.getUndoHistory(1)[0].undoable).toBe(false)
-            expect(emulator.canUndo()).toBe(false)
-            expect(() => emulator.undo()).toThrow('cannot be undone')
-            expect(emulator.getRegisterValue('rax')).toBe(3n)
-            expect(Array.from(emulator.readMemoryBytes(buffer, 3n))).toEqual([0x61, 0x62, 0x0a])
+            expect(emulator.getUndoHistory(1)[0].undoable).toBe(true)
+            emulator.undo()
+            expect(emulator.getNextInstruction()?.code.toLowerCase()).toContain('syscall')
+            expect(Array.from(emulator.readMemoryBytes(buffer, 3n))).toEqual([0, 0, 0])
+            expect(await emulator.step()).toEqual({ terminated: false })
+            expect(emulator.getStatus()).toBe(EmulatorStatus.WaitingForInput)
+            emulator.provideInput('x\n')
+            expect(emulator.getRegisterValue('rax')).toBe(2n)
+            expect(Array.from(emulator.readMemoryBytes(buffer, 3n))).toEqual([0x78, 0x0a, 0])
         } finally {
             emulator.dispose()
         }
     })
 
-    it('retains every vector a readv wrote while refusing Undo across consumed input', async () => {
+    it('restores every vector a readv wrote on Undo', async () => {
         const emulator = await build([...TWO_VECTORS, 'sys 19, 0, buf2, 2', 'save', 'finish'])
         try {
             emulator.initialize(64)
@@ -325,10 +331,10 @@ describe('a read that waits, in the history', () => {
                 { address: base, old: [0, 0], new: [0x61, 0x62] },
                 { address: base + 64n, old: [0, 0], new: [0x63, 0x0a] }
             ])
-            expect(emulator.canUndo()).toBe(false)
-            expect(() => emulator.undo()).toThrow('cannot be undone')
-            expect(Array.from(emulator.readMemoryBytes(base, 2n))).toEqual([0x61, 0x62])
-            expect(Array.from(emulator.readMemoryBytes(base + 64n, 2n))).toEqual([0x63, 0x0a])
+            expect(emulator.canUndo()).toBe(true)
+            emulator.undo()
+            expect(Array.from(emulator.readMemoryBytes(base, 2n))).toEqual([0, 0])
+            expect(Array.from(emulator.readMemoryBytes(base + 64n, 2n))).toEqual([0, 0])
         } finally {
             emulator.dispose()
         }
@@ -373,7 +379,7 @@ describe('the terminal', () => {
         ])
     })
 
-    it('accepts TCSETS, TCSETSW, TCSETSF and TIOCSWINSZ and changes nothing', async () => {
+    it('stores what TCSETS, TCSETSW and TCSETSF set, and accepts TIOCSWINSZ and changes nothing', async () => {
         const run = await probe([
             'sys 16, 0, 0x5401, buf',
             'mov dword [buf + 12], 0', // raw mode, asked for
@@ -391,7 +397,7 @@ describe('the terminal', () => {
             'sys 16, 0, 0x5413, buf2 + 64',
             'saveq buf2 + 64'
         ])
-        expect(run.results).toEqual([0n, 0n, 0n, 0n, 0x8a3bn, 24n | (80n << 16n)])
+        expect(run.results).toEqual([0n, 0n, 0n, 0n, 0n, 24n | (80n << 16n)])
     })
 
     // glibc 2.42 and later ask with termios2 in tcgetattr() and isatty(), and decide from isatty()
@@ -430,7 +436,7 @@ describe('the terminal', () => {
         ])
     })
 
-    it('accepts TCSETS2, TCSETSW2 and TCSETSF2 and changes nothing', async () => {
+    it('stores the termios TCSETS2, TCSETSW2 and TCSETSF2 set, and keeps the speed c_cflag gives', async () => {
         const run = await probe([
             'sys 16, 0, 0x802c542a, buf',
             'mov dword [buf + 12], 0', // raw mode, asked for
@@ -445,7 +451,7 @@ describe('the terminal', () => {
             'saved buf2 + 12',
             'saved buf2 + 40'
         ])
-        expect(run.results).toEqual([0n, 0n, 0n, 0x8a3bn, 38400n])
+        expect(run.results).toEqual([0n, 0n, 0n, 0n, 38400n])
     })
 
     it("leads the process's group and session, and refuses a group it has not", async () => {

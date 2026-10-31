@@ -41,6 +41,7 @@ import {
     type FileSystemSkeleton
 } from './file-system'
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
+import { decodeTerminalMode, decodeWakeSources, installDevices } from './devices'
 import {
     BlinkState,
     END_OF_INPUT,
@@ -57,7 +58,8 @@ import {
     type X86Environment,
     type X86Progress,
     type X86Project,
-    type X86SourceLocation
+    type X86SourceLocation,
+    type X86TerminalMode
 } from './types'
 import { observeCallbackResult, type MaybePromise } from './callbacks'
 import { X86_FPU_STATE_SIZE, emptyFpuStateBlock } from './fpu-state'
@@ -160,6 +162,10 @@ export type BlinkRuntimeCallbacks = {
     inputRequest?: (event: X86InputRequest) => MaybePromise<void>
     waitRequest?: (event: X86WaitRequest) => MaybePromise<void>
     unimplementedSyscall?: (event: { number: number; name: string }) => MaybePromise<void>
+    /** The terminal's mode at each start of a program, and whenever the program changes it. */
+    terminalMode?: (mode: X86TerminalMode) => MaybePromise<void>
+    /** A program opened a device node the machine does not cover; the open failed with ENODEV. */
+    unsupportedDevice?: (event: { path: string }) => MaybePromise<void>
 }
 
 export type BlinkRuntimeOptions = {
@@ -253,6 +259,8 @@ export class BlinkRuntime {
         this.mode = mode
         this.callbacks = callbacks
         this.scheduler = scheduler
+        // the devices are part of every program's file system, which each start puts back
+        installDevices(module)
         this.skeleton = captureFileSystemSkeleton(module.FS)
     }
 
@@ -321,6 +329,15 @@ export class BlinkRuntime {
         ])
 
         runtime = new BlinkRuntime(module, mode, callbacks, scheduler, disassembler)
+        // Both arrive from inside a system call: a handler that throws is reported as an
+        // asynchronous one's failure, and the assembler's and linker's runs report nothing.
+        module.blinkTerminalMode = (bits) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.terminalMode, decodeTerminalMode(bits))
+        }
+        module.blinkUnsupportedDevice = (path) => {
+            if (runtime?.programSources) runtime.report(callbacks.unsupportedDevice, { path })
+        }
         module.onUnimplementedSyscall = (number) => {
             if (runtime?.programSources)
                 observeCallbackResult(
@@ -1130,14 +1147,66 @@ export class BlinkRuntime {
                 throw new TypeError('provideInput takes bytes, a string or END_OF_INPUT')
             this.module.blinkenlibProvideInput(bytes)
         }
-        if (this.state === BlinkState.ProgramWaitPause && this.waitRequest?.acceptsInput)
+        if (this.state === BlinkState.ProgramWaitPause && this.waitRequest?.wakeSources.terminal)
             return this.resumeWait()
+        return this.resumeRead()
+    }
+
+    /** Resumes a read that waited for input, which starts over: true when there was one. */
+    private resumeRead(): boolean {
         if (this.state !== BlinkState.ProgramReadlinePause) return false
         if (this.waitTimer !== null) clearTimeout(this.waitTimer)
         this.waitTimer = null
         this.setState(BlinkState.ProgramRunning)
         this.callNative(() => this.module._blinkenlib_faketty_resume())
         return true
+    }
+
+    /** The settings the program's terminal has now; canonical before any program ran. */
+    getTerminalMode(): X86TerminalMode {
+        return decodeTerminalMode(this.module._blinkenlib_terminal_mode?.() ?? 0x3f)
+    }
+
+    /**
+     * Whether the terminal applies `ICRNL` and its relatives to the input `provideInput()` gives,
+     * and `OPOST`'s `ONLCR` and `OCRNL` to what the program writes, as Linux's line discipline
+     * does when the program's termios asks for them. Both are off until asked for, which keeps
+     * what a program writes reaching `stdout` as it wrote it; 8.0.0 turns them on.
+     */
+    setTerminalProcessing(processing: { input?: boolean; output?: boolean }): void {
+        this.terminalProcessing = { ...this.terminalProcessing, ...processing }
+        this.module._blinkenlib_set_terminal_processing?.(
+            this.terminalProcessing.input,
+            this.terminalProcessing.output
+        )
+    }
+    private terminalProcessing = { input: false, output: false }
+
+    /**
+     * Queues a signal for the program, as the terminal does for Ctrl+C (`SIGINT`, 2) and Ctrl+\
+     * (`SIGQUIT`, 3) under `ISIG`, discarding the input no read took unless `NOFLSH` is set. A
+     * running program takes it at its next instruction; a waiting one at once, as its wait ends
+     * and the call starts over. True when a program was there to take it.
+     */
+    sendSignal(signal: number): boolean {
+        if (!Number.isInteger(signal) || signal < 1 || signal > 64)
+            throw new RangeError(`Not a signal number: ${signal}`)
+        if (!this.programSources || !this.module._blinkenlib_send_signal?.(signal)) return false
+        if (this.state === BlinkState.ProgramWaitPause) this.resumeWait()
+        else this.resumeRead()
+        return true
+    }
+
+    /**
+     * A host callback a system call reached, reported as an asynchronous callback's failure is
+     * when it throws, so that nothing unwinds the wasm in the middle of the call.
+     */
+    private report<T>(callback: (event: T) => MaybePromise<void>, event: T): void {
+        try {
+            observeCallbackResult(callback(event))
+        } catch (error) {
+            observeCallbackResult(Promise.reject(error))
+        }
     }
 
     readMemoryBytes(address: bigint, length: bigint): Uint8Array {
@@ -1696,12 +1765,17 @@ export class BlinkRuntime {
             this.clearWaitTransport()
             const deadline = this.module._blinkenlib_wait_deadline()
             const clock = this.module._blinkenlib_wait_clock()
+            const wakeSources = decodeWakeSources(
+                this.module._blinkenlib_wait_wake_sources?.() ??
+                    (this.module._blinkenlib_wait_input() ? 1 : 0)
+            )
             const request: X86WaitRequest = {
                 clock,
                 deadlineNanoseconds: deadline < 0n ? null : deadline,
                 remainingMilliseconds:
                     deadline < 0n ? null : millisecondsUntil(deadline, this.hostNow(clock)),
-                acceptsInput: Boolean(this.module._blinkenlib_wait_input()),
+                wakeSources,
+                acceptsInput: wakeSources.terminal,
                 instructionSerial: this.getCurrentInstructionSerial()!
             }
             this.waitRequest = request
@@ -1927,7 +2001,9 @@ function withDefaultCallbacks(
         stateChange: callbacks.stateChange ?? (() => undefined),
         inputRequest: callbacks.inputRequest ?? (() => undefined),
         unimplementedSyscall: callbacks.unimplementedSyscall ?? (() => undefined),
-        waitRequest: callbacks.waitRequest ?? (() => undefined)
+        waitRequest: callbacks.waitRequest ?? (() => undefined),
+        terminalMode: callbacks.terminalMode ?? (() => undefined),
+        unsupportedDevice: callbacks.unsupportedDevice ?? (() => undefined)
     }
 }
 

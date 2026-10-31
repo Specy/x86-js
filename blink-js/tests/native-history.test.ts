@@ -338,7 +338,7 @@ cell: dq 0
         }
     })
 
-    it('finishes a paused read as one irreversible row and checks the next breakpoint', async () => {
+    it('finishes a paused read as one row and checks the next breakpoint', async () => {
         const source =
             PREFIX +
             'xor eax, eax\nxor edi, edi\nlea rsi, [rel buffer]\nmov edx, 8\nsyscall\ninc rbx\njmp _start\nsection .data\nbuffer: dq 0x0102030405060708\n'
@@ -360,23 +360,23 @@ cell: dq 0
             })
             expect(emulator.stopReason?.kind).toBe('breakpoint')
             expect(emulator.getRegisterValue('rbx')).toBe(0n)
-            const after = emulator.runtime.getRegisterSnapshot()
             const row = emulator.getUndoHistory(1)[0]
-            expect(row.undoable).toBe(false)
+            expect(row.undoable).toBe(true)
             expect(row.mutations).toContainEqual({
                 type: 'WriteMemoryBytes',
                 value: { address, old: old.slice(0, 3), new: [97, 98, 10] }
             })
-            expect(() => emulator.undo()).toThrow('cannot be undone')
-            expect(emulator.runtime.getRegisterSnapshot()).toEqual(after)
             expect([...emulator.readMemoryBytes(address, 3n)]).toEqual([97, 98, 10])
             await emulator.step()
             expect(emulator.getRegisterValue('rbx')).toBe(1n)
-            expect(emulator.canUndoSteps(1)).toBe(true)
-            expect(emulator.canUndoSteps(2)).toBe(false)
+            expect(emulator.canUndoSteps(2)).toBe(true)
             emulator.undo()
             expect(emulator.getRegisterValue('rbx')).toBe(0n)
-            expect(emulator.canUndo()).toBe(false)
+            // the read, which asks again: what it waited for is not put back (ADR 0069)
+            emulator.undo()
+            expect([...emulator.readMemoryBytes(address, 8n)]).toEqual(old)
+            await emulator.step()
+            expect(emulator.getStatus()).toBe(EmulatorStatus.WaitingForInput)
         } finally {
             emulator.dispose()
         }
@@ -499,7 +499,7 @@ cell: dq 0
 
     it.each([
         ['no history at all', undefined, 'records no undo history'],
-        ['history of another version', 3, 'records undo history version 3']
+        ['history of another version', 2, 'records undo history version 2']
     ])('refuses a wasm with %s when the emulator is created', async (_, version, message) => {
         const create = BlinkRuntime.create.bind(BlinkRuntime)
         vi.spyOn(BlinkRuntime, 'create').mockImplementationOnce(async (options) => {

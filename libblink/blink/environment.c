@@ -7,6 +7,7 @@
 #include "blink/signal.h"
 #include "blink/linux.h"
 #include "blink/debughistory.h"
+#include "blink/devices.h"
 #include <stdint.h>
 #include <limits.h>
 #ifdef __EMSCRIPTEN__
@@ -16,7 +17,15 @@ EM_JS(double, HostMilliseconds, (int clock), {
   catch (error) { Module.blinkHostError = error; return 0; }
 });
 #endif
-static bool pending, masked, cancelled, input_wait;
+static bool pending, masked, cancelled;
+/* What can end the wait besides its deadline, as WAKE_* bits (devices.h). */
+static u32 wake_sources;
+/* When a device the wait is on becomes ready, in Program time on the
+ * monotonic clock. Unlike `deadline`, which a wait keeps across the times its
+ * instruction starts over, a device's readiness is worked out again each
+ * time, so it is only folded into the deadline the host is told. */
+static bool wake_armed;
+static struct timespec wake_at;
 static u64 saved_mask;
 static int wait_clock = CLOCK_MONOTONIC;
 static int reported_wait_clock = CLOCK_MONOTONIC;
@@ -137,7 +146,8 @@ void GuestWaitMask(struct Machine *m, u64 mask) {
 void GuestWaitFinish(struct Machine *m) {
   if (masked) m->sigmask = saved_mask;
   m->issigsuspend = false;
-  pending = masked = cancelled = input_wait = false;
+  pending = masked = cancelled = wake_armed = false;
+  wake_sources = 0;
   wait_clock = CLOCK_MONOTONIC;
   reported_wait_clock_valid = false;
   deadline = GetZeroTime();
@@ -150,10 +160,26 @@ void GuestWaitRestoreMask(struct Machine *m) {
   m->issigsuspend = false;
 }
 bool GuestWaitCancelled(void) { return cancelled; }
-_Noreturn void GuestWaitHalt(struct Machine *m, struct timespec until, bool input) {
+/* Halts the instruction until `until` on the wait's clock, or until one of
+ * the `wake` sources has something for it; it starts over when the host
+ * resumes it. */
+_Noreturn void GuestWaitHalt(struct Machine *m, struct timespec until, u32 wake) {
   deadline = GuestWaitDeadline(until);
   pending = true;
-  input_wait = input;
+  wake_sources = wake;
+  wake_armed = false;
+  reported_wait_clock_valid = false;
+  HaltMachine(m, kMachineWaitTrap);
+}
+/* As GuestWaitHalt(), and also until `at` on the monotonic clock, when a
+ * device the instruction waits on becomes ready. */
+_Noreturn void GuestWaitHaltWake(struct Machine *m, struct timespec until,
+                                 u32 wake, struct timespec at) {
+  deadline = GuestWaitDeadline(until);
+  pending = true;
+  wake_sources = wake;
+  wake_armed = true;
+  wake_at = at;
   reported_wait_clock_valid = false;
   HaltMachine(m, kMachineWaitTrap);
 }
@@ -162,10 +188,15 @@ void blinkenlib_wait_cancel(void) { cancelled = true; }
 EMSCRIPTEN_KEEPALIVE
 bool blinkenlib_wait_pending(void) { return pending; }
 EMSCRIPTEN_KEEPALIVE
-bool blinkenlib_wait_input(void) { return input_wait; }
+bool blinkenlib_wait_input(void) { return wake_sources & WAKE_TERMINAL; }
+EMSCRIPTEN_KEEPALIVE
+u32 blinkenlib_wait_wake_sources(void) { return wake_sources; }
 EMSCRIPTEN_KEEPALIVE
 int64_t blinkenlib_wait_deadline(void) {
   int64_t timer = GuestTimerDeadline();
+  /* a device's readiness is on the monotonic clock, as the timer is */
+  if (wake_armed && (timer < 0 || ToNanoseconds(wake_at) < timer))
+    timer = ToNanoseconds(wake_at);
   int64_t wait = deadline.tv_sec == GetMaxTime().tv_sec ? -1 : ToNanoseconds(deadline);
   reported_wait_clock = wait_clock;
   reported_wait_clock_valid = true;

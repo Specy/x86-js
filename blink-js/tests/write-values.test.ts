@@ -341,17 +341,18 @@ describe('a store into a page the machine has not touched yet', () => {
 
 describe('a write the machine could not capture keeps its old shape', () => {
     it('reports neither value for a store the journal could only capture in part', async () => {
-        // `rep stosb` over more than the journal's 64 KiB of replaced bytes is
-        // one record the machine marks truncated.
+        // `rep stosb` over more than the 16 MiB of replaced bytes one instruction's parts keep
+        // between them (a part is what the journal's 64 KiB holds) is one record marked
+        // truncated.
         const emulator = await startedEmulator(
             `
 .global _start
 .bss
-.lcomm area, 200000
+.lcomm area, 16781312
 .text
 _start:
   lea area(%rip), %rdi
-  mov $100000, %rcx
+  mov $16781312, %rcx
   mov $0xab, %al
   rep stosb
   mov $60, %rax
@@ -367,7 +368,7 @@ _start:
         const entry = emulator.getUndoHistory(1)[0]!
         expect(entry.mutations).toContainEqual({
             type: 'Other',
-            value: `Wrote 100000 bytes to 0x${area.toString(16)}`
+            value: `Wrote 16781312 bytes to 0x${area.toString(16)}`
         })
         expect(entry.mutations.some((mutation) => mutation.type === 'WriteMemoryBytes')).toBe(false)
         expect(emulator.canUndo()).toBe(false)

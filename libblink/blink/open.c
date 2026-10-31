@@ -27,6 +27,7 @@
 #include "blink/assert.h"
 #include "blink/atomic.h"
 #include "blink/debug.h"
+#include "blink/devices.h"
 #include "blink/errno.h"
 #include "blink/fds.h"
 #include "blink/fspath.h"
@@ -132,8 +133,10 @@ int SysOpenat(struct Machine *m, i32 dirfildes, i64 pathaddr, i32 oflags,
   int fildes;
   int sysflags;
   struct Fd *fd;
+  struct stat st;
   const char *path;
   const struct FdCb *terminal;
+  const struct DeviceNode *device;
 // Emscripten's open() takes O_TMPFILE for O_DIRECTORY and opens the
 // directory itself, so there, too, the file is made and unlinked here.
 #if !defined(O_TMPFILE) || defined(__EMSCRIPTEN__)
@@ -156,11 +159,32 @@ int SysOpenat(struct Machine *m, i32 dirfildes, i64 pathaddr, i32 oflags,
       fildes = emfile();
     } else {
       terminal = GetTerminalDeviceCb(fildes);
+      // a device is known by the number of the node the path reached, so a
+      // udev link opens what it points at
+      device = !terminal && !VfsFstat(fildes, &st) && S_ISCHR(st.st_mode)
+                   ? FindDeviceNode(st.st_rdev)
+                   : 0;
+      if (device && device->kind == DEVICE_UNSUPPORTED) {
+        // the guest has a driver for it, which this machine does not
+        // emulate: the host names it in its Log
+        VfsClose(fildes);
+        NotifyUnsupportedDevice(device);
+        return enodev();
+      }
       LOCK(&m->system->fds.lock);
       unassert(fd = AddFd(&m->system->fds, fildes, sysflags));
       fd->path = JoinPath(GetDirFildesPath(m->system, dirfildes), path);
       // /dev/tty and /dev/std* are the terminal, as on linux
       if (terminal) fd->cb = terminal;
+      else if (device) {
+        if (OpenDevice(m, fd, device) == -1) {
+          dll_remove(&m->system->fds.list, &fd->elem);
+          UNLOCK(&m->system->fds.lock);
+          FreeFd(fd);
+          VfsClose(fildes);
+          return -1;
+        }
+      }
       else if (!strcmp(path, "/dev/urandom") || !strcmp(path, "/dev/random")) fd->cb = &kFdCbRandom;
       UNLOCK(&m->system->fds.lock);
     }

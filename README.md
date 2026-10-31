@@ -160,13 +160,15 @@ emulator.on('stdout',       (bytes) => { /* one write's bytes, a Uint8Array */ }
 emulator.on('stderr',       (bytes) => { /* ... */ })
 emulator.on('signal',       ({ signal, code }) => { /* ... */ })
 emulator.on('inputRequest', ({ maxBytes }) => { /* answer with provideInput() */ })
+emulator.on('terminalMode', (mode) => { /* the termios the program set: canonical, echo, ... */ })
+emulator.on('unsupportedDevice', ({ path }) => { /* a device node the machine does not cover */ })
 ```
 
 Callbacks passed to `createX86Emulator()` and handlers registered with `on()` may return either `void` or `Promise<void>`. Async callbacks are observed but not awaited by the emulator, so UI work can be scheduled without blocking execution.
 
 ### Standard streams and runs
 
-Descriptors 0 to 2 are a terminal, which `isatty()` recognises. Each write reaches the `stdout` or `stderr` callback as one call with its bytes. A read takes what `provideInput(bytes)` or `provideInput(END_OF_INPUT)` gave, as a read of a Linux terminal does, and waits, with an `inputRequest`, only when nothing is left. Every start of a program is a new process on a new file system, in an empty working directory, `/project`, and the toolchain's files are never there. The package README's [Standard streams](blink-js/README.md#standard-streams) and [Each run starts afresh](blink-js/README.md#each-run-starts-afresh) say exactly how.
+Descriptors 0 to 2 are a terminal, which `isatty()` recognises, with the termios the program sets. Each write reaches the `stdout` or `stderr` callback as one call with its bytes. A read takes what `provideInput(bytes)` or `provideInput(END_OF_INPUT)` gave, as a read of a Linux terminal does in the mode the program chose, and waits, with an `inputRequest`, when what is left does not satisfy it. The machine also has the QEMU guest's device files, `/dev/fb0`, `/dev/input/event*`, `/dev/dsp` and the rest, described in the package README's [Devices](blink-js/README.md#devices). Every start of a program is a new process on a new file system, in an empty working directory, `/project`, and the toolchain's files are never there. The package README's [Standard streams](blink-js/README.md#standard-streams) and [Each run starts afresh](blink-js/README.md#each-run-starts-afresh) say exactly how.
 
 ## Compiling C and C++
 

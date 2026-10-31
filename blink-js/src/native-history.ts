@@ -6,7 +6,13 @@ import type { BlinkenlibModule } from './wasm-types'
 import { makeFrameColor, toHistoryPc } from './x86-emulator-utils'
 
 /** The version of debughistory.c's packets this reader decodes. */
-const PACKET_VERSION = 2
+const PACKET_VERSION = 3
+/**
+ * A packet's header. The journal of what the step did beyond the CPU and memory (what a read of
+ * the terminal took, the termios it set) comes last, for the wasm's own Undo; nothing here reads
+ * it.
+ */
+const HEADER = 96
 
 type FpuMutations = (
     before: Uint8Array,
@@ -15,7 +21,7 @@ type FpuMutations = (
     writes?: PokeWrite[]
 ) => void
 
-/** Reader for debughistory.c's v1 packets. Nothing here runs per instruction. */
+/** Reader for debughistory.c's v3 packets. Nothing here runs per instruction. */
 export class NativeHistory {
     /**
      * Decoded rows by serial, with the length of the packet each was decoded from: the history
@@ -142,7 +148,7 @@ export class NativeHistory {
 
     previousFlags(): number | undefined {
         const pointer = this.runtime.module._blinkenlib_history_entry!(0)
-        return pointer ? this.view(pointer, 88).getUint32(40, true) : undefined
+        return pointer ? this.view(pointer, HEADER).getUint32(40, true) : undefined
     }
 
     canUndo(): boolean {
@@ -240,7 +246,7 @@ export class NativeHistory {
         const steps: ExecutionStep[] = []
         for (let index = 0; index < count; index++) {
             const pointer = this.runtime.module._blinkenlib_history_entry!(skip + index)
-            const header = this.view(pointer, 88)
+            const header = this.view(pointer, HEADER)
             const serial = header.getBigUint64(8, true)
             const length = header.getUint32(4, true)
             const undoable = Boolean(header.getUint32(20, true))
@@ -267,7 +273,7 @@ export class NativeHistory {
         const mutations: ExecutionStep['mutations'] = []
         const writes: PokeWrite[] | undefined = poke ? [] : undefined
         const mask = view.getUint32(56, true)
-        let offset = 88
+        let offset = HEADER
         for (let index = 0; index < X86_REGISTER_NAMES.length; index++) {
             if (!(mask & (1 << index))) continue
             const old = view.getBigUint64(offset, true)

@@ -1,13 +1,22 @@
 /* Debugger history stays in wasm. Slots retain their allocation when the ring
  * wraps, unless it is far larger than the new packet; JS only decodes the
  * compact packets that the History panel requests.
- * Packet v1: 88-byte LE header, changed GPR old/new pairs, optional two packed
- * FPU blocks, then 24-byte memory descriptors and their old/new byte images.
- * See native-history.ts for the matching reader.
+ * Packet v3: 96-byte LE header, changed GPR old/new pairs, optional two packed
+ * FPU blocks, 24-byte memory descriptors and their old/new byte images, then
+ * the journal: records of what the instruction did outside the CPU and memory
+ * that Undo takes back, each a kind, a size and that many bytes (see
+ * debughistory.h for the kinds). See native-history.ts for the matching
+ * reader.
+ *
+ * An instruction keeps at most 64 KiB of the bytes it replaced in the
+ * machine's own journal. A rep string instruction that would write more stops
+ * between iterations when that journal is full (see string.c), and its parts
+ * are gathered here, so that the instruction is still one entry, one row and
+ * one instruction in the count, and Undo restores every part.
  *
  * The ring holds up to `capacity` entries, and the packets of its newest at
- * most `budget` bytes between them: a step's packet carries up to 64 KiB of the
- * bytes it replaced and as many it left, so a loop of large string stores would
+ * most `budget` bytes between them: a step's packet carries the bytes it
+ * replaced and as many it left, so a loop of large string stores would
  * otherwise fill the wasm heap long before a 200,000-entry ring is full. Over
  * budget, the oldest entries are hollowed: cut down to their header and marked
  * irreversible, so undo stops at them as at any write it couldn't capture. They
@@ -17,7 +26,9 @@
 #include "blink/blinkenlib.h"
 #include "blink/endian.h"
 #include "blink/machine.h"
+#include "blink/devices.h"
 #include "blink/rde.h"
+#include "blink/terminal.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -46,10 +57,14 @@ struct Snapshot {
 };
 struct PokeByte { u64 address; u32 sequence; u8 old; };
 #define HISTORY_BUDGET (256u << 20)
+#define HEADER 96
+/* The most of the bytes it replaced one instruction keeps, its parts
+ * together: a write beyond it is counted and makes the step irreversible. */
+#define SPLIT_BUDGET (16u << 20)
 static struct Entry *entries;
 static u32 capacity, slots, count, start;
 static u32 hollow; /* the oldest `hollow` entries are hollow */
-static u8 (*headers)[88]; /* their headers, by slot, once any is hollowed */
+static u8 (*headers)[HEADER]; /* their headers, by slot, once any is hollowed */
 static u32 budget = HISTORY_BUDGET;
 static u64 held; /* bytes allocated to the packets of the others */
 static u64 serial;
@@ -58,6 +73,15 @@ static bool pending, poke, pending_irreversible;
 static struct Frame *stack;
 static struct PokeByte *poke_bytes;
 static u32 poke_count, poke_allocated;
+/* The journal of the step being recorded, its records one after another. */
+static u8 *journal;
+static u32 journal_used, journal_allocated, journal_count;
+/* The writes of the parts a rep string instruction already finished. */
+static struct MachineWriteRecord *split_writes;
+static u32 split_count, split_allocated;
+static u8 *split_bytes;
+static u32 split_used, split_bytes_allocated;
+static bool split_truncated;
 
 static struct Frame *Retain(struct Frame *f) {
   if (f) ++f->references;
@@ -78,10 +102,16 @@ static void Snapshot(struct Snapshot *out) {
   out->flags = blinkenlib_get_flags();
   blinkenlib_get_fpu_state(out->fpu);
 }
+static void ForgetStep(void) {
+  journal_used = journal_count = 0;
+  split_count = split_used = 0;
+  split_truncated = false;
+}
 void DebugHistoryCancel(void) {
   pending = poke = false;
   pending_irreversible = false;
   poke_count = 0;
+  ForgetStep();
 }
 /* B5 can replace this boundary with a journal for signal process state.
  * Until then the signal frame, mask and pending queue cannot be undone. */
@@ -100,6 +130,99 @@ void blinkenlib_history_mark_irreversible(void) {
   DebugHistoryMarkIrreversible();
 }
 bool DebugHistoryPending(void) { return pending; }
+/* Records what the instruction being recorded did beyond the CPU and memory,
+ * for Undo to take back. With no instruction recording (a Poke opened over a
+ * read that waited, say), the effect cannot be journaled, and the newest
+ * entry becomes a barrier instead. */
+void DebugHistoryJournal(u32 kind, const void *data, u32 size) {
+  u32 want;
+  u8 *grown;
+  if (!pending || poke) {
+    DebugHistoryMarkIrreversible();
+    return;
+  }
+  if (8 + size > journal_allocated - journal_used) {
+    want = journal_used + 8 + size;
+    want = want > journal_allocated * 2 ? want : journal_allocated * 2;
+    if (!(grown = realloc(journal, want))) abort();
+    journal = grown;
+    journal_allocated = want;
+  }
+  Write32(journal + journal_used, kind);
+  Write32(journal + journal_used + 4, size);
+  memcpy(journal + journal_used + 8, data, size);
+  journal_used += 8 + size;
+  ++journal_count;
+}
+/* Takes back what a journal record says, by its kind. */
+static void UndoJournal(u32 kind, const u8 *data, u32 size) {
+  if (kind < 16) UndoTerminalJournal(kind, data, size);
+}
+static void AppendSplitWrite(const struct MachineWriteRecord *w, const u8 *old) {
+  void *grown;
+  struct MachineWriteRecord *last;
+  u32 oldsize;
+  bool truncated;
+  /* Past the budget the step cannot be undone, so nothing it kept is any use:
+   * every record is only counted from then on, as a truncated one is. */
+  if (!split_truncated && split_used + w->oldsize > SPLIT_BUDGET) {
+    for (u32 i = 0; i < split_count; ++i) {
+      split_writes[i].oldsize = 0;
+      split_writes[i].truncated = true;
+    }
+    split_used = 0;
+    split_truncated = true;
+  }
+  last = split_count ? &split_writes[split_count - 1] : 0;
+  oldsize = w->truncated || split_truncated ? 0 : w->oldsize;
+  truncated = oldsize < w->size;
+  /* A part that goes on where the last ended extends it, its old bytes
+   * following the last's, as ExtendWriteRecord() extends a record. */
+  if (last && last->addr + last->size == w->addr && last->truncated == truncated &&
+      w->size <= 0xffffffffu - last->size &&
+      (truncated || last->oldoffset + last->oldsize == split_used)) {
+    last->size += w->size;
+    if (!truncated) {
+      memcpy(split_bytes + split_used, old, oldsize);
+      last->oldsize += oldsize;
+      split_used += oldsize;
+    }
+    return;
+  }
+  if (split_count == split_allocated) {
+    split_allocated = split_allocated ? split_allocated * 2 : 16;
+    if (!(grown = realloc(split_writes, split_allocated * sizeof(*split_writes)))) abort();
+    split_writes = grown;
+  }
+  split_writes[split_count++] = (struct MachineWriteRecord){
+      .addr = w->addr, .size = w->size, .oldoffset = split_used,
+      .oldsize = oldsize, .truncated = truncated};
+  if (oldsize) {
+    memcpy(split_bytes + split_used, old, oldsize);
+    split_used += oldsize;
+  }
+}
+/* Moves the writes the machine journaled for one part of a rep string
+ * instruction into the step, which goes on recording the next part. */
+static void GatherWrites(void) {
+  u8 *grown;
+  u32 i, want;
+  u64 bytes = 0;
+  for (i = 0; i < m->writeoldcount; ++i) bytes += m->writeold[i].oldsize;
+  if (bytes > split_bytes_allocated - split_used) {
+    want = split_used + bytes;
+    want = want > split_bytes_allocated * 2 ? want : split_bytes_allocated * 2;
+    if (!(grown = realloc(split_bytes, want))) abort();
+    split_bytes = grown;
+    split_bytes_allocated = want;
+  }
+  for (i = 0; i < m->writeoldcount; ++i)
+    AppendSplitWrite(&m->writeold[i], m->writeoldbytes + m->writeold[i].oldoffset);
+  split_truncated |= m->writeoldtruncated;
+}
+void DebugHistorySplit(void) {
+  if (pending && !poke && m) GatherWrites();
+}
 /* Leaves a slot as one no entry occupies: no packet, no frames. A hollow
  * entry's header belongs to `headers`, which it leaves alone (allocated 0). */
 static void Empty(struct Entry *e) {
@@ -111,6 +234,15 @@ static void Empty(struct Entry *e) {
 }
 void DebugHistoryClear(void) {
   for (u32 i = 0; i < slots; ++i) Empty(&entries[i]);
+  free(journal);
+  journal = 0;
+  journal_allocated = 0;
+  free(split_writes);
+  split_writes = 0;
+  split_allocated = 0;
+  free(split_bytes);
+  split_bytes = 0;
+  split_bytes_allocated = 0;
   free(entries);
   entries = 0;
   slots = 0;
@@ -125,7 +257,8 @@ void DebugHistoryClear(void) {
 }
 EMSCRIPTEN_KEEPALIVE
 // 2: the FPU blocks grew from 356 to 612 bytes with the ymm upper halves
-u32 blinkenlib_history_version(void) { return 2; }
+// 3: a 96-byte header and the journal after the memory images
+u32 blinkenlib_history_version(void) { return 3; }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_history_capacity(u32 size) {
   DebugHistoryClear();
@@ -165,6 +298,7 @@ void DebugHistoryBegin(u32 flow, u32 size) {
   before.size = size;
   pending_irreversible = false;
   pending = true;
+  ForgetStep();
 }
 /* Read a guest range page by page, avoiding a page-table walk per byte. */
 static bool CopyGuest(u8 *out, u64 address, u32 size) {
@@ -191,20 +325,22 @@ static void Reallocate(struct Entry *e, u32 allocated) {
   e->bytes = p;
   e->allocated = allocated;
 }
-/* Cuts the oldest entry that isn't hollow down to its 88-byte header, which
- * keeps its serial, addresses and flags but no longer offers it to undo. */
+/* Cuts the oldest entry that isn't hollow down to its header, which keeps its
+ * serial, addresses and flags but no longer offers it to undo. */
 static void HollowOldest(void) {
   u32 slot = (start + hollow++) % slots;
   struct Entry *e = &entries[slot];
   u8 *header;
   if (!headers && !(headers = calloc(slots, sizeof(*headers)))) abort();
   header = headers[slot];
-  memcpy(header, e->bytes, 88);
-  Write32(header + 4, 88);
+  memcpy(header, e->bytes, HEADER);
+  Write32(header + 4, HEADER);
   Write32(header + 20, 0); /* irreversible */
   Write32(header + 56, 0); /* no registers */
   Write32(header + 60, 0); /* no memory writes */
   Write32(header + 64, 0); /* no FPU blocks */
+  Write32(header + 88, 0); /* no journal */
+  Write32(header + 92, 0);
   held -= e->allocated;
   free(e->bytes);
   e->bytes = header;
@@ -219,13 +355,13 @@ static void Grow(void) {
   u32 size = slots ? (slots > capacity / 2 ? capacity : slots * 2)
                    : (capacity < 64 ? capacity : 64);
   struct Entry *grown = calloc(size, sizeof(*grown));
-  u8 (*grown_headers)[88] = headers ? calloc(size, sizeof(*headers)) : 0;
+  u8 (*grown_headers)[HEADER] = headers ? calloc(size, sizeof(*headers)) : 0;
   if (!grown || (headers && !grown_headers)) abort();
   for (u32 i = 0; i < count; ++i) {
     u32 slot = (start + i) % slots;
     grown[i] = entries[slot];
     if (headers && !grown[i].allocated) {
-      memcpy(grown_headers[i], headers[slot], 88);
+      memcpy(grown_headers[i], headers[slot], HEADER);
       grown[i].bytes = grown_headers[i];
     }
   }
@@ -274,7 +410,8 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
                    const u8 *old_bytes, bool truncated, bool exited) {
   struct Snapshot after;
   Snapshot(&after);
-  u32 mask = 0, bytes = 88;
+  u32 mask = 0, bytes = HEADER;
+  u32 journal_bytes = is_poke ? 0 : journal_used;
   for (int i = 0; i < 17; ++i) {
     if (before.registers[i] != after.registers[i]) {
       mask |= 1u << i;
@@ -289,12 +426,13 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
     bytes += 24 + w->oldsize + (w->truncated ? 0 : w->size);
     if (w->truncated || w->oldsize != w->size) reversible = false;
   }
+  bytes += journal_bytes;
   if (!capacity) return;
   struct Entry *e = NewEntry(bytes);
   e->instructions_before = before.instructions;
   e->exited = exited;
   u8 *p = e->bytes;
-  memset(p, 0, 88);
+  memset(p, 0, HEADER);
   Write32(p, blinkenlib_history_version());
   Write32(p + 4, bytes);
   ++serial;
@@ -313,7 +451,9 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
   Write32(p + 68, stack ? stack->depth : 0);
   Write64(p + 72, after.registers[BLINKENLIB_REG_RSP]);
   Write64(p + 80, before.pc + before.size);
-  p += 88;
+  Write32(p + 88, is_poke ? 0 : journal_count);
+  Write32(p + 92, journal_bytes);
+  p += HEADER;
   for (int i = 0; i < 17; ++i) if (mask & (1u << i)) {
     Write64(p, before.registers[i]);
     Write64(p + 8, after.registers[i]);
@@ -343,6 +483,7 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
     }
     p += 24 + w->oldsize + newsize;
   }
+  memcpy(p, journal, journal_bytes);
   Write32(e->bytes + 4, bytes);
   Write32(e->bytes + 20, reversible);
   if (!is_poke && before.flow == BLINKENLIB_CONTROL_FLOW_CALL) {
@@ -371,10 +512,17 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
 }
 void DebugHistoryFinish(bool exited) {
   if (!pending || poke || !m) return;
-  Finish(false, m->writeold, m->writeoldcount, m->writeoldbytes,
-         m->writeoldtruncated, exited);
+  if (split_count || split_truncated) {
+    /* the last part's writes join the parts before it */
+    GatherWrites();
+    Finish(false, split_writes, split_count, split_bytes, split_truncated, exited);
+  } else {
+    Finish(false, m->writeold, m->writeoldcount, m->writeoldbytes,
+           m->writeoldtruncated, exited);
+  }
   pending = false;
   pending_irreversible = false;
+  ForgetStep();
 }
 EMSCRIPTEN_KEEPALIVE
 bool blinkenlib_history_can_undo(void) {
@@ -386,7 +534,7 @@ int blinkenlib_history_undo(void) {
   struct Entry *e = EntryAt(0);
   if (!e) return 0;
   if (!Read32(e->bytes + 20)) return -1;
-  u8 *p = e->bytes + 88, *fpu = 0;
+  u8 *p = e->bytes + HEADER, *fpu = 0;
   u32 mask = Read32(e->bytes + 56), n = Read32(e->bytes + 60);
   u64 values[17];
   for (int i = 0; i < 17; ++i) if (mask & (1u << i)) {
@@ -399,22 +547,43 @@ int blinkenlib_history_undo(void) {
   }
   u8 **writes = n ? malloc(n * sizeof(*writes)) : 0;
   if (n && !writes) abort();
-  /* Check all mappings before changing anything. */
+  /* Check all mappings before changing anything, a page at a time: a rep
+   * string instruction's record can be megabytes long. */
   for (u32 i = 0; i < n; ++i) {
     writes[i] = p;
     u64 address = Read64(p);
     u32 size = Read32(p + 12);
-    for (u32 j = 0; j < size; ++j)
+    for (u32 j = 0; j < size; j += 4096 - ((address + j) & 4095))
       if (!blinkenlib_spy_address(address + j)) { free(writes); return -1; }
     p += 24 + size + Read32(p + 16);
   }
+  u8 *journal_records = p;
+  u32 journal_records_count = Read32(e->bytes + 88);
   for (u32 i = n; i > 0; --i) {
     p = writes[i - 1];
     u64 address = Read64(p);
-    for (u32 j = 0; j < Read32(p + 12); ++j)
-      blinkenlib_write_memory_byte(address + j, p[24 + j]);
+    u32 size = Read32(p + 12);
+    for (u32 j = 0, chunk; j < size; j += chunk) {
+      chunk = 4096 - ((address + j) & 4095);
+      if (chunk > size - j) chunk = size - j;
+      memcpy(blinkenlib_spy_address(address + j), p + 24 + j, chunk);
+    }
   }
   free(writes);
+  /* The journal's records are taken back newest first. */
+  if (journal_records_count) {
+    u8 **records = malloc(journal_records_count * sizeof(*records));
+    if (!records) abort();
+    for (u32 i = 0; i < journal_records_count; ++i) {
+      records[i] = journal_records;
+      journal_records += 8 + Read32(journal_records + 4);
+    }
+    for (u32 i = journal_records_count; i > 0; --i)
+      UndoJournal(Read32(records[i - 1]), records[i - 1] + 8, Read32(records[i - 1] + 4));
+    free(records);
+  }
+  /* a blocking write that instruction left unfinished starts afresh */
+  DeviceForgetProgress(Read64(e->bytes + 8));
   for (int i = 0; i < 17; ++i)
     if (mask & (1u << i)) blinkenlib_set_register_u64(i, values[i]);
   if (fpu) blinkenlib_set_fpu_state(fpu);

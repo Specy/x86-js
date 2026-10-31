@@ -212,7 +212,7 @@ int WaitForBrowserPipe(struct Machine *m, int fd, bool write, u64 size,
                      : !e->pipe->size && e->pipe->writers;
   if (!block) return 0;
   if (GuestWaitInterruptedRestartable(m)) return eintr();
-  GuestWaitHalt(m, GetMaxTime(), false);
+  GuestWaitHalt(m, GetMaxTime(), 0);
 }
 
 static int NotTerminalGet(int fd, struct termios *tio) { return enotty(); }

@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- The groundwork for the x86 devices (`docs/design/x86-devices-plan.md`, M1).
+  The machine has the QEMU guest's device nodes, `/dev/fb0`, `/dev/tty0`,
+  `/dev/input/event0` to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and
+  `/dev/snd/midiC1D0`, udev's links to the input devices and
+  `/proc/bus/input/devices`, made from one table in the Core and put back at
+  every start. `open()` finds a device by its node's number; the nodes the
+  machine does not cover open with ENODEV and raise the new `unsupportedDevice`
+  event. What `open()` makes is an open file description that `dup()` shares
+  with its `O_NONBLOCK`. An ioctl nothing knows answers ENOTTY instead of
+  EINVAL. The input devices answer their identity ioctls and wait for events
+  that never come yet; the raw MIDI port paces writes at 31,250 baud on Program
+  time, a blocking write going on from what it queued each time Blink starts it
+  over. See the README's "Devices".
+- `X86WaitRequest` has `wakeSources`, the terminal and the input devices that
+  can end a wait; `acceptsInput` stays until 8.0.0. A device that keeps time
+  folds the moment it is ready into the deadline.
+- The terminal stores the termios a program sets, instead of ignoring it, and
+  reports it: `getTerminalMode()` and the `terminalMode` event. Raw mode reads
+  as `VMIN` and `VTIME` say, on Program time, and input given while no read
+  waits is kept as type-ahead. `setTerminalProcessing()` turns on `ICRNL` and
+  its relatives for input and `OPOST`'s `ONLCR` and `OCRNL` for output, off
+  until 8.0.0. `sendSignal()` sends `SIGINT` or `SIGQUIT` as Ctrl+C and Ctrl+\
+  do under `ISIG`.
+- A read of the terminal, a flush of its input and a change of its termios are
+  journaled instead of being Undo barriers: Undo of a read that waited asks
+  again, and type-ahead goes back (ADR 0069). The history packets carry the
+  journal after a 96-byte header, so their version is now 3.
+- A `rep` string instruction that writes more than the 64 KiB one instruction
+  keeps stops between iterations for the history and goes on at once: it stays
+  one step, one row and one instruction, and Undo restores all of it, up to
+  16 MiB.
 - The emulator runs VEX-encoded instructions: AVX, AVX2, FMA3, F16C, BMI1,
   BMI2, AES-NI, PCLMULQDQ and the SSE4.1 and SSE4.2 instructions. Of their
   legacy encodings, `pmulld`, `movntdqa`, `crc32` and `pclmulqdq` ran before

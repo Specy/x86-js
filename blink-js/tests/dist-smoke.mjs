@@ -456,12 +456,14 @@ const ROOT_EXPORTS_2_8_0 = [
 ]
 // The token provideInput() takes for End of input, and where programs start.
 const ROOT_EXPORTS_5_0_0 = ['END_OF_INPUT', 'X86_WORKING_DIRECTORY', 'X86EnvironmentError']
-// A download that stalls ends with this error after this long; the upper halves of ymm0-ymm15.
+// A download that stalls ends with this error after this long; the upper halves of ymm0-ymm15;
+// where the input devices are listed.
 const ROOT_EXPORTS_UNRELEASED = [
     'RESOURCE_STALL_TIMEOUT_MS',
     'ResourceDownloadError',
     'X86_FPU_STATE_YMMH_OFFSET',
-    'X86_YMM_REGISTERS'
+    'X86_YMM_REGISTERS',
+    'X86_INPUT_DEVICES_FILE'
 ]
 const ROOT_EXPORTS = [
     ...ROOT_EXPORTS_2_8_0,

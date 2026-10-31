@@ -153,6 +153,12 @@ u64 blinkenlib_next_identity(void) { return ++identity_allocator; }
 static void FinishExecution(void) {
   if (active_identity) { ++instructions_executed; ++run_instruction_count; active_identity = 0; }
 }
+/* A rep string instruction stopped between iterations for the history (see
+ * string.c) and goes on at once: the rest of it is the same instruction, so
+ * nothing a new instruction checks (a signal, the limit, a breakpoint) comes
+ * in between. */
+static bool resuming_split = false;
+
 /* Mirrors Module.blinkHostError, which the runtime keeps in step with an accessor. The run loop
  * reads it after every instruction, and asking JavaScript each time cost a call out of wasm per
  * instruction. */
@@ -166,6 +172,7 @@ void blinkenlib_abandon_execution(void) {
   DebugHistoryCancel();
   active_identity = 0;
   active_step = false;
+  resuming_split = false;
 }
 /* A native exit() inside an instruction (Blink giving up on a condition it
  * cannot recover from) unwinds to JavaScript past everything the instruction
@@ -459,9 +466,14 @@ void runLoop() {
   // a function call. both the struct and fcall dont
   // exist right now
 
+  for (;;) {
   if (!(interrupt = sigsetjmp(m->onhalt, 1))) {
     m->canhalt = true;
     for (int i = 0; i < MAX_CYCLES; i++) {
+      if (resuming_split) {
+        resuming_split = false;
+        LoadInstruction(m, GetPc(m));
+      } else {
       if (!active_identity) {
         GuestTimerCheck(m);
         if (atomic_load_explicit(&m->attention, memory_order_acquire))
@@ -489,6 +501,7 @@ void runLoop() {
                              SIGTRAP_CODE_BREAKPOINT, pc);
           return;
         }
+      }
       }
 
       if (!active_identity) active_identity = blinkenlib_next_identity();
@@ -535,6 +548,15 @@ void runLoop() {
     printf("handling machine interrupt: %d \n", interrupt);
     puts("--");
 #endif
+    if (interrupt == kMachineRepSplit) {
+      // the history takes the part's writes and the step goes on recording
+      DebugHistorySplit();
+      m->writeoldcount = 0;
+      m->writeoldbytesused = 0;
+      m->writeoldtruncated = false;
+      resuming_split = true;
+      continue;
+    }
     if (interrupt == kMachineExitTrap || interrupt == kMachineFakeTTYtrap || interrupt == kMachineWaitTrap) {
       /* Exit and a read waiting for input abandon OpSyscall's stack.
        * Release its temporary state as Blink() does after a halt, so undo
@@ -568,6 +590,8 @@ void runLoop() {
       update_clstruct(m);
       TerminateSignal(m, SIGTRAP, SIGTRAP_CODE_FAKE_TTY);
     }
+  }
+  break;
   }
   m->canhalt = false;
 }
@@ -677,6 +701,8 @@ void setupProgram(bool withdebugger) {
   TearDown();
   SetUp();
   OpenTerminalHostFds();
+  // every program starts on a terminal in canonical mode
+  ResetTerminal();
   char *bios = 0;
   LoadProgram(m, progname_string, progname_string,
                process_arguments_set ? process_args : args, vars, bios);
@@ -901,6 +927,32 @@ void blinkenlib_provide_end_of_input() {
 
 void blinkenlib_clear_input() {
   ClearTerminalInput();
+}
+
+/* The terminal's mode, as TERMINAL_MODE_* bits (terminal.h). */
+EMSCRIPTEN_KEEPALIVE
+int blinkenlib_terminal_mode(void) {
+  return GetTerminalMode();
+}
+
+/* Whether the terminal applies ICRNL and its relatives to the input the host
+ * gives it, and OPOST's ONLCR and OCRNL to what the program writes. Both are
+ * off until the host asks, so that output reaches it as the program wrote
+ * it. */
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_set_terminal_processing(bool input, bool output) {
+  SetTerminalProcessing(input, output);
+}
+
+/* Queues `sig` for the program, as the terminal's line discipline does for
+ * Ctrl+C (SIGINT) and Ctrl+\ (SIGQUIT) under ISIG. It is delivered at the
+ * next instruction, or ends the wait an instruction is in, once the host
+ * resumes it. False when no program is there to take it. */
+EMSCRIPTEN_KEEPALIVE
+bool blinkenlib_send_signal(int sig) {
+  if (!m || !s || s->exited || sig < 1 || sig > 64) return false;
+  SendTerminalSignal(m, sig);
+  return true;
 }
 
 _Static_assert(BLINKENLIB_FPU_STATE_SIZE ==
