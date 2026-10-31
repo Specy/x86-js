@@ -1,8 +1,9 @@
 // The sound devices (x86-devices-plan.md, M4): /dev/dsp and /dev/mixer as snd-pcm-oss and
 // snd-mixer-oss have them on the guest's HDA card, the raw MIDI port, the PC speaker and the
 // console's tone ioctls, the timeline they hand the host on Program time, and Undo. The values are
-// those of the QEMU guest x86's devices follow (ADR 0067), worked out from Linux 6.12's and QEMU
-// 10.0's sources and provisional until it is booted, so these run in the Core only.
+// those of the pinned QEMU guest x86's devices follow (ADR 0067), Linux 7.2's, as its probe
+// recorded them (docs/research/x86-reference-guest.md), where they could be; the rest from its
+// sources.
 import { describe, expect, it } from 'vitest'
 import {
     BlinkState,
@@ -20,6 +21,7 @@ const EPERM = -1n
 const EIO = -5n
 const ENXIO = -6n
 const EAGAIN = -11n
+const ENOMEM = -12n
 const ENODEV = -19n
 const EINVAL = -22n
 const ENOTTY = -25n
@@ -79,7 +81,8 @@ const PATHS: Record<string, string> = {
     midi: '/dev/snd/midiC1D0',
     midi1: '/dev/midi1',
     tty0: '/dev/tty0',
-    speaker: '/dev/input/event4'
+    tty1: '/dev/tty1',
+    speaker: '/dev/input/event3'
 }
 
 const DATA = [
@@ -231,6 +234,10 @@ describe('/dev/dsp', () => {
             `mov dword [buf], 129`,
             `sys 16, r12, ${hex(SNDCTL_DSP_CHANNELS)}, buf`,
             'save',
+            // the count is unsigned: -1 is past 128
+            `mov dword [buf], -1`,
+            `sys 16, r12, ${hex(SNDCTL_DSP_CHANNELS)}, buf`,
+            'save',
             ...intIoctl('r12', SNDCTL_DSP_STEREO, 1),
             ...intIoctl('r12', SNDCTL_DSP_GETCAPS),
             ...intIoctl('r12', OSS_GETVERSION),
@@ -252,6 +259,7 @@ describe('/dev/dsp', () => {
             ...[0n, 44100n],
             ...[0n, 1n],
             ...[0n, 6n],
+            EINVAL,
             EINVAL,
             ...[0n, 1n], // STEREO answers channels - 1
             ...[0n, 0x1201n], // TRIGGER | REALTIME, revision 1; no MMAP, no DUPLEX
@@ -304,6 +312,41 @@ describe('/dev/dsp', () => {
             ...getOspace()
         ])
         expect(results).toEqual([0n, 16000n, 0n, EINVAL, 4n, 4n, 1024n, 4096n])
+    })
+
+    it('takes a 16 MiB fragment, then every call that applies it answers ENOMEM', async () => {
+        const { results } = await probe([
+            ...openDsp(),
+            `mov dword [buf], ${0x18}`,
+            `sys 16, r12, ${hex(SNDCTL_DSP_SETFRAGMENT)}, buf`,
+            'save',
+            ...intIoctl('r12', SNDCTL_DSP_GETBLKSIZE).slice(0, 2),
+            `sys 16, r12, ${hex(SNDCTL_DSP_GETOSPACE)}, buf2`,
+            'save',
+            ...intIoctl('r12', SNDCTL_DSP_SETFMT, 0).slice(0, 3),
+            // at a rate the card plays, stereo, no rate plugin: the 1 MiB fragment
+            // snd_pcm_oss_period_size() allows at most
+            ...intIoctl('r12', SNDCTL_DSP_SPEED, 44100).slice(0, 2),
+            ...intIoctl('r12', SNDCTL_DSP_CHANNELS, 2).slice(0, 2),
+            ...intIoctl('r12', SNDCTL_DSP_GETBLKSIZE)
+        ])
+        // at the defaults the rate plugin's buffer for 131,072 frames of S16 is 2 Mibit, past
+        // the 1 Mibit snd_pcm_plugin_alloc() allows, as the guest answers
+        expect(results).toEqual([0n, ENOMEM, ENOMEM, ENOMEM, ...[0n, 1048576n]])
+    })
+
+    it('counts a negative space in whole fragments down, as the guest does', async () => {
+        const { results } = await probe([
+            ...openDsp(O_WRONLY | O_NONBLOCK),
+            ...intIoctl('r12', SNDCTL_DSP_SPEED, 16000).slice(0, 2),
+            `mov dword [buf], ${0x4000a}`,
+            `sys 16, r12, ${hex(SNDCTL_DSP_SETFRAGMENT)}, buf`,
+            'sys 1, r12, buf, 4096', // the whole buffer
+            'sys 1, r12, buf, 10', // and part of a fragment, staged
+            ...getOspace()
+        ])
+        // fragments is info.bytes over a size_t: -10 bytes free is -1 fragments
+        expect(results).toEqual([BigInt.asUintN(32, -1n), 4n, 1024n, BigInt.asUintN(32, -10n)])
     })
 
     it('keeps a short write silent until SYNC pads its fragment and plays it out', async () => {
@@ -505,8 +548,8 @@ describe('/dev/mixer', () => {
             ENXIO,
             0n,
             0x65746e492d414448n, // "HDA-Inte"
-            0x20444920554d4551n, // "QEMU ID "
-            3n, // the volume control twice and the switch once
+            0x6e654720554d4551n, // "QEMU Gen", hda_generic's "QEMU Generic"
+            17n, // the 14 changes since boot, then the volume control twice and the switch once
             ...[0n, 0x0064n]
         ])
         expect(heard.mixer).toEqual([
@@ -588,7 +631,7 @@ describe('the raw MIDI port', () => {
             'save'
         ])
         expect(results).toEqual([
-            ...[0n, 0x20004n],
+            ...[0n, 0x20005n], // 2.0.5 on Linux 7.2
             0n,
             1n,
             7n,
@@ -683,7 +726,8 @@ describe('the PC speaker', () => {
             ],
             clock
         )
-        expect(results).toEqual([0n, 0x4bfn, 0x8a3bn, 0n, EPERM])
+        // agetty's settings for the virtual console, raw at its login prompt
+        expect(results).toEqual([0n, 0x4bfn, 0n, 0n, EPERM])
         const tone = PIT / 2711
         expect(heard.tone).toEqual([
             { at: 0n, hz: tone },
@@ -696,7 +740,60 @@ describe('the PC speaker', () => {
         expect(heard.cuts).toContainEqual({ after: 50000000n, device: 'speaker' })
     })
 
-    it("takes the pcspkr driver's EV_SND events, written to /dev/input/event4", async () => {
+    it("answers /dev/tty0's modes and LEDs as the guest's VT1 does, and /dev/tty1 is the same console", async () => {
+        const { results } = await probe([
+            `sys 2, tty0, ${O_RDWR}`,
+            'mov r12, rax',
+            ...intIoctl('r12', 0x4b3b), // KDGETMODE: text
+            ...intIoctl('r12', 0x4b44), // KDGKBMODE: Unicode
+            'mov dword [buf], -1',
+            `sys 16, r12, ${hex(0x4b31)}, buf`, // KDGETLED, a byte
+            'save',
+            'saved buf',
+            'mov dword [buf], -1',
+            `sys 16, r12, ${hex(0x4b64)}, buf`, // KDGKBLED
+            'save',
+            'saved buf',
+            'mov qword [buf], -1',
+            `sys 16, r12, ${hex(0x5603)}, buf`, // VT_GETSTATE
+            'save',
+            'saveq buf', // v_active 1, v_signal left, v_state 0x43
+            `sys 16, r12, ${hex(0x4b3a)}, 1`, // KDSETMODE KD_GRAPHICS
+            'save',
+            `sys 16, r12, ${hex(0x4b3a)}, 5`,
+            'save',
+            `sys 16, r12, ${hex(0x4b45)}, 1`, // KDSKBMODE K_XLATE
+            'save',
+            `sys 16, r12, ${hex(0x4b45)}, 9`,
+            'save',
+            // VT1 is the same console: what tty0 set reads back there
+            `sys 2, tty1, ${O_RDWR}`,
+            'mov r13, rax',
+            ...intIoctl('r13', 0x4b3b),
+            ...intIoctl('r13', 0x4b44),
+            `sys 16, r13, ${TCGETS}, buf`,
+            'saved buf', // c_iflag
+            'saved buf + 12' // c_lflag
+        ])
+        expect(results).toEqual([
+            ...[0n, 0n],
+            ...[0n, 3n],
+            ...[0n, 0xffffff00n],
+            ...[0n, 0xffffff00n],
+            0n,
+            BigInt.asIntN(64, 0xffff_0043_ffff_0001n),
+            0n,
+            EINVAL,
+            0n,
+            EINVAL,
+            ...[0n, 1n],
+            ...[0n, 1n],
+            0o62402n, // BRKINT ICRNL IXON IMAXBEL IUTF8, as tty1's getty leaves it
+            0n
+        ])
+    })
+
+    it("takes the pcspkr driver's EV_SND events, written to /dev/input/event3", async () => {
         const events: [number, number, number][] = [
             [0x12, 2, 440], // SND_TONE
             [0x12, 2, 20], // too low: silence

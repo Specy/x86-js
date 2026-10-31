@@ -285,7 +285,7 @@ export class BlinkRuntime {
         this.callbacks = callbacks
         this.scheduler = scheduler
         // the devices are part of every program's file system, which each start puts back
-        installDevices(module)
+        installDevices(module, (fd, bytes) => this.deliverOutput(fd, bytes))
         this.skeleton = captureFileSystemSkeleton(module.FS)
     }
 

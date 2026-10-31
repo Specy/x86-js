@@ -2,8 +2,8 @@
 // device table, matched by their device numbers; the open file description dup() shares; ENOTTY
 // for an ioctl nothing knows; sized requests; the uncovered nodes; what can end a wait on a
 // device; and a blocking write that keeps its progress while Blink starts it over. The values are
-// those of the QEMU guest x86's devices follow (ADR 0067), provisional until it is booted, so
-// these run in the Core only.
+// those of the pinned QEMU guest x86's devices follow (ADR 0067), as its probe recorded them
+// (docs/research/x86-reference-guest.md).
 import { describe, expect, it } from 'vitest'
 import { EmulatorStatus } from '../src/interface'
 import { BlinkState, type X86Environment, type X86WaitRequest } from '../src/types'
@@ -37,6 +37,14 @@ const PATHS: Record<string, string> = {
     event3: '/dev/input/event3',
     kbd: '/dev/input/by-path/platform-i8042-serio-0-event-kbd',
     tablet: '/dev/input/by-id/usb-QEMU_QEMU_USB_Tablet_28754-0000:00:04.0-1-event-mouse',
+    joystick: '/dev/input/by-path/pci-0000:00:04.0-usb-0:1:1.0-mouse',
+    power: '/dev/input/by-path/platform-LNXPWRBN:00-event',
+    serial: '/dev/ttyS0',
+    amidi1: '/dev/amidi1',
+    hdaPath: '/dev/snd/by-path/pci-0000:00:05.0',
+    usbAudio: '/dev/snd/by-id/usb-QEMU_QEMU_USB_Audio_1-0000:00:04.0-2-00',
+    dsp2: '/dev/dsp2',
+    tty2: '/dev/tty2',
     psmouse: '/dev/input/by-path/platform-i8042-serio-1-mouse',
     dsp: '/dev/dsp',
     mixer: '/dev/mixer',
@@ -147,27 +155,49 @@ describe('the device nodes', () => {
             'sys 4, mixer, buf',
             'saveq buf + 40',
             'sys 4, tty0, buf',
+            'saved buf + 24',
             'saveq buf + 40',
             'sys 6, kbd, buf', // lstat: the link itself
             'saved buf + 24',
             'sys 4, kbd, buf', // stat: what it points at
             'saveq buf + 40',
             'sys 4, tablet, buf',
+            'saveq buf + 40',
+            'sys 4, joystick, buf',
+            'saved buf + 24',
+            'saveq buf + 40',
+            'sys 4, power, buf',
+            'saveq buf + 40',
+            'sys 4, serial, buf',
+            'saveq buf + 40',
+            'sys 4, amidi1, buf',
+            'saveq buf + 40',
+            'sys 4, hdaPath, buf',
+            'saveq buf + 40',
+            'sys 4, usbAudio, buf',
             'saveq buf + 40'
         ])
         expect(run.results).toEqual([
             0n,
             0o20660n, // a character device, root's and its group's
             0x1d00n, // 29:0
-            0x0d41n, // 13:65
-            0x7428n, // 116:40
+            0x0d41n, // 13:65, the PS/2 mouse
+            0x7402n, // 116:2: ALSA's minors are dynamic
             0x0e12n, // 14:18
             0x0e03n, // 14:3
             0x0e00n, // 14:0
+            0o20600n,
             0x0400n, // 4:0
             0o120777n,
-            0x0d41n,
-            0x0d43n // 13:67
+            0x0d40n, // the keyboard, event0
+            0x0d42n, // the tablet, event2
+            0o20664n, // the tablet's -mouse link leads to joydev's js0
+            0x0d00n, // 13:0
+            0x0d44n, // the Power Button, event4
+            0x0440n, // 4:64
+            0x0e1dn, // 14:29
+            0x740an, // card 0's control, 116:10
+            0x740cn // card 2's, the USB card's, 116:12
         ])
     })
 
@@ -181,15 +211,16 @@ describe('the device nodes', () => {
         ])
         const blocks = run.stdout.split('\n\n').filter(Boolean)
         expect(blocks.map((block) => /N: Name="(.*)"/.exec(block)?.[1])).toEqual([
-            'Power Button',
             'AT Translated Set 2 keyboard',
             'ImExPS/2 Generic Explorer Mouse',
             'QEMU QEMU USB Tablet',
-            'PC Speaker'
+            'PC Speaker',
+            'Power Button'
         ])
-        expect(blocks[1]).toContain('I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\n')
-        expect(blocks[1]).toContain('H: Handlers=sysrq kbd event1 leds \n')
-        expect(blocks[3]).toContain('U: Uniq=28754-0000:00:04.0-1\n')
+        expect(blocks[0]).toContain('I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\n')
+        expect(blocks[0]).toContain('H: Handlers=sysrq kbd leds event0 \n')
+        expect(blocks[2]).toContain('U: Uniq=28754-0000:00:04.0-1\n')
+        expect(blocks[2]).toContain('H: Handlers=mouse1 event2 js0 \n')
     })
 
     it('come back for the next run after one removed them', async () => {
@@ -226,24 +257,36 @@ describe('the device nodes', () => {
 
     it('the machine does not cover fail to open with ENODEV, and the host hears which', async () => {
         const run = await probe([
-            ...['card0', 'pcm', 'control', 'mice', 'audio', 'psmouse'].flatMap((path) => [
-                `sys 2, ${path}, ${O_RDWR}`,
-                'save'
-            ]),
+            ...[
+                'card0',
+                'pcm',
+                'control',
+                'mice',
+                'audio',
+                'psmouse',
+                'joystick',
+                'usbAudio',
+                'dsp2',
+                'tty2'
+            ].flatMap((path) => [`sys 2, ${path}, ${O_RDWR}`, 'save']),
             // the guest builds no OSS sequencer
             'sys 2, sequencer, 2',
             'save',
             'sys 2, music, 2',
             'save'
         ])
-        expect(run.results).toEqual([...new Array(6).fill(ENODEV), ENOENT, ENOENT])
+        expect(run.results).toEqual([...new Array(10).fill(ENODEV), ENOENT, ENOENT])
         expect(run.unsupported).toEqual([
             '/dev/dri/card0',
             '/dev/snd/pcmC0D0p',
             '/dev/snd/controlC0',
             '/dev/input/mice',
             '/dev/audio',
-            '/dev/input/mouse0'
+            '/dev/input/mouse0',
+            '/dev/input/js0',
+            '/dev/snd/controlC2',
+            '/dev/dsp2',
+            '/dev/tty2'
         ])
     })
 })

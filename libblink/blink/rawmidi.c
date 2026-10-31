@@ -1,7 +1,8 @@
 /* The raw MIDI port: snd-virmidi's card 1, at ALSA's /dev/snd/midiC1D0 to
  * midiC1D3, its four devices, and, through OSS emulation, /dev/midi1, which is
- * device 0, with FluidSynth in the guest playing what leaves them
- * (x86-devices.md, "The raw MIDI port").
+ * device 0 (so is /dev/dmmidi1; /dev/amidi1 and /dev/admmidi1 are device 1),
+ * with FluidSynth in the guest playing what leaves them (x86-devices.md, "The
+ * raw MIDI port").
  *
  * Bytes leave at MIDI's 31,250 baud on Program time, ten bits each, behind
  * rawmidi's buffer (a page, 4 KiB, until PARAMS changes it), a documented
@@ -50,7 +51,7 @@
 #define SNDRV_RAWMIDI_IOCTL_STATUS64      0xc0385720
 #define SNDRV_RAWMIDI_IOCTL_DROP          0x40045730
 #define SNDRV_RAWMIDI_IOCTL_DRAIN         0x40045731
-#define SNDRV_RAWMIDI_VERSION             0x00020004  // 2.0.4 in 6.12
+#define SNDRV_RAWMIDI_VERSION             0x00020005  // 2.0.5 in 7.2
 #define SNDRV_PROTOCOL_2_0_2              0x00020002
 #define SNDRV_RAWMIDI_STREAM_OUTPUT       0
 #define SNDRV_RAWMIDI_STREAM_INPUT        1
@@ -702,10 +703,11 @@ static int GetWord(struct Machine *m, i64 addr, i32 *value) {
   return 0;
 }
 
-/* The device of the virtual card a node opens: ALSA's minor is card × 32 + 8
- * + device, and OSS's /dev/midi1 is device 0 (rawmidi's midi_map). */
+/* The device of the virtual card a node opens: midiC1D0 to D3 their own,
+ * OSS's /dev/midi1 and /dev/dmmidi1 device 0 and /dev/amidi1 and
+ * /dev/admmidi1 device 1 (rawmidi's midi_map and amidi_map). */
 static u32 MidiDevice(const struct DeviceNode *node) {
-  return node->major == 116 ? (node->minor - 8) % 32 : 0;
+  return node->unit;
 }
 
 /* snd_rawmidi_info(), for the virtual card's port. */

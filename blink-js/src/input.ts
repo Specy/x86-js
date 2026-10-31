@@ -2,8 +2,8 @@ import type { X86InputDeviceId, X86InputEvent } from './types'
 
 /** Each device the host delivers events to, by its place in `/dev/input` (`INPUT_*`, devices.h). */
 const INPUT_DEVICE_INDEX: Record<X86InputDeviceId, number> = {
-    keyboard: 1,
-    tablet: 3
+    keyboard: 0,
+    tablet: 2
 }
 
 /** The `INPUT_*` index of a device the host delivers events to. */

@@ -428,11 +428,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     /**
      * Delivers what the host's keyboard or pointer did, one host event at a time, to the guest's
-     * AT keyboard (`/dev/input/event1`) or QEMU USB tablet (`event3`), as their hardware and
+     * AT keyboard (`/dev/input/event0`) or QEMU USB tablet (`event2`), as their hardware and
      * drivers would: a key as the scan codes QEMU's keyboard sends, which become `MSC_SCAN`, the
-     * key and `SYN_REPORT`, with the lock LEDs' packet after; the pointer as one HID report, its
-     * buttons with their usages as `MSC_SCAN`, `ABS_X` and `ABS_Y` when they move, the wheel with
-     * `REL_WHEEL_HI_RES`, and `SYN_REPORT`. Every reader of the device gets it, or the one holding
+     * key and `SYN_REPORT`, a lock key's LED change waiting in the packet its release closes; the
+     * pointer as one HID report, its five buttons (`BTN_LEFT` to `BTN_EXTRA`) with their usages as
+     * `MSC_SCAN`, `ABS_X` and `ABS_Y` when they move, the wheel with `REL_WHEEL_HI_RES`, and
+     * `SYN_REPORT`. Every reader of the device gets it, or the one holding
      * `EVIOCGRAB`, stamped with Program time; with no reader the device's state still changes. A
      * read or `poll` waiting on the device resumes and starts over. Nothing happens when no
      * program is running. Never call it in a Testcase, where no event ever arrives.

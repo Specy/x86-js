@@ -6,7 +6,7 @@
 /* The PC speaker's driver, Linux's pcspkr_event(): what an event the input
  * core passes the PC Speaker device does. evdev.c calls it where the input
  * core calls the driver: for every EV_SND event of a code the speaker has
- * (SND_BELL, SND_TONE), whether a program wrote it to /dev/input/event4 or
+ * (SND_BELL, SND_TONE), whether a program wrote it to /dev/input/event3 or
  * the console's KIOCSOUND and KDMKTONE injected it, whether or not it changes
  * anything, and for SYN_CONFIG. An EV_SND SND_TONE or SND_BELL sets the
  * speaker's tone, anything else changes nothing. Returns 0. */

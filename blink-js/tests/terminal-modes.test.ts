@@ -23,6 +23,7 @@ const O_NONBLOCK = 0x800
 const CANONICAL: X86TerminalMode = {
     canonical: true,
     echo: true,
+    echoControl: false,
     signals: true,
     crToNl: true,
     outputProcessing: true,
@@ -111,6 +112,60 @@ async function throughSyscall(emulator: X86Emulator, count = 1): Promise<void> {
 }
 
 describe('the termios', () => {
+    it("starts as agetty leaves the guest's serial line, which /dev/ttyS0 also opens", async () => {
+        const emulator = await build(
+            [
+                'sys 16, 0, 0x5401, buf2', // TCGETS
+                'save',
+                'saved buf2', // c_iflag: ICRNL IXON IXOFF IMAXBEL IUTF8
+                'saved buf2 + 8', // c_cflag: B9600 CS8 CREAD HUPCL CLOCAL
+                'saved buf2 + 12', // c_lflag: no ECHOCTL, no IEXTEN
+                'sys 16, 0, 0x802c542a, buf', // TCGETS2
+                'saved buf + 36', // c_ispeed
+                'saved buf + 40', // c_ospeed
+                'sys 2, serial, 2',
+                'mov r12, rax',
+                'sys 16, r12, 0x5401, buf', // the same tty
+                'save',
+                'saved buf + 12',
+                'sys 89, fd0, buf, 64', // readlink: what glibc's ttyname() reads first
+                'save',
+                'saveq buf',
+                'saved buf + 8',
+                // ECHOCTL on: the host hears it
+                'or dword [buf2 + 12], 0x200',
+                'sys 16, 0, 0x5402, buf2', // TCSETS
+                'save'
+            ],
+            undefined,
+            ['section .data', 'serial: db "/dev/ttyS0", 0', 'fd0: db "/proc/self/fd/0", 0']
+        )
+        try {
+            const modes: X86TerminalMode[] = []
+            emulator.on('terminalMode', (mode) => void modes.push(mode))
+            const { results } = record(emulator)
+            emulator.initialize(100)
+            expect(await settle(emulator)).toBe(EmulatorStatus.Terminated)
+            expect(results()).toEqual([
+                0n,
+                0o72400n,
+                0o6275n,
+                0o4073n,
+                9600n, // a speed reported, never paced
+                9600n,
+                0n,
+                0o4073n,
+                10n,
+                0x7974742f7665642fn, // "/dev/tty"
+                0x3053n, // "S0"
+                0n
+            ])
+            expect(modes.at(-1)).toEqual({ ...CANONICAL, echoControl: true })
+        } finally {
+            emulator.dispose()
+        }
+    })
+
     it('is reported at start and at each change, and Undo puts it back', async () => {
         const emulator = await build([...raw(1, 0), 'nop'])
         try {

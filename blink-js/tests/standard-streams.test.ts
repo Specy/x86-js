@@ -363,10 +363,11 @@ describe('the terminal', () => {
         ])
         expect(run.results).toEqual([
             0n,
-            0x4500n, // ICRNL | IXON | IUTF8
+            // as agetty leaves the guest's serial line for root's shell
+            0x7500n, // ICRNL | IXON | IXOFF | IMAXBEL | IUTF8
             0x5n, // OPOST | ONLCR
-            0xbfn, // B38400 | CS8 | CREAD
-            0x8a3bn, // ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN
+            0xcbdn, // B9600 | CS8 | CREAD | HUPCL | CLOCAL
+            0x83bn, // ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOKE: no ECHOCTL, no IEXTEN
             // the line discipline, N_TTY, then Linux's control characters: ^C ^\ DEL ^U ^D, VTIME 0,
             // VMIN 1, VSWTC 0, ^Q ^S ^Z, VEOL 0, ^R ^O ^W ^V, VEOL2 0
             0x0100_0415_7f1c_0300n,
@@ -402,7 +403,7 @@ describe('the terminal', () => {
 
     // glibc 2.42 and later ask with termios2 in tcgetattr() and isatty(), and decide from isatty()
     // whether standard output is line-buffered
-    it('answers TCGETS2 on 0, 1 and 2 with the termios TCGETS gives and 38400 bits per second', async () => {
+    it('answers TCGETS2 on 0, 1 and 2 with the termios TCGETS gives and 9600 bits per second', async () => {
         const run = await probe([
             'sys 16, 0, 0x802c542a, buf',
             'save', // TCGETS2
@@ -422,15 +423,15 @@ describe('the terminal', () => {
         ])
         expect(run.results).toEqual([
             0n,
-            0x4500n,
+            0x7500n,
             0x5n,
-            0xbfn,
-            0x8a3bn,
+            0xcbdn,
+            0x83bn,
             0x0100_0415_7f1c_0300n,
             0x170f_1200_1a13_1100n,
             0x16n,
-            38400n,
-            38400n,
+            9600n,
+            9600n,
             0n,
             0n
         ])
@@ -440,7 +441,7 @@ describe('the terminal', () => {
         const run = await probe([
             'sys 16, 0, 0x802c542a, buf',
             'mov dword [buf + 12], 0', // raw mode, asked for
-            'mov dword [buf + 40], 9600',
+            'mov dword [buf + 40], 38400',
             'sys 16, 0, 0x402c542b, buf',
             'save',
             'sys 16, 0, 0x402c542c, buf',
@@ -451,7 +452,8 @@ describe('the terminal', () => {
             'saved buf2 + 12',
             'saved buf2 + 40'
         ])
-        expect(run.results).toEqual([0n, 0n, 0n, 0n, 38400n])
+        // c_cflag's B9600, not the speed asked for without BOTHER
+        expect(run.results).toEqual([0n, 0n, 0n, 0n, 9600n])
     })
 
     it("leads the process's group and session, and refuses a group it has not", async () => {

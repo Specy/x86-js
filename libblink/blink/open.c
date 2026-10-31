@@ -164,6 +164,12 @@ int SysOpenat(struct Machine *m, i32 dirfildes, i64 pathaddr, i32 oflags,
       device = !terminal && !VfsFstat(fildes, &st) && S_ISCHR(st.st_mode)
                    ? FindDeviceNode(st.st_rdev)
                    : 0;
+      // /dev/ttyS0 and /dev/console are the serial line, the program's own
+      // terminal
+      if (device && device->kind == DEVICE_SERIAL) {
+        terminal = &kFdCbTerminal;
+        device = 0;
+      }
       if (device && device->kind == DEVICE_UNSUPPORTED) {
         // the guest has a driver for it, which this machine does not
         // emulate: the host names it in its Log

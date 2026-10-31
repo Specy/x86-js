@@ -7,9 +7,8 @@
  * before any program starts, and an open() finds what it opened here by the
  * device number of the node it reached, so a path through a link opens the
  * same device and stat() answers as on Linux. The numbers, the names and the
- * links are Linux's conventional ones for that machine, provisional until the
- * pinned guest's own are recorded (M0 of x86-devices-plan.md); the comments
- * say which are least certain.
+ * links are the pinned guest's, as its probe recorded them
+ * (docs/research/x86-reference-guest.md, M0 of x86-devices-plan.md).
  *
  * Each device is a struct FdCb of its own. What open() made is the open file
  * description, a struct DeviceFile that dup() shares and the last close()
@@ -55,54 +54,116 @@ EM_JS(void, NotifyUnsupportedDeviceHost, (const char *path), {
 });
 #endif
 
+#define NODE(PATH, MAJOR, MINOR, MODE, KIND) \
+  {PATH, MAJOR, MINOR, MODE, KIND, -1, 0}
+#define INPUT(N, WHICH) \
+  {"/dev/input/event" #N, 13, 64 + N, 0660, DEVICE_INPUT, WHICH, 0}
+// a raw MIDI node and the device of card 1 it opens
+#define MIDI(PATH, MAJOR, MINOR, UNIT) \
+  {PATH, MAJOR, MINOR, 0660, DEVICE_MIDI, -1, UNIT}
+// a virtual console the program does not use: VT1 is the foreground one
+#define VT(N) NODE("/dev/tty" #N, 4, N, 0600, DEVICE_UNSUPPORTED)
+
 static const struct DeviceNode kDeviceNodes[] = {
-    {"/dev/fb0", 29, 0, 0660, DEVICE_FRAMEBUFFER, -1},
-    {"/dev/tty0", 4, 0, 0620, DEVICE_CONSOLE, -1},
-    {"/dev/input/event0", 13, 64, 0660, DEVICE_INPUT, INPUT_POWER_BUTTON},
-    {"/dev/input/event1", 13, 65, 0660, DEVICE_INPUT, INPUT_KEYBOARD},
-    {"/dev/input/event2", 13, 66, 0660, DEVICE_INPUT, INPUT_MOUSE},
-    {"/dev/input/event3", 13, 67, 0660, DEVICE_INPUT, INPUT_TABLET},
-    {"/dev/input/event4", 13, 68, 0660, DEVICE_INPUT, INPUT_SPEAKER},
-    {"/dev/mixer", 14, 0, 0660, DEVICE_MIXER, -1},
-    {"/dev/dsp", 14, 3, 0660, DEVICE_DSP, -1},
-    // OSS numbers a card's raw MIDI port 16 × card + 2: card 1 is snd-virmidi
-    {"/dev/midi1", 14, 18, 0660, DEVICE_MIDI, -1},
-    // ALSA's minors are dynamic on Debian; these are the static scheme's
-    // (card × 32, + 8 for raw MIDI, + 16 and + 24 for playback and capture,
-    // + the device). snd-virmidi makes four devices (midi_devs=4), which
-    // FluidSynth all plays; OSS's /dev/midi1 is device 0.
-    {"/dev/snd/midiC1D0", 116, 40, 0660, DEVICE_MIDI, -1},
-    {"/dev/snd/midiC1D1", 116, 41, 0660, DEVICE_MIDI, -1},
-    {"/dev/snd/midiC1D2", 116, 42, 0660, DEVICE_MIDI, -1},
-    {"/dev/snd/midiC1D3", 116, 43, 0660, DEVICE_MIDI, -1},
+    NODE("/dev/fb0", 29, 0, 0660, DEVICE_FRAMEBUFFER),
+    // the serial line root is logged in on, the kernel's console too
+    NODE("/dev/ttyS0", 4, 64, 0600, DEVICE_SERIAL),
+    NODE("/dev/console", 5, 1, 0600, DEVICE_SERIAL),
+    // the foreground virtual console, VT1, where tty1's getty waits
+    NODE("/dev/tty0", 4, 0, 0600, DEVICE_CONSOLE),
+    NODE("/dev/tty1", 4, 1, 0600, DEVICE_CONSOLE),
+    VT(2), VT(3), VT(4), VT(5), VT(6), VT(7), VT(8), VT(9), VT(10), VT(11),
+    VT(12), VT(13), VT(14), VT(15), VT(16), VT(17), VT(18), VT(19), VT(20),
+    VT(21), VT(22), VT(23), VT(24), VT(25), VT(26), VT(27), VT(28), VT(29),
+    VT(30), VT(31), VT(32), VT(33), VT(34), VT(35), VT(36), VT(37), VT(38),
+    VT(39), VT(40), VT(41), VT(42), VT(43), VT(44), VT(45), VT(46), VT(47),
+    VT(48), VT(49), VT(50), VT(51), VT(52), VT(53), VT(54), VT(55), VT(56),
+    VT(57), VT(58), VT(59), VT(60), VT(61), VT(62), VT(63),
+    // in the order the guest probes them: the AT keyboard, the PS/2 mouse,
+    // the USB tablet, the PC speaker, the ACPI power button
+    INPUT(0, INPUT_KEYBOARD),
+    INPUT(1, INPUT_MOUSE),
+    INPUT(2, INPUT_TABLET),
+    INPUT(3, INPUT_SPEAKER),
+    INPUT(4, INPUT_POWER_BUTTON),
+    NODE("/dev/mixer", 14, 0, 0660, DEVICE_MIXER),
+    NODE("/dev/dsp", 14, 3, 0660, DEVICE_DSP),
+    // OSS numbers card 1's raw MIDI ports 16 + 2 (device 0, as /dev/midi1
+    // and /dev/dmmidi1) and 16 + 13 (device 1, as /dev/amidi1 and
+    // /dev/admmidi1): snd-rawmidi's midi_map and amidi_map
+    MIDI("/dev/midi1", 14, 18, 0),
+    MIDI("/dev/dmmidi1", 14, 25, 0),
+    MIDI("/dev/amidi1", 14, 29, 1),
+    MIDI("/dev/admmidi1", 14, 30, 1),
+    // ALSA's minors are dynamic (CONFIG_SND_DYNAMIC_MINORS), given out as
+    // devices register: the sequencer, card 1's four raw MIDI devices and its
+    // control, card 0's PCM, hwdep and control, then card 2's (loaded after
+    // card 0 in the pinned guest, so the numbers hold at every boot), and the
+    // timer at its fixed minor
+    MIDI("/dev/snd/midiC1D0", 116, 2, 0),
+    MIDI("/dev/snd/midiC1D1", 116, 3, 1),
+    MIDI("/dev/snd/midiC1D2", 116, 4, 2),
+    MIDI("/dev/snd/midiC1D3", 116, 5, 3),
     // the guest's nodes this design does not cover: opening one answers ENODEV
-    {"/dev/dri/card0", 226, 0, 0660, DEVICE_UNSUPPORTED, -1},
-    {"/dev/snd/controlC0", 116, 0, 0660, DEVICE_UNSUPPORTED, -1},
-    {"/dev/snd/pcmC0D0p", 116, 16, 0660, DEVICE_UNSUPPORTED, -1},
-    {"/dev/snd/pcmC0D0c", 116, 24, 0660, DEVICE_UNSUPPORTED, -1},
-    {"/dev/snd/seq", 116, 1, 0660, DEVICE_UNSUPPORTED, -1},
-    {"/dev/input/mice", 13, 63, 0660, DEVICE_UNSUPPORTED, -1},
-    {"/dev/input/mouse0", 13, 32, 0660, DEVICE_UNSUPPORTED, -1},
-    {"/dev/input/mouse1", 13, 33, 0660, DEVICE_UNSUPPORTED, -1},
-    {"/dev/audio", 14, 4, 0660, DEVICE_UNSUPPORTED, -1},
+    NODE("/dev/snd/seq", 116, 1, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/snd/controlC1", 116, 6, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/snd/pcmC0D0p", 116, 7, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/snd/pcmC0D0c", 116, 8, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/snd/hwC0D0", 116, 9, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/snd/controlC0", 116, 10, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/snd/pcmC2D0p", 116, 11, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/snd/controlC2", 116, 12, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/snd/timer", 116, 33, 0660, DEVICE_UNSUPPORTED),
+    // card 1's OSS mixer, which has no controls, and card 2's OSS devices:
+    // the USB card FluidSynth plays on, as a program would find it
+    NODE("/dev/mixer1", 14, 16, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/mixer2", 14, 32, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/dsp2", 14, 35, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/audio2", 14, 36, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/audio", 14, 4, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/dri/card0", 226, 0, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/input/mice", 13, 63, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/input/mouse0", 13, 32, 0660, DEVICE_UNSUPPORTED),
+    NODE("/dev/input/mouse1", 13, 33, 0660, DEVICE_UNSUPPORTED),
+    // joydev's node for the tablet, which has absolute axes
+    NODE("/dev/input/js0", 13, 0, 0664, DEVICE_UNSUPPORTED),
+    NODE("/dev/uinput", 10, 223, 0600, DEVICE_UNSUPPORTED),
 };
 
-// udev's links. The tablet's name the USB controller's PCI address, which the
-// pinned guest fixes and these guess; its serial is QEMU's, built from it.
+#undef NODE
+#undef INPUT
+#undef MIDI
+#undef VT
+
+// udev's links, as the pinned guest's udev 257 makes them. The USB devices'
+// name the controller's PCI address (00:04.0) and port, the tablet on port 1
+// and the audio card on port 2, once as usb- and once as usbv2-; the
+// tablet's serial is QEMU's, built from its port. Its "-mouse" links go to
+// js0: joydev's node takes the name udev gives a device with absolute axes.
 static const struct DeviceLink kDeviceLinks[] = {
-    {"/dev/input/by-path/platform-i8042-serio-0-event-kbd", "../event1"},
-    {"/dev/input/by-path/platform-i8042-serio-1-event-mouse", "../event2"},
+    {"/dev/input/by-path/platform-i8042-serio-0-event-kbd", "../event0"},
+    {"/dev/input/by-path/platform-i8042-serio-1-event-mouse", "../event1"},
     {"/dev/input/by-path/platform-i8042-serio-1-mouse", "../mouse0"},
-    {"/dev/input/by-path/platform-pcspkr-event-spkr", "../event4"},
     {"/dev/input/by-path/pci-0000:00:04.0-usb-0:1:1.0-event-mouse",
-     "../event3"},
-    {"/dev/input/by-path/pci-0000:00:04.0-usb-0:1:1.0-mouse", "../mouse1"},
+     "../event2"},
+    {"/dev/input/by-path/pci-0000:00:04.0-usb-0:1:1.0-mouse", "../js0"},
+    {"/dev/input/by-path/pci-0000:00:04.0-usbv2-0:1:1.0-event-mouse",
+     "../event2"},
+    {"/dev/input/by-path/pci-0000:00:04.0-usbv2-0:1:1.0-mouse", "../js0"},
+    {"/dev/input/by-path/platform-pcspkr-event-spkr", "../event3"},
+    {"/dev/input/by-path/platform-LNXPWRBN:00-event", "../event4"},
     {"/dev/input/by-id/usb-QEMU_QEMU_USB_Tablet_28754-0000:00:04.0-1-event-mouse",
-     "../event3"},
+     "../event2"},
     {"/dev/input/by-id/usb-QEMU_QEMU_USB_Tablet_28754-0000:00:04.0-1-mouse",
-     "../mouse1"},
+     "../js0"},
+    {"/dev/snd/by-path/pci-0000:00:05.0", "../controlC0"},
+    {"/dev/snd/by-path/platform-snd_virmidi.0", "../controlC1"},
+    {"/dev/snd/by-path/pci-0000:00:04.0-usb-0:2:1.0", "../controlC2"},
+    {"/dev/snd/by-path/pci-0000:00:04.0-usbv2-0:2:1.0", "../controlC2"},
+    {"/dev/snd/by-id/usb-QEMU_QEMU_USB_Audio_1-0000:00:04.0-2-00",
+     "../controlC2"},
+    {"/dev/dri/by-path/pci-0000:00:01.0-card", "../card0"},
 };
-
 
 // struct input_event on x86-64: a timeval, then type, code and value.
 #define INPUT_EVENT_SIZE 24

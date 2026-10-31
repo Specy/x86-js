@@ -1,7 +1,9 @@
 /* /dev/dsp and /dev/mixer: OSS sampled sound and the OSS mixer, as Linux
- * 6.12's snd-pcm-oss and snd-mixer-oss emulate them on the guest's HDA card,
- * QEMU's hda-duplex codec behind its ICH9 controller (x86-devices.md, "What
- * /dev/dsp accepts", "/dev/dsp's buffer and pacing").
+ * 7.2's snd-pcm-oss and snd-mixer-oss emulate them on the guest's HDA card,
+ * QEMU's hda-duplex codec behind its ICH6 controller (intel-hda), card 0
+ * (x86-devices.md, "What /dev/dsp accepts", "/dev/dsp's buffer and pacing";
+ * docs/research/x86-reference-guest.md). FluidSynth plays on a USB card of
+ * its own, so /dev/dsp is the program's.
  *
  * The card plays 16-bit stereo at 16 to 96 kHz only, so snd-pcm-oss converts
  * what the program writes through a chain of plugins: format, channels and,
@@ -106,7 +108,7 @@
 #define DSP_CAP_REALTIME  0x00000200
 #define DSP_CAP_TRIGGER   0x00001000
 
-// QEMU's hda-duplex codec through hda_intel on an ICH9 controller: 16-bit
+// QEMU's hda-duplex codec through hda_intel on an ICH6 controller: 16-bit
 // stereo at the codec's rates, a buffer of at most AZX_MAX_BUF_SIZE (4 MiB),
 // periods of 128 bytes up to half of it, 2 to AZX_MAX_FRAG (32) of them, and
 // no 128-byte alignment (AZX_DCAPS_NO_ALIGN_BUFSIZE).
@@ -177,6 +179,10 @@ struct MixerSlot {
 
 static struct MixerSlot mixer[MIXER_SLOTS];
 static u32 mixer_changes;
+
+// SOUND_MIXER_INFO's modify_counter on the guest before any program writes
+// the mixer: the changes alsactl init and the boot made to card 0.
+#define MIXER_CHANGES_AT_BOOT 14
 
 // ------------------------------------------------------------ formats
 
@@ -549,6 +555,54 @@ static void Prepare(struct DspPass *p) {
   dsp.period_ptr = 0;
 }
 
+/* snd_pcm_plug_alloc(): a period's buffer for each plugin of the chain
+ * snd_pcm_plug_format_plugins() builds but the first, each in its source
+ * format, which snd_pcm_plugin_alloc() refuses with ENOMEM past 1024 × 1024,
+ * a limit it checks in bits: so a long fragment the card took fails here,
+ * and every call that applies the settings fails the same way until they
+ * change. The chain into the card's S16 stereo: µ-law decoded when the rate
+ * changes, channels past two dropped, S16 for the rate plugin and the rate
+ * plugin, the card's format, mono made stereo. The rate plugin's frames are
+ * the program's, the plugins after it the card's. */
+static bool PluginBuffersFit(struct RatePlugin *plug, u32 format, i64 frames) {
+  int plugins = 0;
+  u32 width = PhysicalWidth(format), channels = dsp.channels;
+  bool fit = true;
+#define PLUGIN(WIDTH, CHANNELS)                                          \
+  do {                                                                   \
+    if (plugins++ && (u64)frames * (CHANNELS) * (WIDTH) > 1024 * 1024) { \
+      fit = false;                                                       \
+    }                                                                    \
+  } while (0)
+  if (plug->present && format == AFMT_MU_LAW) {
+    PLUGIN(width, channels);
+    width = 16;
+    format = AFMT_S16_LE;
+  }
+  if (channels > 2) {
+    PLUGIN(width, channels);
+    channels = 2;
+  }
+  if (plug->present) {
+    if (format != AFMT_S16_LE) {
+      PLUGIN(width, channels);
+      width = 16;
+      format = AFMT_S16_LE;
+    }
+    PLUGIN(width, channels);
+    // the plugin after it, if any, asks it how many frames it makes
+    if (channels < 2) frames = RateDstFrames(plug, frames);
+  }
+  if (format != AFMT_S16_LE) {
+    PLUGIN(width, channels);
+    width = 16;
+    format = AFMT_S16_LE;
+  }
+  if (channels < 2) PLUGIN(width, channels);
+#undef PLUGIN
+  return fit;
+}
+
 /* snd_pcm_oss_change_params_locked(), with snd_pcm_oss_period_size(): the
  * fragment size and count for what the program set, part of it computed
  * through the chain of the configuration before. */
@@ -613,6 +667,10 @@ static int ApplyParams(struct DspPass *p, i64 now) {
   DropRing(p, now);
   plug = NewRatePlugin(dsp.rate, slave_rate);
   if ((client = ClientSize(&plug, speriod)) <= 0) goto Invalid;
+  if (!PluginBuffersFit(&plug, format, client)) {
+    errno = ENOMEM;
+    goto Failed;
+  }
   SaveStaging(p);
   if (!(grown = (u8 *)realloc(staging, client * frame))) {
     errno = ENOMEM;
@@ -989,12 +1047,13 @@ void ResetOss(void) {
   // The guest's HDA card through hda_generic has "Master" and "Capture"
   // controls, so VOLUME and IGAIN are its OSS channels; the levels are what
   // alsactl init sets on a card with no saved state (Master at -20 dB of
-  // 74 steps, Capture at its top). Provisional until the pinned guest is
-  // booted (M0).
+  // 74 steps, Capture at its top), and the mixer has counted the 14 control
+  // changes made since the card came up by the time a program asks, as the
+  // pinned guest's does.
   memset(mixer, 0, sizeof(mixer));
   mixer[MIXER_VOLUME] = (struct MixerSlot){true, true, 73, 73};
   mixer[MIXER_IGAIN] = (struct MixerSlot){true, true, 100, 100};
-  mixer_changes = 0;
+  mixer_changes = MIXER_CHANGES_AT_BOOT;
 }
 
 void OssTearDown(void) {
@@ -1096,10 +1155,11 @@ static int MixerRequest(struct Machine *m, u32 cmd, i64 addr) {
     switch (cmd) {
       case SOUND_MIXER_INFO:
       case SOUND_OLD_MIXER_INFO:
-        // the card's driver and its codec, QEMU's hda-duplex with its mixer
+        // the card's driver and the mixer's name, which hda_generic gives
+        // QEMU's hda-duplex codec
         memset(info, 0, sizeof(info));
         strcpy((char *)info, "HDA-Intel");
-        strcpy((char *)info + 16, "QEMU ID 22");
+        strcpy((char *)info + 16, "QEMU Generic");
         Write32(info + 48, mixer_changes);
         return CopyToUserWrite(m, addr, info,
                                cmd == SOUND_MIXER_INFO ? 92 : 48) == -1
@@ -1177,7 +1237,9 @@ static int SetRate(struct DspPass *p, i32 rate) {
   return Apply(p) == -1 ? -1 : (int)dsp.rate;
 }
 
-static int SetChannels(struct DspPass *p, i32 channels) {
+/* snd_pcm_oss_set_channels(), which takes the count unsigned: 0 is 1, and
+ * anything past 128, -1 among them, EINVAL. */
+static int SetChannels(struct DspPass *p, u32 channels) {
   if (channels < 1) channels = 1;
   if (channels > 128) return einval();
   if (dsp.channels != (u32)channels) {
@@ -1209,7 +1271,9 @@ static int GetSpace(struct Machine *m, struct DspPass *p, i64 addr) {
   } else {
     bytes = OssBytes(dsp.capacity - Queued(now)) - dsp.buffer_used;
   }
-  Write32(info, bytes / dsp.period_bytes);  // fragments
+  // info.bytes / runtime->oss.period_bytes, an int over a size_t: a
+  // negative count of bytes free comes out as floor division would have it
+  Write32(info, (u32)((u64)bytes / dsp.period_bytes));  // fragments
   Write32(info + 12, bytes);
   return CopyToUserWrite(m, addr, info, sizeof(info)) == -1 ? efault() : 0;
 }

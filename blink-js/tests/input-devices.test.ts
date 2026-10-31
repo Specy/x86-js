@@ -2,8 +2,8 @@
 // capabilities, every ioctl evdev answers, the packets a host report becomes (MSC_SCAN, the LEDs
 // the lock keys light, REL_WHEEL_HI_RES, SYN_REPORT), event times on each reader's clock, readers
 // and the grab, the overflow rule, waits and poll, writes, and Undo of what reads and flushes took
-// (ADR 0069). The values are Linux 6.12's on the QEMU guest x86's devices follow (ADR 0067),
-// provisional until it is booted, so these run in the Core only.
+// (ADR 0069). The values are Linux 7.2's on the pinned QEMU guest x86's devices follow (ADR 0067,
+// docs/research/x86-reference-guest.md), as its probe recorded them.
 import { describe, expect, it } from 'vitest'
 import { EmulatorStatus } from '../src/interface'
 import { BlinkState, type X86Environment, type X86InputEvent } from '../src/types'
@@ -38,6 +38,8 @@ const KEY_SYSRQ = 99
 const KEY_PAUSE = 119
 const BTN_LEFT = 0x110
 const BTN_RIGHT = 0x111
+const BTN_SIDE = 0x113
+const BTN_EXTRA = 0x114
 const ABS_X = 0
 const ABS_Y = 1
 const REL_WHEEL = 8
@@ -69,9 +71,9 @@ const EVIOCSCLOCKID = ioc(WRITE, 0xa0, 4)
 const EVIOCGEFFECTS = ioc(READ, 0x84, 4)
 
 const PATHS: Record<string, string> = {
-    power: '/dev/input/event0',
+    power: '/dev/input/by-path/platform-LNXPWRBN:00-event',
     kbd: '/dev/input/by-path/platform-i8042-serio-0-event-kbd',
-    psmouse: '/dev/input/event2',
+    psmouse: '/dev/input/by-path/platform-i8042-serio-1-event-mouse',
     tablet: '/dev/input/by-id/usb-QEMU_QEMU_USB_Tablet_28754-0000:00:04.0-1-event-mouse',
     speaker: '/dev/input/by-path/platform-pcspkr-event-spkr',
     proc: X86_INPUT_DEVICES_FILE
@@ -258,9 +260,9 @@ describe('the input devices', () => {
     ]
 
     it('have the identities and capabilities of their Linux drivers', async () => {
-        // atkbd's translated set 2 table, as /proc/bus/input/devices prints it below
+        // atkbd's translated set 2 table on Linux 7.2, as /proc/bus/input/devices prints it below
         const keyboardKeys: number[] = []
-        ;['fffffffffffffffe', 'feffffdfffefffff', '3803078f800d001', '402000000'].forEach(
+        ;['fffffffffffffffe', 'feffffdfffcfffff', 'ff803078f800d001', '402000007'].forEach(
             (word, index) => {
                 for (let bit = 0; bit < 64; bit++)
                     if ((BigInt(`0x${word}`) >> BigInt(bit)) & 1n)
@@ -295,7 +297,7 @@ describe('the input devices', () => {
             ],
             [
                 'tablet',
-                expected(0x0001_0001_0627_0003n, 0n, 0x1fn, [0x110, 0x111, 0x112], [
+                expected(0x0001_0001_0627_0003n, 0n, 0x1fn, [0x110, 0x111, 0x112, 0x113, 0x114], [
                     0x900n,
                     0x3n,
                     0x10n,
@@ -331,25 +333,15 @@ describe('the input devices', () => {
         }
         expect(text).toBe(
             [
-                'I: Bus=0019 Vendor=0000 Product=0001 Version=0000',
-                'N: Name="Power Button"',
-                'P: Phys=LNXPWRBN/button/input0',
-                'S: Sysfs=/devices/LNXSYSTM:00/LNXPWRBN:00/input/input0',
-                'U: Uniq=',
-                'H: Handlers=kbd event0 ',
-                'B: PROP=0',
-                'B: EV=3',
-                'B: KEY=8000 10000000000000 0',
-                '',
                 'I: Bus=0011 Vendor=0001 Product=0001 Version=ab41',
                 'N: Name="AT Translated Set 2 keyboard"',
                 'P: Phys=isa0060/serio0/input0',
-                'S: Sysfs=/devices/platform/i8042/serio0/input/input1',
+                'S: Sysfs=/devices/platform/i8042/serio0/input/input0',
                 'U: Uniq=',
-                'H: Handlers=sysrq kbd event1 leds ',
+                'H: Handlers=sysrq kbd leds event0 ',
                 'B: PROP=0',
                 'B: EV=120013',
-                'B: KEY=402000000 3803078f800d001 feffffdfffefffff fffffffffffffffe',
+                'B: KEY=402000007 ff803078f800d001 feffffdfffcfffff fffffffffffffffe',
                 'B: MSC=10',
                 'B: LED=7',
                 '',
@@ -358,7 +350,7 @@ describe('the input devices', () => {
                 'P: Phys=isa0060/serio1/input0',
                 'S: Sysfs=/devices/platform/i8042/serio1/input/input2',
                 'U: Uniq=',
-                'H: Handlers=mouse0 event2 ',
+                'H: Handlers=mouse0 event1 ',
                 'B: PROP=1',
                 'B: EV=7',
                 'B: KEY=1f0000 0 0 0 0',
@@ -369,10 +361,10 @@ describe('the input devices', () => {
                 'P: Phys=usb-0000:00:04.0-1/input0',
                 'S: Sysfs=/devices/pci0000:00/0000:00:04.0/usb1/1-1/1-1:1.0/0003:0627:0001.0001/input/input3',
                 'U: Uniq=28754-0000:00:04.0-1',
-                'H: Handlers=mouse1 event3 ',
+                'H: Handlers=mouse1 event2 js0 ',
                 'B: PROP=0',
                 'B: EV=1f',
-                'B: KEY=70000 0 0 0 0',
+                'B: KEY=1f0000 0 0 0 0',
                 'B: REL=900',
                 'B: ABS=3',
                 'B: MSC=10',
@@ -382,10 +374,20 @@ describe('the input devices', () => {
                 'P: Phys=isa0061/input0',
                 'S: Sysfs=/devices/platform/pcspkr/input/input4',
                 'U: Uniq=',
-                'H: Handlers=kbd event4 ',
+                'H: Handlers=kbd event3 ',
                 'B: PROP=0',
                 'B: EV=40001',
                 'B: SND=6',
+                '',
+                'I: Bus=0019 Vendor=0000 Product=0001 Version=0000',
+                'N: Name="Power Button"',
+                'P: Phys=LNXPWRBN/button/input0',
+                'S: Sysfs=/devices/platform/LNXPWRBN:00/input/input5',
+                'U: Uniq=',
+                'H: Handlers=kbd event4 ',
+                'B: PROP=0',
+                'B: EV=3',
+                'B: KEY=8000 10000000000000 0',
                 '',
                 ''
             ].join('\n')
@@ -644,7 +646,7 @@ describe('a keyboard report', () => {
         }
     })
 
-    it('lights Caps Lock in a packet of its own, as the console does, and EVIOCGLED says so', async () => {
+    it('lights Caps Lock in the packet its release closes, as the guest does, and EVIOCGLED says so', async () => {
         const emulator = await build([
             `sys 2, kbd, ${O_RDWR | O_NONBLOCK}`,
             'mov r12, rax',
@@ -657,12 +659,12 @@ describe('a keyboard report', () => {
             emulator.sendInputReport('keyboard', key(KEY_CAPSLOCK, 1))
             emulator.sendInputReport('keyboard', key(KEY_CAPSLOCK, 0))
             await throughSyscall(emulator)
+            // the console's LED trigger sets the LED with no SYN_REPORT of its own
             expect(plain(readEvents(emulator).events)).toEqual([
                 [EV_MSC, MSC_SCAN, 0x3a],
                 [EV_KEY, KEY_CAPSLOCK, 1],
                 [EV_SYN, SYN_REPORT, 0],
                 [EV_LED, LED_CAPSL, 1],
-                [EV_SYN, SYN_REPORT, 0],
                 [EV_MSC, MSC_SCAN, 0x3a],
                 [EV_KEY, KEY_CAPSLOCK, 0],
                 [EV_SYN, SYN_REPORT, 0]
@@ -747,6 +749,65 @@ describe('a tablet report', () => {
                 [EV_SYN, SYN_REPORT, 0]
             ])
             expect(await finish(emulator)).toEqual([1000n, 1n << BigInt(BTN_RIGHT - 256)])
+        } finally {
+            emulator.dispose()
+        }
+    })
+
+    it('has five buttons, BTN_SIDE and BTN_EXTRA with their usages, and a keymap of them', async () => {
+        const emulator = await build([
+            `sys 2, tablet, ${O_RDWR | O_NONBLOCK}`,
+            'mov r12, rax',
+            'sys 0, r12, buf, 4096',
+            // hid-input's keymap: BTN_SIDE by its usage, a usage it lacks, then BTN_EXTRA
+            // reporting BTN_LEFT instead
+            'mov dword [buf2], 0x90004',
+            `sys 16, r12, ${EVIOCGKEYCODE}, buf2`,
+            'save',
+            'saved buf2 + 4',
+            'mov dword [buf2], 0x90006',
+            `sys 16, r12, ${EVIOCGKEYCODE}, buf2`,
+            'save',
+            'mov dword [buf2], 0x90005',
+            `mov dword [buf2 + 4], ${BTN_LEFT}`,
+            `sys 16, r12, ${ioc(WRITE, 0x04, 8)}, buf2`, // EVIOCSKEYCODE
+            'save',
+            `sys 16, r12, ${EVIOCGBIT(EV_KEY, 96)}, buf2`, // BTN_EXTRA has no usage now
+            'saveq buf2 + 32',
+            'sys 0, r12, buf, 4096'
+        ])
+        try {
+            await throughSyscall(emulator)
+            emulator.sendInputReport('tablet', [{ type: EV_KEY, code: BTN_SIDE, value: 1 }])
+            emulator.sendInputReport('tablet', [
+                { type: EV_KEY, code: BTN_SIDE, value: 0 },
+                { type: EV_KEY, code: BTN_EXTRA, value: 1 }
+            ])
+            await throughSyscall(emulator)
+            expect(plain(readEvents(emulator).events)).toEqual([
+                [EV_MSC, MSC_SCAN, 0x90004],
+                [EV_KEY, BTN_SIDE, 1],
+                [EV_SYN, SYN_REPORT, 0],
+                [EV_MSC, MSC_SCAN, 0x90004],
+                [EV_KEY, BTN_SIDE, 0],
+                [EV_MSC, MSC_SCAN, 0x90005],
+                [EV_KEY, BTN_EXTRA, 1],
+                [EV_SYN, SYN_REPORT, 0]
+            ])
+            // the keymap's four calls, then the read: the fifth button, held, now reports
+            // BTN_LEFT, and BTN_EXTRA went up as EVIOCSKEYCODE took it away
+            await throughSyscall(emulator, 5)
+            expect(plain(readEvents(emulator).events)).toEqual([
+                [EV_KEY, BTN_EXTRA, 0],
+                [EV_SYN, SYN_REPORT, 1]
+            ])
+            expect(await finish(emulator)).toEqual([
+                0n,
+                BigInt(BTN_SIDE),
+                EINVAL,
+                0n,
+                0xfn << 16n
+            ])
         } finally {
             emulator.dispose()
         }

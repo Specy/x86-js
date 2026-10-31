@@ -256,17 +256,22 @@ u64 GetTerminalWaitSize(void) {
 
 // --------------------------------------------------------------- the termios
 
-/* What a Linux serial console starts with, before a program changes it:
+/* What the program finds on the pinned guest's serial console, as agetty
+ * leaves ttyS0 for root's shell (docs/research/x86-reference-guest.md):
  * canonical, echoing, Enter read as a line feed, Backspace erasing a whole
- * UTF-8 character (IUTF8), and Linux's control characters. */
+ * UTF-8 character (IUTF8), control characters echoed as themselves (no
+ * ECHOCTL) and no IEXTEN; 9600 baud with HUPCL and CLOCAL, a speed reported
+ * and never paced (ADR 0010 has no clock pacing), and Linux's control
+ * characters. */
 static void DefaultTermios(struct termios_linux *tio) {
   memset(tio, 0, sizeof(*tio));
-  Write32(tio->iflag, ICRNL_LINUX | IXON_LINUX | IUTF8_LINUX);
+  Write32(tio->iflag,
+          ICRNL_LINUX | IXON_LINUX | IXOFF_LINUX | IMAXBEL_LINUX | IUTF8_LINUX);
   Write32(tio->oflag, OPOST_LINUX | ONLCR_LINUX);
-  Write32(tio->cflag, B38400_LINUX | CS8_LINUX | CREAD_LINUX);
+  Write32(tio->cflag,
+          B9600_LINUX | CS8_LINUX | CREAD_LINUX | HUPCL_LINUX | CLOCAL_LINUX);
   Write32(tio->lflag, ISIG_LINUX | ICANON_LINUX | ECHO_LINUX | ECHOE_LINUX |
-                          ECHOK_LINUX | ECHOCTL_LINUX | ECHOKE_LINUX |
-                          IEXTEN_LINUX);
+                          ECHOK_LINUX | ECHOKE_LINUX);
   tio->cc[VINTR_LINUX] = 'C' - '@';
   tio->cc[VQUIT_LINUX] = '\\' - '@';
   tio->cc[VERASE_LINUX] = 0177;
@@ -300,6 +305,7 @@ int GetTerminalMode(void) {
   lflag = Read32(termios.lflag);
   if (lflag & ICANON_LINUX) mode |= TERMINAL_MODE_CANONICAL;
   if (lflag & ECHO_LINUX) mode |= TERMINAL_MODE_ECHO;
+  if (lflag & ECHOCTL_LINUX) mode |= TERMINAL_MODE_ECHO_CONTROL;
   if (lflag & ISIG_LINUX) mode |= TERMINAL_MODE_SIGNALS;
   if (iflag & ICRNL_LINUX) mode |= TERMINAL_MODE_CR_TO_NL;
   if (oflag & OPOST_LINUX) mode |= TERMINAL_MODE_OUTPUT_PROCESSING;
@@ -779,16 +785,38 @@ const struct FdCb *GetTerminalDeviceCb(int hostfd) {
   return 0;
 }
 
+/* Whether the host descriptor is one of /dev/ttyS0, which the program's
+ * standard streams are on the guest, so that fstat() and ttyname() find that
+ * node for them. */
+static bool IsSerialHostFd(int hostfd, dev_t serial) {
+  struct stat st;
+  return serial != (dev_t)-1 && !VfsFstat(hostfd, &st) &&
+         S_ISCHR(st.st_mode) && st.st_rdev == serial;
+}
+
 /* Gives descriptors 0 to 2 a host descriptor each again where the last
- * program closed one, before the next program loads and opens anything. */
+ * program closed one, before the next program loads and opens anything: one
+ * of /dev/ttyS0, the serial line root's shell left them on, or, without
+ * that node, of the host's own standard streams. */
 void OpenTerminalHostFds(void) {
   int fildes, hostfd;
+  dev_t serial;
+  struct stat st;
   static const char *const kPlaceholders[] = {"/dev/stdin", "/dev/stdout",
                                               "/dev/stderr"};
   if (!devices_known) LearnTerminalDevices();
+  serial = !VfsStat(AT_FDCWD, "/dev/ttyS0", &st, 0) && S_ISCHR(st.st_mode)
+               ? st.st_rdev
+               : (dev_t)-1;
   for (fildes = 0; fildes < 3; ++fildes) {
-    if (VfsFcntl(fildes, F_GETFD) != -1) continue;
-    if ((hostfd = VfsOpen(AT_FDCWD, kPlaceholders[fildes],
+    if (VfsFcntl(fildes, F_GETFD) != -1) {
+      if (serial == (dev_t)-1 || IsSerialHostFd(fildes, serial)) continue;
+      // the host's own stream, as the module started: the serial line's
+      unassert(!VfsClose(fildes));
+    }
+    if ((serial == (dev_t)-1 ||
+         (hostfd = VfsOpen(AT_FDCWD, "/dev/ttyS0", O_RDWR, 0)) == -1) &&
+        (hostfd = VfsOpen(AT_FDCWD, kPlaceholders[fildes],
                           fildes ? O_WRONLY : O_RDONLY, 0)) == -1 &&
         (hostfd = VfsOpen(AT_FDCWD, "/dev/null", O_RDWR, 0)) == -1) {
       unassert((hostfd = VfsOpen(AT_FDCWD, "/", O_RDONLY | O_DIRECTORY, 0)) !=

@@ -20,6 +20,7 @@
 #define TERMINAL_MODE_CR_TO_NL          8   // ICRNL
 #define TERMINAL_MODE_OUTPUT_PROCESSING 16  // OPOST
 #define TERMINAL_MODE_NL_TO_CR_NL       32  // ONLCR
+#define TERMINAL_MODE_ECHO_CONTROL      64  // ECHOCTL
 
 // The flags of a JOURNAL_TERMINAL_READ record.
 #define TERMINAL_READ_END_OF_INPUT 1  // it took an End of input token

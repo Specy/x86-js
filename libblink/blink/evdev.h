@@ -28,6 +28,7 @@ int PollEvdev(struct pollfd *, nfds_t, int);
 int IoctlEvdev(struct Machine *, int, u64, i64);
 void ResetInputDevices(void);
 bool EvdevConsoleSound(u32, i64);
+void EvdevConsoleLeds(u8 *, u8 *);
 void UndoEvdevJournal(u32, const u8 *, u32);
 
 #endif /* BLINK_EVDEV_H_ */

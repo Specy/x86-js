@@ -1,8 +1,8 @@
 // /dev/fb0 (x86-devices-plan.md, M2): the screen information Linux's DRM fbdev emulation gives on
 // the QEMU guest's bochs display, its check of a new one, panning and the vsync wait; the buffer
 // mmap() shares and read(), write() and lseek() reach; what Undo takes back; and the wrapper's
-// view of the page the scanout shows. The values are the guest's as Linux 6.12's sources give
-// them, provisional until the guest is booted, so these run in the Core only.
+// view of the page the scanout shows. The values are the pinned guest's, Linux 7.2's, as its
+// probe recorded them (docs/research/x86-reference-guest.md).
 import { describe, expect, it } from 'vitest'
 import { BlinkState, type X86Environment, type X86WaitRequest } from '../src/types'
 import { createX86Emulator, type X86Emulator } from '../src/x86-emulator'
@@ -192,6 +192,19 @@ async function stepTo(body: readonly string[]) {
     throw new Error('the marked instruction never came up')
 }
 
+/** Steps the next instruction, through the wait it makes, as one instruction to the history. */
+async function stepThroughWait(emulator: X86Emulator): Promise<void> {
+    await emulator.step()
+    for (let index = 0; index < 100 && emulator.runtime.isWaiting(); index++) {
+        await new Promise<void>((resolve) => {
+            const done = emulator.on('stateChange', () => {
+                done()
+                resolve()
+            })
+        })
+    }
+}
+
 function pixelAt(emulator: X86Emulator, index: number): number {
     const visible = emulator.getFramebuffer()!.visible()
     return new DataView(visible.buffer, visible.byteOffset).getUint32(index * 4, true)
@@ -267,8 +280,8 @@ describe('the screen information', () => {
             emulator.runtime.starti()
             expect(emulator.getFramebuffer()).toBeNull()
             const second = await runToEnd(emulator)
-            // 1312 × 400 bytes, rounded up to whole pages as the VRAM helper does
-            expect(second.results).toEqual([328n, 200n, 400n, 528384n, 1312n])
+            // 1312 × 400 bytes, not rounded to pages: the guest's 8×8 has 512
+            expect(second.results).toEqual([328n, 200n, 400n, 524800n, 1312n])
             const framebuffer = emulator.getFramebuffer()!
             expect([framebuffer.width, framebuffer.height, framebuffer.lineLength]).toEqual([
                 328, 200, 1312
@@ -537,6 +550,74 @@ describe('the other ioctls', () => {
             ],
             ({ results }) => {
                 expect(results).toEqual([EINVAL, ENOTTY, ENOTTY, ENOTTY, 0n])
+            },
+            virtualClock()
+        )
+    })
+})
+
+describe('the vertical blank a pan waits for', () => {
+    it('ends a pan at the next refresh, a pan to the page shown too, and FBIOPUT at the second', async () => {
+        await probe(
+            [
+                'sys 2, fb0, 2',
+                'mov r12, rax',
+                ...getVar(V.yoffset, 240),
+                `sys 16, r12, ${FBIOPAN_DISPLAY}, buf`,
+                'save',
+                'sys 228, 1, buf2', // clock_gettime(CLOCK_MONOTONIC)
+                'saveq buf2 + 8',
+                // the page already shown: it still waits
+                `sys 16, r12, ${FBIOPAN_DISPLAY}, buf`,
+                'sys 228, 1, buf2',
+                'saveq buf2 + 8',
+                // "wait for vsync, then pan" takes two refreshes
+                `sys 16, r12, ${FBIO_WAITFORVSYNC}, 0`,
+                `mov dword [buf + ${V.yoffset}], 0`,
+                `sys 16, r12, ${FBIOPAN_DISPLAY}, buf`,
+                'sys 228, 1, buf2',
+                'saveq buf2 + 8',
+                // a new yoffset through the screen information: the mode's commit, then the pan's
+                ...getVar(V.yoffset, 240),
+                `sys 16, r12, ${FBIOPUT_VSCREENINFO}, buf`,
+                'save',
+                'sys 228, 1, buf2',
+                'saveq buf2 + 8',
+                // the screen information as it is: nothing to commit, no wait
+                ...getVar(),
+                `sys 16, r12, ${FBIOPUT_VSCREENINFO}, buf`,
+                'save',
+                'sys 228, 1, buf2',
+                'saveq buf2 + 8',
+                // a pan the check refuses answers at once
+                `mov dword [buf + ${V.yoffset}], 241`,
+                `sys 16, r12, ${FBIOPAN_DISPLAY}, buf`,
+                'save',
+                'sys 228, 1, buf2',
+                'saveq buf2 + 8'
+            ],
+            ({ results, presents, waits }) => {
+                const frame = (n: number) => BigInt(Math.ceil((n * 1e9) / 60))
+                expect(results).toEqual([
+                    0n,
+                    frame(1),
+                    frame(2),
+                    frame(4),
+                    0n,
+                    frame(6),
+                    0n,
+                    frame(6),
+                    EINVAL,
+                    frame(6)
+                ])
+                expect(presents).toEqual([240, 240, 0, 240])
+                expect(waits.map((wait) => wait.deadlineNanoseconds)).toEqual([
+                    frame(1),
+                    frame(2),
+                    frame(3),
+                    frame(4),
+                    frame(6)
+                ])
             },
             virtualClock()
         )
@@ -838,7 +919,8 @@ describe('Undo', () => {
             'syscall ; <-- step'
         ])
         try {
-            await emulator.step()
+            // the pan waits for the next vertical blank, as one instruction
+            await stepThroughWait(emulator)
             expect(emulator.getFramebuffer()!.yoffset).toBe(240)
             expect(presents).toEqual([240])
             expect(emulator.canUndo()).toBe(true)
@@ -866,7 +948,7 @@ describe('Undo', () => {
         ])
         try {
             const buf = emulator.getRegisterValue('rdx')
-            await emulator.step()
+            await stepThroughWait(emulator)
             expect(presents).toEqual([0])
             emulator.undo()
             // run again asking for the whole mode, it finds the device already has it: nothing

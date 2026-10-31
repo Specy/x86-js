@@ -1,7 +1,15 @@
-/* /dev/fb0, as Linux's DRM fbdev emulation answers on the QEMU guest's bochs
- * display (docs/design/x86-devices.md, "Screen size and format" and "Double
- * buffering and the vsync wait"): drm_fbdev_ttm's shadow buffer behind
- * fb_chrdev.c, with drm_fb_helper.c's screen information, check and pan.
+/* /dev/fb0, as Linux 7.2's DRM fbdev emulation answers on the QEMU guest's
+ * bochs display (docs/design/x86-devices.md, "Screen size and format" and
+ * "Double buffering and the vsync wait"; docs/research/x86-reference-guest.md):
+ * the fbdev emulation's shadow buffer behind fb_chrdev.c, with
+ * drm_fb_helper.c's screen information, check and pan.
+ *
+ * bochs-drm has a vertical blank on 7.2, from a timer at the mode's 60 Hz,
+ * and the emulation's pan is an atomic commit that waits for it: a pan
+ * returns at the next refresh, a pan to the page already shown too, and an
+ * FBIOPUT_VSCREENINFO that changes anything at the second, its mode's commit
+ * taking one and its pan the next. Each is a wait on Program time with that
+ * deadline (in a Testcase the virtual clock), as FBIO_WAITFORVSYNC is.
  *
  * The scanout shows the mode the Display configuration set at the program's
  * start (setDisplayMode(), the guest's video=), XRGB8888, over a buffer twice
@@ -99,12 +107,11 @@ EM_JS(void, NotifyFramebufferPresentHost, (u32 yoffset), {
 // The physical size the guest's connector reports, in mm: QEMU's EDID for
 // its default preferred mode of 1280×800 at 100 dpi, 32 by 20 cm in the
 // EDID's base block, which is where Linux takes display_info's from.
-// Provisional until the pinned guest is booted.
 #define FRAMEBUFFER_WIDTH_MM  320
 #define FRAMEBUFFER_HEIGHT_MM 200
 
-// The display's refresh: FBIO_WAITFORVSYNC returns at the next of these
-// boundaries of Program time.
+// The display's refresh: FBIO_WAITFORVSYNC and every pan return at the next
+// of these boundaries of Program time.
 #define VSYNC_HZ 60
 
 struct FramebufferState {
@@ -114,9 +121,10 @@ struct FramebufferState {
 };
 
 static struct {
-  u8 *pixels;  // smem_len bytes, page-aligned; none until /dev/fb0 opens
+  u8 *pixels;  // whole pages, page-aligned; none until /dev/fb0 opens
   u32 width, height;  // the mode the scanout shows
-  u32 smem_len;
+  u32 smem_len;       // the buffer's bytes: a line's times the lines
+  u32 mapped_len;     // smem_len rounded up to whole pages, which mmap sees
   struct FramebufferState state;
 } fb;
 
@@ -170,18 +178,20 @@ void ResetFramebuffer(void) {
   fb.height = mode_height;
 }
 
-/* What drm_fbdev_ttm's probe makes, the first time a program opens the
- * device: a dumb buffer of the mode's width by twice its height, whose size
- * the VRAM helper rounds up to whole pages, and a shadow buffer as large,
- * black. Later opens find it as the earlier ones left it. */
+/* What the fbdev emulation's probe makes, the first time a program opens the
+ * device: a buffer of the mode's width by twice its height, black, whose
+ * smem_len is its size in bytes, not rounded to pages (8 by 8 has 512 on the
+ * guest); a mapping sees it in whole pages. Later opens find it as the
+ * earlier ones left it. */
 int OpenFramebuffer(void) {
   void *pixels;
   u8 *var;
   if (fb.pixels) return 0;
   if (!fb.width) ResetFramebuffer();
-  fb.smem_len = ROUNDUP(LineLength() * VirtualHeight(), 4096);
-  if (posix_memalign(&pixels, 4096, fb.smem_len)) return enomem();
-  memset(pixels, 0, fb.smem_len);
+  fb.smem_len = LineLength() * VirtualHeight();
+  fb.mapped_len = ROUNDUP(fb.smem_len, 4096);
+  if (posix_memalign(&pixels, 4096, fb.mapped_len)) return enomem();
+  memset(pixels, 0, fb.mapped_len);
   fb.pixels = (u8 *)pixels;
   // drm_fb_helper_fill_var(), then the connector's size from
   // drm_setup_crtcs_fb()
@@ -410,10 +420,42 @@ static bool NoPixelFormat(const u8 *var) {
   return true;
 }
 
+/* The next of the display's refreshes after `now`, in Program time: the
+ * first k / 60 s, rounded up to a nanosecond, later than it. */
+static i64 NextVsync(i64 now) {
+  unsigned __int128 k;
+  if (now < 0) now = 0;
+  k = (unsigned __int128)now * VSYNC_HZ / 1000000000 + 1;
+  return (k * 1000000000 + VSYNC_HZ - 1) / VSYNC_HZ;
+}
+
+/* Waits for the vertical blank `blanks` refreshes from now, which an atomic
+ * commit of the fbdev emulation waits for, as FBIO_WAITFORVSYNC waits for
+ * one: the call halts with that deadline, kept while Blink starts it over,
+ * and goes on once it has passed. */
+static void WaitForBlanks(struct Machine *m, int blanks) {
+  i64 now = DeviceNow(), at = now;
+  struct timespec deadline;
+  while (blanks-- > 0) at = NextVsync(at);
+  deadline = GuestWaitDeadline(DeviceTimespec(at));
+  if (GuestWaitCancelled() || now >= ToNanoseconds(deadline)) return;
+#ifdef __EMSCRIPTEN__
+  GuestWaitHalt(m, deadline, 0);
+#endif
+}
+
+/* Whether the commit to the scanout at `xoffset` and `yoffset` would pass the
+ * atomic check: the whole mode fits the buffer there. */
+static bool CommitFits(u32 xoffset, u32 yoffset) {
+  return !xoffset && yoffset <= VirtualHeight() - fb.height;
+}
+
 /* fb_set_var() with drm_fb_helper_check_var() as the check: a size up to the
  * buffer's (8 at least), 32 bpp or less, which reads back as 32, and the
- * pixel format the device has; the scanout keeps showing the whole mode. */
-static int SetVar(u8 *var) {
+ * pixel format the device has; the scanout keeps showing the whole mode.
+ * What it applies, drm_fb_helper_set_par()'s commit and fb_pan_display()'s,
+ * waits for a vertical blank each (a pan the check refuses, none). */
+static int SetVar(struct Machine *m, u8 *var) {
   u32 xres, yres, product, activate, blank;
   activate = Read32(var + VAR_ACTIVATE);
   if (activate & FB_ACTIVATE_INV_MODE_LINUX) {
@@ -448,6 +490,10 @@ static int SetVar(u8 *var) {
   if (!SamePixelFormat(var, fb.state.var)) return einval();
   // FB_ACTIVATE_TEST and the like: checked, and given back as it would be
   if ((activate & FB_ACTIVATE_MASK_LINUX) != FB_ACTIVATE_NOW_LINUX) return 0;
+  WaitForBlanks(m, CommitFits(Read32(var + VAR_XOFFSET),
+                              Read32(var + VAR_YOFFSET))
+                       ? 2
+                       : 1);
   SaveState();
   memcpy(fb.state.var, var, VAR_SIZE);
   // drm_fb_helper_set_par() commits the mode where the scanout was, which
@@ -470,14 +516,15 @@ static int PutVar(struct Machine *m, i64 addr) {
           Read32(var + VAR_ACTIVATE) & ~FB_ACTIVATE_KD_TEXT_LINUX);
   // fbcon_modechange_possible() has no console on this framebuffer to
   // refuse for, fbcon=map:1 keeping it off
-  if (SetVar(var) == -1) return -1;
+  if (SetVar(m, var) == -1) return -1;
   if (CopyToUserWrite(m, addr, var, VAR_SIZE) == -1) return efault();
   return 0;
 }
 
 /* fb_pan_display() with drm_fb_helper_pan_display(): ypanstep and xpanstep 1,
  * no ywrap, within what the screen information's size leaves of the buffer,
- * and the commit's own check that the whole mode fits. */
+ * and the commit's own check that the whole mode fits; then the commit, which
+ * waits for the next vertical blank, a pan to the page shown already too. */
 static int PanDisplay(struct Machine *m, i64 addr) {
   u32 xoffset, yoffset, vmode;
   u8 var[VAR_SIZE];
@@ -493,6 +540,11 @@ static int PanDisplay(struct Machine *m, i64 addr) {
                     Read32(fb.state.var + VAR_XRES)) {
     return einval();
   }
+  if (!CommitFits(xoffset, yoffset)) {
+    errno = ENOSPC;
+    return -1;
+  }
+  WaitForBlanks(m, 1);
   old = fb.state;
   if (Commit(xoffset, yoffset) == -1) return -1;
   DebugHistoryJournal(JOURNAL_FRAMEBUFFER_STATE, &old, sizeof(old));
@@ -537,26 +589,11 @@ static int Blank(u64 blank) {
   return 0;
 }
 
-/* The next of the display's refreshes after `now`, in Program time: the
- * first k / 60 s, rounded up to a nanosecond, later than it. */
-static i64 NextVsync(i64 now) {
-  unsigned __int128 k;
-  if (now < 0) now = 0;
-  k = (unsigned __int128)now * VSYNC_HZ / 1000000000 + 1;
-  return (k * 1000000000 + VSYNC_HZ - 1) / VSYNC_HZ;
-}
-
 /* drm_fb_helper_ioctl()'s FBIO_WAITFORVSYNC, which reads no argument and
  * cannot be interrupted: it waits for the next refresh, which the wait keeps
  * as its deadline while Blink starts the call over. */
 static int WaitForVsync(struct Machine *m) {
-  i64 now = DeviceNow();
-  struct timespec deadline;
-  deadline = GuestWaitDeadline(DeviceTimespec(NextVsync(now)));
-  if (GuestWaitCancelled() || now >= ToNanoseconds(deadline)) return 0;
-#ifdef __EMSCRIPTEN__
-  GuestWaitHalt(m, deadline, 0);
-#endif
+  WaitForBlanks(m, 1);
   return 0;
 }
 
@@ -590,15 +627,16 @@ int IoctlFramebuffer(struct Machine *m, int fildes, u64 request, i64 addr) {
 
 /* The host bytes a mapping of `size` bytes at `offset` of the descriptor
  * shows, for ReserveVirtual(): null with ENODEV when it is not the
- * framebuffer, and with EINVAL when the range goes past smem_len, which a
- * deferred-I/O mapping would only fault on (SIGBUS) once touched. */
+ * framebuffer, and with EINVAL when the range goes past the buffer's last
+ * page, which a deferred-I/O mapping would only fault on (SIGBUS) once
+ * touched. */
 u8 *MapFramebuffer(struct System *s, int fildes, i64 offset, i64 size) {
   if (!fb.pixels || !GetFramebufferFile(s, fildes)) {
     errno = ENODEV;
     return 0;
   }
-  if (offset < 0 || (u64)offset > fb.smem_len ||
-      (u64)ROUNDUP(size, 4096) > fb.smem_len - (u64)offset) {
+  if (offset < 0 || (u64)offset > fb.mapped_len ||
+      (u64)ROUNDUP(size, 4096) > fb.mapped_len - (u64)offset) {
     errno = EINVAL;
     return 0;
   }

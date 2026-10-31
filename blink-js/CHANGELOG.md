@@ -9,7 +9,7 @@ terminal change shape, and programs find Linux's devices. The README's
 - The machine has the QEMU guest's devices (`docs/design/x86-devices-plan.md`,
   M1 to M4). Its device nodes, `/dev/fb0`, `/dev/tty0`, `/dev/input/event0`
   to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and `/dev/snd/midiC1D0`
-  to `midiC1D3`, udev's links to the input devices and
+  to `midiC1D3`, udev's links and
   `/proc/bus/input/devices` are made from one table in the Core and put back
   at every start. `open()` finds a device by its node's number; the nodes the
   machine does not cover open with ENODEV and raise the new `unsupportedDevice`
@@ -33,8 +33,8 @@ terminal change shape, and programs find Linux's devices. The README's
   heap, and the `framebufferPresent` event marks pans, syncs, blanks and Undo
   moving the scanout. See the README's "The framebuffer".
 - The input devices (M3): `/dev/input/event0` to `event4` answer evdev as
-  Linux 6.12 does for the guest's Power Button, AT keyboard, PS/2 mouse, QEMU
-  USB tablet and PC Speaker, with each one's identity and capabilities,
+  Linux 7.2 does for the guest's AT keyboard, PS/2 mouse, QEMU USB tablet, PC
+  Speaker and Power Button, with each one's identity and capabilities,
   readers' queues of 4,096 events with evdev's `SYN_DROPPED`, the state
   ioctls (`EVIOCGKEY`, `EVIOCGLED`, `EVIOCGABS` and the rest), `EVIOCGREP` and
   `EVIOCSREP`, `EVIOCSCLOCKID`, `EVIOCGRAB`, masks, keymaps and writes. The new
@@ -44,9 +44,9 @@ terminal change shape, and programs find Linux's devices. The README's
   stamped with Program time. Reads, flushes and writes of an input device are
   journaled rather than Undo barriers: Undo puts the events a read took back
   (ADR 0069). `/proc/bus/input/devices` is generated from the same table; the
-  Power Button now lists `KEY_WAKEUP`, as Linux 6.12's has it. See the
+  Power Button now lists `KEY_WAKEUP`, as Linux's has it. See the
   README's "Input devices".
-- The sound devices (M4). `/dev/dsp` and `/dev/mixer` behave as Linux 6.12's
+- The sound devices (M4). `/dev/dsp` and `/dev/mixer` behave as Linux 7.2's
   snd-pcm-oss and snd-mixer-oss on the guest's HDA card (QEMU's
   `hda-duplex`): 8000 Hz U8 mono at open, the fixed `GETFMTS` mask, settings
   written back, the buffer and fragments the kernel computes through its
@@ -56,7 +56,7 @@ terminal change shape, and programs find Linux's devices. The README's
   mixer's `VOLUME` and `IGAIN`. snd-virmidi's four raw MIDI devices and
   `/dev/midi1` send at 31,250 baud behind rawmidi's buffer and answer its
   ioctls. The PC speaker sounds for `EV_SND` events written to
-  `/dev/input/event4` and for `/dev/tty0`'s `KIOCSOUND` and `KDMKTONE`, which
+  `/dev/input/event3` and for `/dev/tty0`'s `KIOCSOUND` and `KDMKTONE`, which
   reach it through the input core as on Linux, so the device's readers see
   them too; `/dev/tty0` is a tty. What they play leaves the Core as the new
   `pcm`, `midi`, `tone`, `mixer` and `soundCut` events, on Program time.
@@ -64,6 +64,38 @@ terminal change shape, and programs find Linux's devices. The README's
   journaled rather than Undo barriers: Undo puts settings back and cuts what
   was queued and not heard, and restores the MIDI channels and the speaker's
   tone. See the README's "Sound".
+- The devices are the pinned guest's as its probe recorded them (M0,
+  `docs/research/x86-reference-guest.md`: QEMU 10.2.1, Debian 13 with Linux
+  7.2.11 from backports), where they were provisional. The input devices'
+  order is the guest's, `event0` the keyboard, `event1` the PS/2 mouse,
+  `event2` the tablet, `event3` the PC Speaker and `event4` the Power Button,
+  with its `/proc/bus/input/devices` text, udev's links (the tablet's `-mouse`
+  links lead to `js0`; `usbv2-` and `platform-LNXPWRBN:00-event` links are
+  new) and `sendInputReport()`'s indices. ALSA's minors are the guest's
+  dynamic ones (`midiC1D0` is 116:2). New nodes: `/dev/ttyS0` and
+  `/dev/console`, the serial line descriptors 0 to 2 are on, so `ttyname(0)`
+  answers `/dev/ttyS0`; `/dev/tty1`, the same console as `/dev/tty0`;
+  `/dev/dmmidi1` (device 0) and `/dev/amidi1` and `/dev/admmidi1` (device 1)
+  as raw MIDI ports; and, opening with ENODEV, `js0`, `controlC1`,
+  `controlC2`, `hwC0D0`, `pcmC2D0p`, `timer`, `/dev/mixer1`, `/dev/mixer2`,
+  `/dev/dsp2`, `/dev/audio2`, `/dev/uinput` and `/dev/tty2` to `/dev/tty63`,
+  with the `/dev/snd/by-path/`, `/dev/snd/by-id/` and `/dev/dri/by-path/`
+  links. `/dev/tty0` is mode 0600, its termios is what tty1's getty leaves,
+  and it answers `KDGETMODE`, `KDSETMODE`, `KDGKBMODE`, `KDSKBMODE`,
+  `KDGETLED`, `KDGKBLED` and `VT_GETSTATE`. The tablet has five buttons,
+  `BTN_SIDE` and `BTN_EXTRA` with their usages, and a keymap `EVIOCGKEYCODE`
+  and `EVIOCSKEYCODE` reach. A lock key's LED change arrives in the key's
+  release packet. The keyboard has Linux 7.2's keymap (F13 to F24). The
+  terminal starts with the serial line's termios as agetty leaves it (no
+  `ECHOCTL`, no `IEXTEN`, `IXOFF`, `IMAXBEL`, 9600 baud with `HUPCL` and
+  `CLOCAL`), and `X86TerminalMode` has `echoControl`. A pan of `/dev/fb0`
+  waits for the next vertical blank, and an `FBIOPUT_VSCREENINFO` that
+  changes anything for the second, as bochs-drm's commits do on 7.2;
+  `smem_len` is no longer rounded to pages. Raw MIDI's `PVERSION` is 2.0.5;
+  the mixer is `QEMU Generic` and its change counter starts at 14;
+  `SNDCTL_DSP_CHANNELS` takes its count unsigned (-1 is EINVAL); a fragment
+  whose plugin buffers are too large makes the calls that apply it answer
+  ENOMEM; `GETOSPACE` counts negative space in whole fragments down.
 - `X86WaitRequest` has `wakeSources`, the terminal and the input devices that
   can end a wait, and `terminalRead`, whether the instruction waiting is a
   read of the terminal, a raw read that `VTIME` times, which takes the input

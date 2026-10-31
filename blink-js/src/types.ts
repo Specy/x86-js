@@ -188,6 +188,11 @@ export type X86TerminalMode = {
     canonical: boolean
     /** `ECHO`: what is typed is echoed. */
     echo: boolean
+    /**
+     * `ECHOCTL`: under `ECHO`, a control character typed is echoed as `^` and a letter (`^C`,
+     * `^[`); off, as itself. The serial line starts with it off, as agetty leaves it.
+     */
+    echoControl: boolean
     /** `ISIG`: Ctrl+C and Ctrl+\ send `SIGINT` and `SIGQUIT` (see `sendSignal()`). */
     signals: boolean
     /** `ICRNL`: a carriage return typed is read as a line feed. */

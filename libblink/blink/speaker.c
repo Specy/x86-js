@@ -1,5 +1,5 @@
 /* The PC speaker: Linux's pcspkr input device, which a program sounds by
- * writing EV_SND events to /dev/input/event4, and the virtual console's
+ * writing EV_SND events to /dev/input/event3, and the virtual console's
  * KIOCSOUND and KDMKTONE on /dev/tty0, which reach the same speaker through
  * the keyboard handler and the input core, so that the device's readers see
  * them too (x86-devices.md, "The PC speaker"; evdev.c).
@@ -28,6 +28,20 @@
 #define SND_TONE      0x02
 #define KIOCSOUND     0x4b2f
 #define KDMKTONE      0x4b30
+#define KDGETLED      0x4b31
+#define KDSETMODE     0x4b3a
+#define KDGETMODE     0x4b3b
+#define KDGKBMODE     0x4b44
+#define KDSKBMODE     0x4b45
+#define KDGKBLED      0x4b64
+#define VT_GETSTATE   0x5603
+#define KD_TEXT       0x00
+#define KD_GRAPHICS   0x01
+#define KD_TEXT0      0x02
+#define KD_TEXT1      0x03
+#define K_RAW         0x00
+#define K_OFF         0x04
+#define K_UNICODE     0x03
 // Debian's kernel ticks at 250 Hz: KDMKTONE's duration is whole jiffies
 #define JIFFY_NS 4000000
 
@@ -41,6 +55,12 @@ struct Tone {
 static struct Tone tone;
 static struct termios_linux console_termios;
 static bool console_termios_known;
+
+// The foreground console's display and keyboard modes, as KDSETMODE and
+// KDSKBMODE set them: text and Unicode on the guest's VT1.
+static struct {
+  u8 mode, kbmode;
+} console_modes = {KD_TEXT, K_UNICODE};
 
 // The console is sounding the speaker through the input core, at `console_at`
 // in Program time, and has journaled the tone already.
@@ -114,7 +134,7 @@ int SpeakerInputEvent(struct Machine *m, u16 type, u16 code, i32 value) {
   if (console) {
     now = console_at;
   } else {
-    // a write to /dev/input/event4, which settled the timer first
+    // a write to /dev/input/event3, which settled the timer first
     now = SoundNow();
     Journal();
     if (Expired(now)) {
@@ -151,14 +171,15 @@ static void MakeSound(u32 hz, u32 ticks) {
 }
 
 static void DefaultConsoleTermios(struct termios_linux *tio) {
-  // tty_std_termios with IUTF8, as the virtual console's driver has it
+  // what tty1's getty leaves on the foreground console while it waits at its
+  // login prompt, as the pinned guest shows: agetty's settings for a virtual
+  // console, raw (no local flags)
   memset(tio, 0, sizeof(*tio));
-  Write32(tio->iflag, ICRNL_LINUX | IXON_LINUX | IUTF8_LINUX);
+  Write32(tio->iflag, BRKINT_LINUX | ICRNL_LINUX | IXON_LINUX | IMAXBEL_LINUX |
+                          IUTF8_LINUX);
   Write32(tio->oflag, OPOST_LINUX | ONLCR_LINUX);
   Write32(tio->cflag, B38400_LINUX | CS8_LINUX | CREAD_LINUX | HUPCL_LINUX);
-  Write32(tio->lflag, ISIG_LINUX | ICANON_LINUX | ECHO_LINUX | ECHOE_LINUX |
-                          ECHOK_LINUX | ECHOCTL_LINUX | ECHOKE_LINUX |
-                          IEXTEN_LINUX);
+  Write32(tio->lflag, 0);
   tio->cc[VINTR_LINUX] = 'C' - '@';
   tio->cc[VQUIT_LINUX] = '\\' - '@';
   tio->cc[VERASE_LINUX] = 0177;
@@ -182,17 +203,76 @@ static struct termios_linux *ConsoleTermios(void) {
   return &console_termios;
 }
 
-/* /dev/tty0, the virtual console: a tty, so isatty() holds and its termios
- * reads back, and the console's tone ioctls, which take an argument rather
- * than a pointer. vt_ioctl() lets them through for CAP_SYS_TTY_CONFIG, which
- * root holds, since tty0 is not the program's controlling terminal. The
- * console's other requests (KDSETMODE and the rest) are not covered. */
+static int PutByte(struct Machine *m, i64 addr, u8 value) {
+  return CopyToUserWrite(m, addr, &value, 1) == -1 ? efault() : 0;
+}
+
+static int PutWord(struct Machine *m, i64 addr, u32 value) {
+  u8 word[4];
+  Write32(word, value);
+  return CopyToUserWrite(m, addr, word, 4) == -1 ? efault() : 0;
+}
+
+static void SetConsoleModes(u8 mode, u8 kbmode) {
+  u8 record[2] = {console_modes.mode, console_modes.kbmode};
+  if (mode == console_modes.mode && kbmode == console_modes.kbmode) return;
+  DebugHistoryJournal(JOURNAL_CONSOLE_MODES, record, sizeof(record));
+  console_modes.mode = mode;
+  console_modes.kbmode = kbmode;
+}
+
+/* /dev/tty0 and /dev/tty1, the foreground virtual console, VT1: a tty, so
+ * isatty() holds and its termios reads back, the console's tone ioctls,
+ * which take an argument rather than a pointer, and its modes and LEDs
+ * (vt_ioctl(), vt_do_kdskbmode(), vt_do_kdskled()). vt_ioctl() lets the
+ * changes through for CAP_SYS_TTY_CONFIG, which root holds, since the console
+ * is not the program's controlling terminal. A mode changes nothing anyone
+ * sees: the console draws on no framebuffer (fbcon=map:1) and its keyboard
+ * reaches nobody but tty1's getty. The console's other requests (KDSETLED,
+ * the fonts, VT switching and the rest) are not covered. */
 int ConsoleIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
-  u8 change[2 * sizeof(struct termios_linux)];
+  u8 change[2 * sizeof(struct termios_linux)], leds, flags, state[6];
   u32 ms, ticks, count;
   struct termios2_linux tio2;
   struct termios_linux *tio = ConsoleTermios();
   switch ((u32)request) {
+    case KDGETMODE:
+      return PutWord(m, addr, console_modes.mode);
+    case KDSETMODE:
+      if (m->system->uid[1]) return eperm();
+      switch ((u64)addr) {
+        case KD_GRAPHICS:
+        case KD_TEXT:
+          SetConsoleModes(addr, console_modes.kbmode);
+          return 0;
+        case KD_TEXT0:
+        case KD_TEXT1:
+          SetConsoleModes(KD_TEXT, console_modes.kbmode);
+          return 0;
+        default:
+          return einval();
+      }
+    case KDGKBMODE:
+      return PutWord(m, addr, console_modes.kbmode);
+    case KDSKBMODE:
+      if (m->system->uid[1]) return eperm();
+      if ((u64)addr > K_OFF) return einval();
+      SetConsoleModes(console_modes.mode, addr);
+      return 0;
+    case KDGETLED:
+      EvdevConsoleLeds(&leds, &flags);
+      return PutByte(m, addr, leds);
+    case KDGKBLED:
+      EvdevConsoleLeds(&leds, &flags);
+      return PutByte(m, addr, flags);
+    case VT_GETSTATE:
+      // VT1 in the foreground; v_signal left as it was; v_state the consoles
+      // in use, as the guest has them: tty0 always, VT1, which its getty
+      // holds open, and VT6, which systemd-logind reserves (0x43)
+      Write16(state, 1);
+      if (CopyToUserWrite(m, addr, state, 2) == -1) return efault();
+      Write16(state, 0x43);
+      return CopyToUserWrite(m, addr + 4, state, 2) == -1 ? efault() : 0;
     case KIOCSOUND:
       if (m->system->uid[1]) return eperm();
       // the argument is the PIT's divisor
@@ -239,6 +319,8 @@ int ConsoleIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
 void ResetSpeaker(void) {
   memset(&tone, 0, sizeof(tone));
   console_termios_known = false;
+  console_modes.mode = KD_TEXT;
+  console_modes.kbmode = K_UNICODE;
 }
 
 void UndoSpeakerJournal(u32 kind, const u8 *data, u32 size) {
@@ -261,6 +343,10 @@ void UndoSpeakerJournal(u32 kind, const u8 *data, u32 size) {
       break;
     case JOURNAL_CONSOLE_TERMIOS:
       memcpy(ConsoleTermios(), data, sizeof(struct termios_linux));
+      break;
+    case JOURNAL_CONSOLE_MODES:
+      console_modes.mode = data[0];
+      console_modes.kbmode = data[1];
       break;
     default:
       break;

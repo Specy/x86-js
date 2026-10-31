@@ -15,13 +15,14 @@
 #define DEVICE_MIDI        5  // a raw MIDI port, OSS's /dev/midi1 or ALSA's
 #define DEVICE_CONSOLE     6  // the virtual console, /dev/tty0
 #define DEVICE_UNSUPPORTED 7  // the guest has it; opening it answers ENODEV
+#define DEVICE_SERIAL      8  // the serial line, the program's own terminal
 
 // The guest's input devices, in /dev/input's order: event0 to event4.
-#define INPUT_POWER_BUTTON 0
-#define INPUT_KEYBOARD     1
-#define INPUT_MOUSE        2
-#define INPUT_TABLET       3
-#define INPUT_SPEAKER      4
+#define INPUT_KEYBOARD     0
+#define INPUT_MOUSE        1
+#define INPUT_TABLET       2
+#define INPUT_SPEAKER      3
+#define INPUT_POWER_BUTTON 4
 #define INPUT_DEVICES      5
 
 // What can end a wait, besides its deadline and a signal: the bits of
@@ -50,6 +51,7 @@ struct DeviceNode {
   u16 mode;  // its permissions
   u8 kind;
   i8 input;  // INPUT_*, or -1
+  u8 unit;   // the device of its card a raw MIDI node opens
 };
 
 // Bytes of the program's memory a write takes, a write's buffer or one of a

@@ -1,9 +1,10 @@
 /* The guest's input devices, /dev/input/event0 to event4, through Linux's
  * evdev, as the QEMU guest x86's devices follow has them
  * (docs/design/x86-devices.md, "The keyboard device", "The input devices",
- * "The pointer", ADR 0067): the ACPI Power Button, the AT keyboard, the PS/2
- * mouse, QEMU's USB tablet and the PC Speaker, each with the identity and the
- * capabilities its Linux 6.12 driver gives it.
+ * "The pointer", ADR 0067; docs/research/x86-reference-guest.md): the AT
+ * keyboard, the PS/2 mouse, QEMU's USB tablet, the PC Speaker and the ACPI
+ * Power Button, in the order the guest probes them, each with the identity
+ * and the capabilities its Linux 7.2 driver gives it.
  *
  * The model is the kernel's, cut down to what these devices use. Each device
  * is an input_dev: its state (keys held, LEDs, sound, the tablet's axes, the
@@ -17,7 +18,8 @@
  * report, which hid-input turns into MSC_SCAN and the buttons, the axes and
  * the wheel with its hi-res twin (drivers/hid/hid-input.c). The console's
  * keyboard handler sees the keyboard's events and toggles the lock LEDs
- * (drivers/tty/vt/keyboard.c), except while a reader holds EVIOCGRAB, and
+ * through the LED triggers input-leds follows (drivers/tty/vt/keyboard.c,
+ * drivers/input/input-leds.c), except while a reader holds EVIOCGRAB, and
  * sounds the PC Speaker for /dev/tty0's KIOCSOUND and KDMKTONE (kd_mksound(),
  * EvdevConsoleSound()). A write goes in as evdev_write() injects it, and an
  * event the PC Speaker's driver takes reaches SpeakerInputEvent() (speaker.c).
@@ -195,8 +197,9 @@ struct InputCaps {
 };
 
 // What EVIOCGNAME, EVIOCGPHYS, EVIOCGUNIQ, EVIOCGID and EVIOCGBIT answer and
-// /proc/bus/input/devices lists. The input numbers in the sysfs paths are the
-// least certain: they depend on the order the guest probes its devices.
+// /proc/bus/input/devices lists, as the pinned guest has them: the input
+// numbers in the sysfs paths are the order it registered them in (input1 is
+// the PS/2 mouse's first registration, before psmouse found its protocol).
 struct InputIdentity {
   const char *name, *phys, *uniq, *sysfs, *handlers;
   u16 bustype, vendor, product, version;
@@ -206,25 +209,12 @@ struct InputIdentity {
 };
 
 static const struct InputIdentity kInputIdentities[INPUT_DEVICES] = {
-    // acpi_button_add(): KEY_POWER and KEY_WAKEUP
-    {"Power Button",
-     "LNXPWRBN/button/input0",
-     0,
-     "/devices/LNXSYSTM:00/LNXPWRBN:00/input/input0",
-     "kbd event0",
-     0x19,
-     0,
-     1,
-     0,
-     {.ev = 0x3, .key = {0, 1ull << (116 - 64), 1ull << (143 - 128)}},
-     10,
-     false},
     // atkbd_set_device_attrs(), translated set 2 with softraw and LEDs
     {"AT Translated Set 2 keyboard",
      "isa0060/serio0/input0",
      0,
-     "/devices/platform/i8042/serio0/input/input1",
-     "sysrq kbd event1 leds",
+     "/devices/platform/i8042/serio0/input/input0",
+     "sysrq kbd leds event0",
      0x11,
      1,
      1,
@@ -238,7 +228,7 @@ static const struct InputIdentity kInputIdentities[INPUT_DEVICES] = {
      "isa0060/serio1/input0",
      0,
      "/devices/platform/i8042/serio1/input/input2",
-     "mouse0 event2",
+     "mouse0 event1",
      0x11,
      2,
      6,
@@ -246,20 +236,21 @@ static const struct InputIdentity kInputIdentities[INPUT_DEVICES] = {
      {.prop = 0x1, .ev = 0x7, .key = {0, 0, 0, 0, 0x1f0000}, .rel = 0x143},
      14,
      false},
-    // hid-generic on QEMU 10.0's usb-tablet: three buttons, X and Y from 0 to
-    // 32767, a vertical wheel and its hi-res twin
+    // hid-generic on QEMU 10.2's usb-tablet: five buttons (BTN_LEFT to
+    // BTN_EXTRA), X and Y from 0 to 32767, a vertical wheel and its hi-res
+    // twin; joydev takes it too, for its absolute axes
     {"QEMU QEMU USB Tablet",
      "usb-0000:00:04.0-1/input0",
      "28754-0000:00:04.0-1",
      "/devices/pci0000:00/0000:00:04.0/usb1/1-1/1-1:1.0/0003:0627:0001.0001/"
      "input/input3",
-     "mouse1 event3",
+     "mouse1 event2 js0",
      0x03,
      0x627,
      1,
      1,
      {.ev = 0x1f,
-      .key = {0, 0, 0, 0, 0x70000},
+      .key = {0, 0, 0, 0, 0x1f0000},
       .rel = 0x900,
       .abs = 0x3,
       .msc = 1 << MSC_SCAN_LINUX},
@@ -270,12 +261,25 @@ static const struct InputIdentity kInputIdentities[INPUT_DEVICES] = {
      "isa0061/input0",
      0,
      "/devices/platform/pcspkr/input/input4",
-     "kbd event4",
+     "kbd event3",
      0x10,
      0x1f,
      1,
      0x100,
      {.ev = 0x40001, .snd = 0x6},
+     10,
+     false},
+    // acpi_button_add(): KEY_POWER and KEY_WAKEUP
+    {"Power Button",
+     "LNXPWRBN/button/input0",
+     0,
+     "/devices/platform/LNXPWRBN:00/input/input5",
+     "kbd event4",
+     0x19,
+     0,
+     1,
+     0,
+     {.ev = 0x3, .key = {0, 1ull << (116 - 64), 1ull << (143 - 128)}},
      10,
      false},
 };
@@ -347,10 +351,15 @@ static struct {
   bool console_pending;  // kbd_bh() is scheduled
 } kbd;
 
-// QEMU's tablet: what its HID reports say.
+// QEMU's tablet: what its HID reports say, and the keys hid-input reports
+// for its five button usages (the Button page's 1 to 5), which
+// EVIOCSKEYCODE can change.
+#define TABLET_BUTTONS 5
+#define HID_UP_BUTTON  0x90000
 static struct {
   u32 buttons;
   i32 x, y;
+  u16 keymap[TABLET_BUTTONS];
 } tablet;
 
 // Whether a reader got a whole packet since the host's report began.
@@ -370,8 +379,9 @@ static i32 report_buffer[3 * INPUT_REPORT_MAX];
 
 // atkbd's keycode table for a translated set 2 keyboard, indexed by
 // atkbd_compat_scancode(): atkbd_set2_keycode[] through atkbd_unxlate_table[],
-// with Hanja and Hangeul (atkbd_set_keycode_table()). Generated from Linux
-// 6.12's drivers/input/keyboard/atkbd.c.
+// with Hanja and Hangeul (atkbd_set_keycode_table()), as the pinned guest's
+// Linux 7.2 answers EVIOCGKEYCODE_V2 for it (facts.txt): 7.2 adds F13 to F23
+// at scan codes 0x64 to 0x6e and makes 0x76, Zenkaku/Hankaku before, F24.
 static const u16 kAtkbdKeymap[ATKBD_KEYMAP_SIZE] = {
     [0x1] = 1, [0x2] = 2, [0x3] = 3, [0x4] = 4, [0x5] = 5, [0x6] = 6, [0x7] = 7,
     [0x8] = 8, [0x9] = 9, [0xa] = 10, [0xb] = 11, [0xc] = 12, [0xd] = 13,
@@ -390,25 +400,31 @@ static const u16 kAtkbdKeymap[ATKBD_KEYMAP_SIZE] = {
     [0x4b] = 75, [0x4c] = 76, [0x4d] = 77, [0x4e] = 78, [0x4f] = 79,
     [0x50] = 80, [0x51] = 81, [0x52] = 82, [0x53] = 83, [0x54] = 99,
     [0x56] = 86, [0x57] = 87, [0x58] = 88, [0x59] = 117, [0x5c] = 95,
-    [0x5d] = 183, [0x5e] = 184, [0x5f] = 185, [0x70] = 93, [0x73] = 89,
-    [0x76] = 85, [0x77] = 91, [0x78] = 90, [0x79] = 92, [0x7b] = 94,
-    [0x7d] = 124, [0x7e] = 121, [0x90] = 165, [0x99] = 163, [0x9c] = 96,
-    [0x9d] = 97, [0xa0] = 113, [0xa1] = 140, [0xa2] = 164, [0xa4] = 166,
-    [0xaa] = 255, [0xae] = 114, [0xb0] = 115, [0xb2] = 172, [0xb5] = 98,
-    [0xb6] = 255, [0xb7] = 99, [0xb8] = 100, [0xc5] = 119, [0xc6] = 119,
-    [0xc7] = 102, [0xc8] = 103, [0xc9] = 104, [0xcb] = 105, [0xcc] = 112,
-    [0xcd] = 106, [0xce] = 118, [0xcf] = 107, [0xd0] = 108, [0xd1] = 109,
-    [0xd2] = 110, [0xd3] = 111, [0xdb] = 125, [0xdc] = 126, [0xdd] = 127,
-    [0xde] = 116, [0xdf] = 142, [0xe3] = 143, [0xe5] = 217, [0xe6] = 156,
-    [0xe7] = 173, [0xe8] = 128, [0xe9] = 159, [0xea] = 158, [0xeb] = 157,
-    [0xec] = 155, [0xed] = 226, [0xef] = 112, [0x171] = 123, [0x172] = 122,
+    [0x5d] = 183, [0x5e] = 184, [0x5f] = 185, [0x64] = 183, [0x65] = 184,
+    [0x66] = 185, [0x67] = 186, [0x68] = 187, [0x69] = 188, [0x6a] = 189,
+    [0x6b] = 190, [0x6c] = 191, [0x6d] = 192, [0x6e] = 193, [0x70] = 93,
+    [0x73] = 89, [0x76] = 194, [0x77] = 91, [0x78] = 90, [0x79] = 92,
+    [0x7b] = 94, [0x7d] = 124, [0x7e] = 121, [0x90] = 165, [0x99] = 163,
+    [0x9c] = 96, [0x9d] = 97, [0xa0] = 113, [0xa1] = 140, [0xa2] = 164,
+    [0xa4] = 166, [0xaa] = 255, [0xae] = 114, [0xb0] = 115, [0xb2] = 172,
+    [0xb5] = 98, [0xb6] = 255, [0xb7] = 99, [0xb8] = 100, [0xc5] = 119,
+    [0xc6] = 119, [0xc7] = 102, [0xc8] = 103, [0xc9] = 104, [0xcb] = 105,
+    [0xcc] = 112, [0xcd] = 106, [0xce] = 118, [0xcf] = 107, [0xd0] = 108,
+    [0xd1] = 109, [0xd2] = 110, [0xd3] = 111, [0xdb] = 125, [0xdc] = 126,
+    [0xdd] = 127, [0xde] = 116, [0xdf] = 142, [0xe3] = 143, [0xe5] = 217,
+    [0xe6] = 156, [0xe7] = 173, [0xe8] = 128, [0xe9] = 159, [0xea] = 158,
+    [0xeb] = 157, [0xec] = 155, [0xed] = 226, [0xef] = 112, [0x171] = 123,
+    [0x172] = 122,
 };
 
 // The scan code, as atkbd_compat_scancode() has it, that QEMU's PS/2
 // keyboard sends for each Linux key it can send (its AT set 1 column of
 // keycodemapdb's keymaps.csv, which QEMU's tables are generated from), where
-// atkbd reads that code back as the same key. Pause, Print Screen, Hangeul
-// and Hanja have sequences of their own (see HostKey()).
+// atkbd reads that code back as the same key, but for KEY_ZENKAKUHANKAKU
+// (85), whose 0x76 Linux 7.2's atkbd reads as KEY_F24: the guest sees F24.
+// QEMU's set 2 has no codes for F16 to F24, so it sends nothing for them.
+// Pause, Print Screen, Hangeul and Hanja have sequences of their own (see
+// HostKey()).
 struct KeyScancode {
   u16 key, scancode;
 };
@@ -502,6 +518,7 @@ void ResetInputDevices(void) {
   devices[INPUT_TABLET].abs[ABS_X_LINUX].maximum = 32767;
   devices[INPUT_TABLET].abs[ABS_Y_LINUX].maximum = 32767;
   memset(&tablet, 0, sizeof(tablet));
+  for (i = 0; i < TABLET_BUTTONS; ++i) tablet.keymap[i] = BTN_LEFT_LINUX + i;
   initialized = true;
 }
 
@@ -818,7 +835,11 @@ static int Disposition(struct InputDevice *dev, unsigned type, unsigned code,
 
 /* atkbd_set_repeat_rate(): the keyboard takes the nearest rate and delay it
  * has at or above what was asked for. QEMU ignores the command, so repeats
- * stay the host's. */
+ * stay the host's. atkbd does it in its event work, which on the guest runs
+ * on another CPU as the ioctl returns: an EVIOCGREP right after EVIOCSREP
+ * read the values asked for in one run of the probe and the rounded ones in
+ * another (docs/research/x86-reference-guest.md). Here the work has always
+ * run, so EVIOCGREP reads the rounded values at once. */
 static void RoundRepeat(struct InputDevice *dev) {
   static const short kPeriods[32] = {
       33,  37,  42,  46,  50,  54,  58,  63,  67,  75,  83,
@@ -923,23 +944,31 @@ static void ConsoleEvents(struct InputDevice *dev,
   kbd.console_pending = true;
 }
 
-/* kbd_bh(): when the console's locks differ from the LEDs it last set, it
- * sets all three through its own handle, in a packet of their own after the
- * key's; the input core passes on only the ones that change. */
+/* kbd_bh(): when the console's locks differ from the LEDs it last set,
+ * kbd_propagate_led_state() fires the LED trigger of each one that changed,
+ * scroll, num and caps in that order, and input-leds sets that LED through its
+ * own handle with no SYN_REPORT: the change waits in the packet being built,
+ * which the key's release closes, as the guest shows (EV_LED, then the
+ * release's MSC_SCAN and key, then SYN_REPORT). */
 static void ConsoleBottomHalf(struct InputTime now) {
   struct InputDevice *dev = devices + INPUT_KEYBOARD;
-  int leds = kbd.console_flags;
+  int leds = kbd.console_flags, changed;
   if (!kbd.console_pending) return;
   kbd.console_pending = false;
-  if (leds == kbd.console_leds) return;
+  if (!(changed = leds ^ kbd.console_leds)) return;
   kbd.console_leds = leds;
-  InjectEvent(dev, EV_LED_LINUX, LED_SCROLLL_LINUX, leds >> VC_SCROLLOCK & 1,
-              now, true);
-  InjectEvent(dev, EV_LED_LINUX, LED_NUML_LINUX, leds >> VC_NUMLOCK & 1, now,
-              true);
-  InjectEvent(dev, EV_LED_LINUX, LED_CAPSL_LINUX, leds >> VC_CAPSLOCK & 1, now,
-              true);
-  InjectEvent(dev, EV_SYN_LINUX, SYN_REPORT_LINUX, 0, now, true);
+  if (changed >> VC_SCROLLOCK & 1) {
+    InjectEvent(dev, EV_LED_LINUX, LED_SCROLLL_LINUX, leds >> VC_SCROLLOCK & 1,
+                now, true);
+  }
+  if (changed >> VC_NUMLOCK & 1) {
+    InjectEvent(dev, EV_LED_LINUX, LED_NUML_LINUX, leds >> VC_NUMLOCK & 1, now,
+                true);
+  }
+  if (changed >> VC_CAPSLOCK & 1) {
+    InjectEvent(dev, EV_LED_LINUX, LED_CAPSL_LINUX, leds >> VC_CAPSLOCK & 1,
+                now, true);
+  }
 }
 
 // ---------------------------------------------------------- the keyboard
@@ -1162,20 +1191,21 @@ static i32 Clamp(i32 value, i32 lo, i32 hi) {
   return value < lo ? lo : value > hi ? hi : value;
 }
 
-/* One HID report of QEMU's tablet through hid-input: the buttons in usage
- * order, each with its usage as MSC_SCAN when it changes, X and Y clamped to
- * their logical range, the wheel (hidinput_handle_scroll(): REL_WHEEL, then
- * REL_WHEEL_HI_RES at 120 a notch), and input_sync(). */
+/* One HID report of QEMU's tablet through hid-input: the five buttons in
+ * usage order, each with its usage as MSC_SCAN when it changes and as the
+ * key its keymap names, X and Y clamped to their logical range, the wheel
+ * (hidinput_handle_scroll(): REL_WHEEL, then REL_WHEEL_HI_RES at 120 a
+ * notch), and input_sync(). */
 static void TabletHidReport(i32 wheel, struct InputTime now) {
   int i;
   i32 value;
   struct InputDevice *dev = devices + INPUT_TABLET;
-  for (i = 0; i < 3; ++i) {
+  for (i = 0; i < TABLET_BUTTONS; ++i) {
     value = tablet.buttons >> i & 1;
-    if (!TestBit(dev->key, BTN_LEFT_LINUX + i) == value) {
-      InputEvent(dev, EV_MSC_LINUX, MSC_SCAN_LINUX, 0x90001 + i, now);
+    if (!TestBit(dev->key, tablet.keymap[i]) == value) {
+      InputEvent(dev, EV_MSC_LINUX, MSC_SCAN_LINUX, HID_UP_BUTTON + 1 + i, now);
     }
-    InputEvent(dev, EV_KEY_LINUX, BTN_LEFT_LINUX + i, value, now);
+    InputEvent(dev, EV_KEY_LINUX, tablet.keymap[i], value, now);
   }
   InputEvent(dev, EV_ABS_LINUX, ABS_X_LINUX, Clamp(tablet.x, 0, 32767), now);
   InputEvent(dev, EV_ABS_LINUX, ABS_Y_LINUX, Clamp(tablet.y, 0, 32767), now);
@@ -1198,7 +1228,7 @@ static void HostTabletReport(const i32 *events, u32 count,
     code = events[3 * i + 1];
     value = events[3 * i + 2];
     if (type == EV_KEY_LINUX && code >= BTN_LEFT_LINUX &&
-        code < BTN_LEFT_LINUX + 3) {
+        code < BTN_LEFT_LINUX + TABLET_BUTTONS) {
       if (value) {
         tablet.buttons |= 1u << (code - BTN_LEFT_LINUX);
       } else {
@@ -1498,6 +1528,15 @@ bool EvdevConsoleSound(u32 hz, i64 at) {
   if (!hz) InjectEvent(dev, EV_SND_LINUX, SND_BELL_LINUX, 0, t, true);
   EndInject(dev, &before, t);
   return true;
+}
+
+/* What the console's keyboard handler holds for KDGETLED and KDGKBLED: the
+ * LEDs it last set (getledstate()) and its lock flags with the default ones,
+ * none, above them (ledflagstate | default_ledflagstate << 4). */
+void EvdevConsoleLeds(u8 *leds, u8 *flags) {
+  Initialize();
+  *leds = kbd.console_leds & 7;
+  *flags = kbd.console_flags & 7;
 }
 
 /* evdev_poll(): always writable, readable with a whole packet queued, and
@@ -1802,7 +1841,7 @@ static int SetAbs(struct Machine *m, struct InputDevice *dev, unsigned axis,
 }
 
 /* EVIOCSREP: two EV_REP events injected, which atkbd rounds and the next
- * packet carries to the readers. */
+ * packet carries to the readers as asked. */
 static int SetRepeat(struct Machine *m, struct EvdevClient *c, i64 addr) {
   u8 rep[8];
   struct InputState before;
@@ -1836,12 +1875,51 @@ static int ScancodeIndex(const u8 *entry, u32 *index) {
   }
 }
 
-/* input_default_getkeycode() on atkbd's table. */
+/* The keymap entry `entry` names on a device with a keymap: its index, by
+ * index or by scan code, and the scan code it has. atkbd's keymap
+ * (input_default_getkeycode()) is indexed by its scan code; the tablet's
+ * (hidinput_locate_usage()) holds its button usages, 0x90001 to 0x90005, in
+ * usage order. EINVAL for anything else. */
+static int LocateKey(int which, const u8 *entry, u32 *index, u32 *scancode) {
+  u32 value;
+  if (entry[0] & INPUT_KEYMAP_BY_INDEX) {
+    value = Read16(entry + 2);
+    if (value >= (which == INPUT_TABLET ? TABLET_BUTTONS : ATKBD_KEYMAP_SIZE)) {
+      return einval();
+    }
+    *index = value;
+  } else {
+    if (ScancodeIndex(entry, &value) == -1) return -1;
+    if (which == INPUT_TABLET) {
+      if (value <= HID_UP_BUTTON || value > HID_UP_BUTTON + TABLET_BUTTONS) {
+        return einval();
+      }
+      *index = value - HID_UP_BUTTON - 1;
+    } else {
+      if (value >= ATKBD_KEYMAP_SIZE) return einval();
+      *index = value;
+    }
+  }
+  *scancode = which == INPUT_TABLET ? HID_UP_BUTTON + 1 + *index : *index;
+  return 0;
+}
+
+static u16 *Keymap(int which) {
+  return which == INPUT_TABLET ? tablet.keymap : kbd.keymap;
+}
+
+static int KeymapSize(int which) {
+  return which == INPUT_TABLET ? TABLET_BUTTONS : ATKBD_KEYMAP_SIZE;
+}
+
+/* EVIOCGKEYCODE and EVIOCGKEYCODE_V2: the key a scan code or an index of the
+ * keyboard's or the tablet's keymap reports. The other devices have none. */
 static int GetKeycode(struct Machine *m, struct EvdevClient *c, i64 addr,
                       bool v2) {
   u8 entry[KEYMAP_ENTRY_SIZE];
-  u32 index;
-  if (DeviceIndex(c->device) != INPUT_KEYBOARD) return einval();
+  u32 index, scancode;
+  int which = DeviceIndex(c->device);
+  if (which != INPUT_KEYBOARD && which != INPUT_TABLET) return einval();
   memset(entry, 0, sizeof(entry));
   if (v2) {
     if (CopyFromUserRead(m, entry, addr, sizeof(entry)) == -1) return efault();
@@ -1849,32 +1927,29 @@ static int GetKeycode(struct Machine *m, struct EvdevClient *c, i64 addr,
     if (CopyFromUserRead(m, entry + 8, addr, 4) == -1) return efault();
     entry[1] = 4;
   }
-  if (entry[0] & INPUT_KEYMAP_BY_INDEX) {
-    index = Read16(entry + 2);
-  } else if (ScancodeIndex(entry, &index) == -1) {
-    return -1;
-  }
-  if (index >= ATKBD_KEYMAP_SIZE) return einval();
-  if (!v2) return PutInt(m, addr + 4, kbd.keymap[index]);
-  Write32(entry + 4, kbd.keymap[index]);
+  if (LocateKey(which, entry, &index, &scancode) == -1) return -1;
+  if (!v2) return PutInt(m, addr + 4, Keymap(which)[index]);
+  Write32(entry + 4, Keymap(which)[index]);
   Write16(entry + 2, index);
   entry[1] = 4;
-  Write32(entry + 8, index);
+  Write32(entry + 8, scancode);
   return CopyToUserWrite(m, addr, entry, sizeof(entry)) == -1 ? efault() : 0;
 }
 
-/* input_set_keycode() with input_default_setkeycode(): a scan code of the
- * keyboard reports another key from now on, which updates the keys it has
- * and releases the old key if it no longer has it. Not journaled: an Undo
- * barrier. */
+/* input_set_keycode() with input_default_setkeycode() on the keyboard and
+ * hidinput_setkeycode() on the tablet: a scan code of the device reports
+ * another key from now on, which updates the keys it has and releases the old
+ * key if it no longer has it. Not journaled: an Undo barrier. */
 static int SetKeycode(struct Machine *m, struct EvdevClient *c, i64 addr,
                       bool v2) {
   u8 entry[KEYMAP_ENTRY_SIZE];
-  u32 index, keycode, old;
-  int i;
+  u32 index, scancode, keycode, old;
+  int i, which;
+  u16 *keymap;
   struct InputDevice *dev = c->device;
   struct InputTime now;
-  if (DeviceIndex(dev) != INPUT_KEYBOARD) return einval();
+  which = DeviceIndex(dev);
+  if (which != INPUT_KEYBOARD && which != INPUT_TABLET) return einval();
   memset(entry, 0, sizeof(entry));
   if (v2) {
     if (CopyFromUserRead(m, entry, addr, sizeof(entry)) == -1) return efault();
@@ -1886,19 +1961,15 @@ static int SetKeycode(struct Machine *m, struct EvdevClient *c, i64 addr,
   }
   keycode = Read32(entry + 4);
   if (keycode > KEY_MAX_LINUX) return einval();
-  if (entry[0] & INPUT_KEYMAP_BY_INDEX) {
-    index = Read16(entry + 2);
-  } else if (ScancodeIndex(entry, &index) == -1) {
-    return -1;
-  }
-  if (index >= ATKBD_KEYMAP_SIZE) return einval();
+  if (LocateKey(which, entry, &index, &scancode) == -1) return -1;
   DebugHistoryMarkIrreversible();
-  old = kbd.keymap[index];
-  kbd.keymap[index] = keycode;
+  keymap = Keymap(which);
+  old = keymap[index];
+  keymap[index] = keycode;
   if (old <= KEY_MAX_LINUX) {
     ClearBit(dev->keybit, old);
-    for (i = 0; i < ATKBD_KEYMAP_SIZE; ++i) {
-      if (kbd.keymap[i] == old) {
+    for (i = 0; i < KeymapSize(which); ++i) {
+      if (keymap[i] == old) {
         SetBit(dev->keybit, old);
         break;
       }

@@ -26,6 +26,7 @@
 #define JOURNAL_MIDI_PVERSION   50  // the protocol version USER_PVERSION set
 #define JOURNAL_TONE            56  // the speaker's tone before a change
 #define JOURNAL_CONSOLE_TERMIOS 57  // /dev/tty0's termios before TCSETS
+#define JOURNAL_CONSOLE_MODES   58  // the console's KDSETMODE and KDSKBMODE before
 
 // What a cut drops, as the host's soundCut names it.
 #define SOUND_ALL     0

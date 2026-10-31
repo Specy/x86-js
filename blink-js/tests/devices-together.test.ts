@@ -2,8 +2,8 @@
 // M2 to M4): the PC Speaker that both the evdev device and the console's tone ioctls reach, the
 // reads and writes each device journals rather than making an Undo barrier, the raw MIDI port's
 // four devices, one program using every family with Undo across them, and a start after a run
-// that left every device in use finding none of it. The values are Linux 6.12's on the QEMU guest
-// x86's devices follow (ADR 0067), provisional until it is booted, so these run in the Core only.
+// that left every device in use finding none of it. The values are Linux 7.2's on the pinned QEMU
+// guest x86's devices follow (ADR 0067, docs/research/x86-reference-guest.md).
 import { describe, expect, it } from 'vitest'
 import { EmulatorStatus } from '../src/interface'
 import {
@@ -68,8 +68,8 @@ const hex = (value: number) => `0x${value.toString(16)}`
 
 const PATHS: Record<string, string> = {
     fb0: '/dev/fb0',
-    kbd: '/dev/input/event1',
-    speaker: '/dev/input/event4',
+    kbd: '/dev/input/event0',
+    speaker: '/dev/input/event3',
     dsp: '/dev/dsp',
     mixer: '/dev/mixer',
     midi: '/dev/snd/midiC1D0',
@@ -179,11 +179,22 @@ async function probe(body: readonly string[]) {
     }
 }
 
-/** Steps until the instruction after the `count`th syscall from here is next. */
+/**
+ * Steps until the instruction after the `count`th syscall from here is next, through the timed
+ * waits a syscall makes (a pan waits for the vertical blank), each one instruction.
+ */
 async function throughSyscall(emulator: X86Emulator, count = 1): Promise<void> {
     for (let index = 0; index < 1000; index++) {
         const isCall = emulator.getNextInstruction()?.code.toLowerCase().includes('syscall')
         await emulator.step()
+        for (let wait = 0; wait < 100 && emulator.runtime.isWaiting(); wait++) {
+            await new Promise<void>((resolve) => {
+                const done = emulator.on('stateChange', () => {
+                    done()
+                    resolve()
+                })
+            })
+        }
         if (isCall && --count === 0) return
     }
     throw new Error('the probe did not reach the syscall')
@@ -223,7 +234,7 @@ const saveEvents = (count: number) => [
 ]
 
 describe('the PC speaker', () => {
-    it('sounds for EV_SND written to /dev/input/event4, through the sound devices’ driver', async () => {
+    it('sounds for EV_SND written to /dev/input/event3, through the sound devices’ driver', async () => {
         const { results, heard } = await probe([
             `sys 2, speaker, ${O_RDWR | O_NONBLOCK}`,
             'mov r12, rax',
@@ -458,7 +469,7 @@ describe('the raw MIDI port', () => {
                 'sys 3, r12'
             ])
         ])
-        expect(results.slice(0, 5)).toEqual([0x7428n, 0x7429n, 0x742an, 0x742bn, 0x0e12n])
+        expect(results.slice(0, 5)).toEqual([0x7402n, 0x7403n, 0x7404n, 0x7405n, 0x0e12n])
         expect(results.slice(5)).toEqual(
             [0n, 1n, 2n, 3n, 0n].flatMap((device) => [device, 1n, 3n])
         )
@@ -541,20 +552,28 @@ describe('every device family at once', () => {
             expect(heard.presents).toEqual([240, 0])
             expect(emulator.readMemoryBytes(mapped, 4n)).toEqual(new Uint8Array(4))
             expect(emulator.readMemoryBytes(mapped + BigInt(LINE), 4n)).toEqual(new Uint8Array(4))
+            // the pan waited for the first vertical blank, so Undo comes 1/60 s in
+            const blank = 16666667n
             expect(heard.cuts).toEqual(
                 expect.arrayContaining([
-                    { after: 0n, device: 'speaker' },
-                    { after: 0n, device: 'dsp' },
-                    { after: 0n, device: 'midi' }
+                    { after: blank, device: 'speaker' },
+                    { after: blank, device: 'dsp' },
+                    { after: blank, device: 'midi' }
                 ])
             )
-            expect(heard.tone.at(-1)).toEqual({ at: 0n, hz: 0 })
+            expect(heard.tone.at(-1)).toEqual({ at: blank, hz: 0 })
 
             // the program goes on as if none of it had happened: the key is read again
             const results = await runToEnd(emulator)
             expect(results).toEqual([72n, 0xff8000n, 0x112233n])
-            expect(heard.midi).toHaveLength(2)
-            expect(heard.tone.at(-1)).toEqual({ at: 0n, hz: PIT / 2711 })
+            // the note had sounded by the time of the Undo, which stopped it; the run again
+            // sends it anew
+            expect(heard.midi.map(({ at, message }) => [at, [...message]])).toEqual([
+                [3n * MIDI_BYTE, [0x90, 0x3c, 0x64]],
+                [blank, [0x80, 0x3c, 0]],
+                [blank + 3n * MIDI_BYTE, [0x90, 0x3c, 0x64]]
+            ])
+            expect(heard.tone.at(-1)).toEqual({ at: blank, hz: PIT / 2711 })
             expect(framebuffer.yoffset).toBe(240)
         } finally {
             emulator.dispose()
@@ -650,7 +669,22 @@ describe('a start after a run', () => {
                 const stderr: number[] = []
                 const stop = emulator.on('stderr', (bytes) => void stderr.push(...bytes))
                 try {
-                    expect(await emulator.run(1_000_000)).toBe(EmulatorStatus.Waiting)
+                    // through the pan's wait for the vertical blank, to the read nothing ends
+                    let status = await emulator.run(1_000_000)
+                    for (
+                        let wait = 0;
+                        wait < 100 && emulator.getWaitRequest()?.deadlineNanoseconds != null;
+                        wait++
+                    ) {
+                        await new Promise<void>((resolve) => {
+                            const done = emulator.on('stateChange', () => {
+                                done()
+                                resolve()
+                            })
+                        })
+                        status = await emulator.run(1_000_000)
+                    }
+                    expect(status).toBe(EmulatorStatus.Waiting)
                     expect(emulator.getWaitRequest()?.wakeSources.inputDevices).toEqual([
                         'keyboard'
                     ])
