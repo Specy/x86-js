@@ -6547,14 +6547,17 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
     case 0x013: /* readv */
     case 0x001: /* write, except the deferred terminal transcript */
     case 0x014: /* writev */
-      if (result > 0 && !IsTerminalFildes(m, arg1))
+      /* an input device journals what it reads and writes (evdev.c) */
+      if (result > 0 && !IsTerminalFildes(m, arg1) &&
+          !IsJournaledDeviceFildes(m, arg1))
         DebugHistoryMarkIrreversible();
       break;
     case 0x011: /* pread64: a regular File does not move its offset */
     case 0x127: /* preadv */
       break;
     case 0x147: /* preadv2 with offset -1 advances the open description */
-      if (result > 0 && arg4 == -1 && !IsTerminalFildes(m, arg1))
+      if (result > 0 && arg4 == -1 && !IsTerminalFildes(m, arg1) &&
+          !IsJournaledDeviceFildes(m, arg1))
         DebugHistoryMarkIrreversible();
       break;
     case 0x012: /* pwrite64 */

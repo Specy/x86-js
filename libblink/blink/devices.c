@@ -2,7 +2,7 @@
  * devices follow has them (docs/design/x86-devices.md, ADR 0067).
  *
  * This file holds their one table: each node's path, its device number and
- * what it is; the udev links to them; the input devices' identities. The
+ * what it is, and the udev links to them (evdev.c has the input devices'). The
  * wrapper makes the nodes, the links and /proc/bus/input/devices from it
  * before any program starts, and an open() finds what it opened here by the
  * device number of the node it reached, so a path through a link opens the
@@ -33,6 +33,7 @@
 #include "blink/endian.h"
 #include "blink/environment.h"
 #include "blink/errno.h"
+#include "blink/evdev.h"
 #include "blink/fbdev.h"
 #include "blink/linux.h"
 #include "blink/macros.h"
@@ -96,42 +97,6 @@ static const struct DeviceLink kDeviceLinks[] = {
      "../mouse1"},
 };
 
-// What EVIOCGNAME, EVIOCGPHYS, EVIOCGUNIQ and EVIOCGID answer and
-// /proc/bus/input/devices lists. The input numbers and the sysfs paths are
-// the least certain: they depend on the order the guest probes its devices.
-struct InputIdentity {
-  const char *name, *phys, *uniq, *sysfs, *handlers, *bits;
-  u16 bustype, vendor, product, version;
-};
-
-static const struct InputIdentity kInputIdentities[INPUT_DEVICES] = {
-    {"Power Button", "LNXPWRBN/button/input0", 0,
-     "/devices/LNXSYSTM:00/LNXPWRBN:00/input/input0", "kbd event0",
-     "B: PROP=0\nB: EV=3\nB: KEY=10000000000000 0\n", 0x19, 0, 1, 0},
-    {"AT Translated Set 2 keyboard", "isa0060/serio0/input0", 0,
-     "/devices/platform/i8042/serio0/input/input1", "sysrq kbd event1 leds",
-     "B: PROP=0\nB: EV=120013\n"
-     "B: KEY=402000000 3803078f800d001 feffffdfffefffff fffffffffffffffe\n"
-     "B: MSC=10\nB: LED=7\n",
-     0x11, 1, 1, 0xab41},
-    // with vmport=off the PS/2 mouse is the IntelliMouse Explorer QEMU emulates
-    {"ImExPS/2 Generic Explorer Mouse", "isa0060/serio1/input0", 0,
-     "/devices/platform/i8042/serio1/input/input2", "mouse0 event2",
-     "B: PROP=1\nB: EV=7\nB: KEY=1f0000 0 0 0 0\nB: REL=143\n", 0x11, 2, 6,
-     0},
-    {"QEMU QEMU USB Tablet", "usb-0000:00:04.0-1/input0",
-     "28754-0000:00:04.0-1",
-     "/devices/pci0000:00/0000:00:04.0/usb1/1-1/1-1:1.0/0003:0627:0001.0001/"
-     "input/input3",
-     "mouse1 event3",
-     "B: PROP=0\nB: EV=1f\nB: KEY=70000 0 0 0 0\nB: REL=900\nB: ABS=3\n"
-     "B: MSC=10\n",
-     0x03, 0x627, 1, 1},
-    {"PC Speaker", "isa0061/input0", 0, "/devices/platform/pcspkr/input/input4",
-     "kbd event4", "B: PROP=0\nB: EV=40001\nB: SND=6\n", 0x10, 0x1f, 1,
-     0x100},
-};
-
 // The raw MIDI port's pacing: MIDI's 31,250 baud, ten bits a byte, behind a
 // 4 KiB buffer (x86-devices.md, "The raw MIDI port").
 #define MIDI_BYTES_PER_SECOND 3125
@@ -139,11 +104,6 @@ static const struct InputIdentity kInputIdentities[INPUT_DEVICES] = {
 
 // struct input_event on x86-64: a timeval, then type, code and value.
 #define INPUT_EVENT_SIZE 24
-
-// evdev's ioctls ('E'); what is answered before M3 is a device's identity.
-#define EVIOCGVERSION_LINUX 0x80044501
-#define EVIOCGID_LINUX      0x80084502
-#define EVDEV_VERSION_LINUX 0x010001
 
 const struct DeviceNode *GetDeviceNodes(int *count) {
   *count = ARRAYLEN(kDeviceNodes);
@@ -181,7 +141,9 @@ struct DeviceFile *RetainDeviceFile(struct DeviceFile *df) {
 }
 
 void ReleaseDeviceFile(struct DeviceFile *df) {
-  if (df && !--df->references) free(df);
+  if (!df || --df->references) return;
+  if (df->node->kind == DEVICE_INPUT) ReleaseEvdev(df);
+  free(df);
 }
 
 /* The open file description of the device a guest descriptor refers to, for
@@ -322,19 +284,6 @@ static ssize_t WriteDiscarded(int fildes, const struct iovec *iov,
   return IovsSize(iov, iovcnt);
 }
 
-// No input event reaches a reader before M3 delivers them.
-static ssize_t ReadInput(int fildes, const struct iovec *iov, int iovcnt) {
-  if (IovsSize(iov, iovcnt) < INPUT_EVENT_SIZE) return einval();
-  return eagain();
-}
-
-// Whole events are written, as evdev takes them; what they do comes with M3.
-static ssize_t WriteInput(int fildes, const struct iovec *iov, int iovcnt) {
-  size_t size = IovsSize(iov, iovcnt);
-  if (size && size < INPUT_EVENT_SIZE) return einval();
-  return size - size % INPUT_EVENT_SIZE;
-}
-
 // A device without a poll of its own, which Linux reports always ready.
 static int PollReady(struct pollfd *fds, nfds_t nfds, int timeout) {
   nfds_t i;
@@ -346,8 +295,7 @@ static int PollReady(struct pollfd *fds, nfds_t nfds, int timeout) {
   return ready;
 }
 
-// Writable, never readable: evdev with no events queued, the MIDI port's
-// input, the console's keyboard.
+// Writable, never readable: the MIDI port's input, the console's keyboard.
 static int PollWritable(struct pollfd *fds, nfds_t nfds, int timeout) {
   nfds_t i;
   int ready;
@@ -380,8 +328,8 @@ static int IoctlUnknown(struct Machine *m, int fildes, u64 request, i64 addr) {
 
 // Linux's str_to_user(): the string and its NUL, cut to the buffer's size and
 // then not terminated, and the length copied.
-static int IoctlString(struct Machine *m, const char *string, u64 request,
-                       i64 addr) {
+int IoctlString(struct Machine *m, const char *string, u64 request,
+                i64 addr) {
   u32 size;
   if (!string) {
     errno = ENOENT;
@@ -390,37 +338,6 @@ static int IoctlString(struct Machine *m, const char *string, u64 request,
   size = MIN(strlen(string) + 1, IOC_SIZE(request));
   if (CopyToUserWrite(m, addr, (void *)string, size) == -1) return efault();
   return size;
-}
-
-static int IoctlInput(struct Machine *m, int fildes, u64 request, i64 addr) {
-  u8 id[8];
-  struct DeviceFile *df;
-  const struct InputIdentity *identity;
-  if (!(df = GetDeviceFile(fildes))) return ebadf();
-  identity = kInputIdentities + df->node->input;
-  switch (request) {
-    case EVIOCGVERSION_LINUX:
-      Write32(id, EVDEV_VERSION_LINUX);
-      return CopyToUserWrite(m, addr, id, 4) == -1 ? efault() : 0;
-    case EVIOCGID_LINUX:
-      Write16(id + 0, identity->bustype);
-      Write16(id + 2, identity->vendor);
-      Write16(id + 4, identity->product);
-      Write16(id + 6, identity->version);
-      return CopyToUserWrite(m, addr, id, 8) == -1 ? efault() : 0;
-    default:
-      break;
-  }
-  if (IOC_MATCHES(request, IOC_READ_LINUX, 'E', 0x06)) {  // EVIOCGNAME(len)
-    return IoctlString(m, identity->name, request, addr);
-  }
-  if (IOC_MATCHES(request, IOC_READ_LINUX, 'E', 0x07)) {  // EVIOCGPHYS(len)
-    return IoctlString(m, identity->phys, request, addr);
-  }
-  if (IOC_MATCHES(request, IOC_READ_LINUX, 'E', 0x08)) {  // EVIOCGUNIQ(len)
-    return IoctlString(m, identity->uniq, request, addr);
-  }
-  return enotty();
 }
 
 #define DEVICE_CB(READ, WRITE, POLL, IOCTL) \
@@ -439,7 +356,7 @@ static int IoctlInput(struct Machine *m, int fildes, u64 request, i64 addr) {
 static const struct FdCb kFdCbFramebuffer =
     DEVICE_CB(ReadFramebuffer, WriteFramebuffer, PollReady, IoctlFramebuffer);
 static const struct FdCb kFdCbInput =
-    DEVICE_CB(ReadInput, WriteInput, PollWritable, IoctlInput);
+    DEVICE_CB(ReadEvdev, WriteEvdev, PollEvdev, IoctlEvdev);
 static const struct FdCb kFdCbDsp =
     DEVICE_CB(ReadNothing, WriteNothing, PollReady, IoctlUnknown);
 static const struct FdCb kFdCbMixer =
@@ -481,6 +398,11 @@ int OpenDevice(struct Machine *m, struct Fd *fd, const struct DeviceNode *node) 
     DeviceDrainSet(&df->drain, MIDI_BUFFER_BYTES, MIDI_BYTES_PER_SECOND);
   }
   if (node->kind == DEVICE_FRAMEBUFFER && OpenFramebuffer() == -1) {
+    free(df);
+    return -1;
+  }
+  // each open of an input device is a reader of its own (evdev.c)
+  if (node->kind == DEVICE_INPUT && OpenEvdev(df) == -1) {
     free(df);
     return -1;
   }
@@ -534,6 +456,7 @@ int WaitForDeviceRead(struct Machine *m, int fildes, u64 size, int oflags) {
     case DEVICE_INPUT:
       // evdev refuses a buffer that cannot hold one event, waiting or not
       if (size < INPUT_EVENT_SIZE) return einval();
+      if (!EvdevReadWaits(df)) return 0;
       break;
     case DEVICE_MIDI:
     case DEVICE_CONSOLE:
@@ -544,6 +467,18 @@ int WaitForDeviceRead(struct Machine *m, int fildes, u64 size, int oflags) {
   if (oflags & O_NONBLOCK) return 0;
   if (GuestWaitInterruptedRestartable(m)) return eintr();
   GuestWaitHalt(m, GetMaxTime(), wake);
+}
+
+/* Whether the reads and writes of `fildes` journal what they do, so that
+ * they are no Undo barrier: an input device's (evdev.c). */
+bool IsJournaledDeviceFildes(struct Machine *m, int fildes) {
+  bool journaled;
+  struct Fd *fd;
+  LOCK(&m->system->fds.lock);
+  journaled = (fd = GetFd(&m->system->fds, fildes)) && fd->device &&
+              fd->device->node->kind == DEVICE_INPUT;
+  UNLOCK(&m->system->fds.lock);
+  return journaled;
 }
 
 /* Whether writes to `fildes` go through WriteDevice(). */
@@ -733,31 +668,4 @@ const char *blinkenlib_device_link_path(u32 index) {
 EMSCRIPTEN_KEEPALIVE
 const char *blinkenlib_device_link_target(u32 index) {
   return index < ARRAYLEN(kDeviceLinks) ? kDeviceLinks[index].target : 0;
-}
-
-/* /proc/bus/input/devices: each input device as the kernel's
- * input_devices_seq_show() prints it, in /dev/input's order. */
-EMSCRIPTEN_KEEPALIVE
-const char *blinkenlib_input_devices_text(void) {
-  int i, n;
-  size_t used;
-  static char text[4096];
-  const struct InputIdentity *d;
-  for (used = i = 0; i < INPUT_DEVICES; ++i) {
-    d = kInputIdentities + i;
-    n = snprintf(text + used, sizeof(text) - used,
-                 "I: Bus=%04x Vendor=%04x Product=%04x Version=%04x\n"
-                 "N: Name=\"%s\"\n"
-                 "P: Phys=%s\n"
-                 "S: Sysfs=%s\n"
-                 "U: Uniq=%s\n"
-                 "H: Handlers=%s \n"
-                 "%s\n",
-                 d->bustype, d->vendor, d->product, d->version, d->name,
-                 d->phys ? d->phys : "", d->sysfs, d->uniq ? d->uniq : "",
-                 d->handlers, d->bits);
-    unassert(n > 0 && n < sizeof(text) - used);
-    used += n;
-  }
-  return text;
 }

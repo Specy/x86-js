@@ -250,9 +250,9 @@ The machine has the devices of the QEMU guest x86's devices follow ([ADR 0067](.
 
 The nodes the guest has but this machine does not cover, `/dev/dri/card0`, ALSA's `controlC0`, `pcmC0D0p`, `pcmC0D0c` and `seq`, `/dev/input/mice`, `mouse0` and `mouse1`, and `/dev/audio`, exist, and opening one fails with ENODEV and raises `unsupportedDevice` with the node's path, for the host to say what to use instead. There is no `/dev/sequencer` or `/dev/music`, as in the guest.
 
-What `open()` makes is an open file description, which `dup()` shares, with its status flags (`O_NONBLOCK` set through one descriptor holds for every copy), and which the last `close()` releases. An ioctl a descriptor does not know answers ENOTTY, on every descriptor, as Linux does; a request that carries its size is matched on its type and number whatever size it names. The devices answer what their milestone in [x86-devices-plan.md](../../../docs/design/x86-devices-plan.md) has brought so far:
+What `open()` makes is an open file description, which `dup()` shares, with its status flags (`O_NONBLOCK` set through one descriptor holds for every copy), and which the last `close()` releases. An ioctl a descriptor does not know answers ENOTTY, on every descriptor, as Linux does, except where the device answers it itself, as evdev answers EINVAL; a request that carries its size is matched on its type and number whatever size it names. The devices answer what their milestone in [x86-devices-plan.md](../../../docs/design/x86-devices-plan.md) has brought so far:
 
-- the input devices answer `EVIOCGVERSION`, `EVIOCGID`, `EVIOCGNAME`, `EVIOCGPHYS` and `EVIOCGUNIQ`; a read takes whole 24-byte events (EINVAL for a smaller buffer) and none ever comes, so a blocking read waits, with the keyboard or the tablet in its `waitRequest`'s `wakeSources.inputDevices`, and an `O_NONBLOCK` one answers EAGAIN;
+- the input devices are evdev's, see "Input devices" below;
 - the raw MIDI port takes bytes at MIDI's 31,250 baud on Program time behind a 4 KiB buffer: a write queues what fits and, unless `O_NONBLOCK`, waits for room until every byte is queued, and `poll` waits for room with the moment a byte drains as its deadline. Nothing plays them yet;
 - `/dev/tty0` takes writes and never yields a read;
 - `/dev/fb0` is the framebuffer, below;
@@ -292,6 +292,30 @@ if (framebuffer) {
 The `framebufferPresent` event, with the line the scanout starts at, comes at every pan that took, `FBIOPUT_VSCREENINFO` included, at `fsync` and `fdatasync`, when `FBIOBLANK` turns the display off or on, and when Undo moves the scanout or blanks it. A host shows the visible page then, at the end of every run slice and at every wait; nothing else marks what changed, so it reads the whole page, which the view gives without a copy. `visible()` is made again when the wasm heap has grown or the scanout moved, and the object `getFramebuffer()` returns reads every property from the Core when asked.
 
 **Undo.** A store through a mapping is an ordinary memory write, and a `rep stosd` clearing a whole page stays one undoable step. What a `write` replaces, the offset `read`, `write` and `lseek` move, and the screen information, pan and blank the ioctls change are journaled too, so none of them is an Undo barrier; a read into memory larger than the 64 KiB one instruction keeps is, as for any File. Opening `/dev/fb0` and mapping it stay barriers, as every descriptor and mapping change is.
+
+### Input devices
+
+`/dev/input/event0` to `event4` are evdev devices with the identities and capabilities Linux 6.12's drivers give the guest's Power Button, AT keyboard (translated set 2), PS/2 mouse (IntelliMouse Explorer), QEMU 10.0 USB tablet and PC Speaker: `EVIOCGNAME`, `EVIOCGPHYS`, `EVIOCGUNIQ`, `EVIOCGID`, `EVIOCGVERSION`, `EVIOCGPROP` and `EVIOCGBIT` for every type answer as there, and `/proc/bus/input/devices` lists the same bits. Every program starts on a machine just booted: nothing held, no LED lit, the tablet at 0, 0.
+
+The host delivers what the user does with `sendInputReport(device, events)`, one host event at a time, to `'keyboard'` or `'tablet'`, as Linux `struct input_event`s without their times (`X86InputEvent`):
+
+```ts
+emulator.sendInputReport('keyboard', [{ type: 1, code: 30, value: 1 }]) // EV_KEY, KEY_A, down
+emulator.sendInputReport('tablet', [
+    { type: 3, code: 0, value: 16384 }, // EV_ABS, ABS_X: floor(x × 32767 ÷ width)
+    { type: 3, code: 1, value: 8000 }, // ABS_Y
+    { type: 1, code: 0x110, value: 1 } // BTN_LEFT
+])
+emulator.sendInputReport('tablet', [{ type: 2, code: 8, value: 1 }]) // REL_WHEEL, a notch away
+```
+
+The Core turns them into what the guest's hardware and drivers make of them. A key, `EV_KEY` with a `KEY_*` code and 1, 2 or 0, becomes the scan codes QEMU's PS/2 keyboard sends for it, which atkbd reads into `MSC_SCAN` (the set 1 code, 0x80 for an E0 prefix), the key and `SYN_REPORT`: a key held is a repeat, value 2, a make code within half the repeat delay of the first is dropped as atkbd drops a double press, Pause goes down and up at once and sends nothing as it is released, and Print Screen is `0xb7`. A key the AT keyboard does not have is ignored. Caps Lock, Num Lock and Scroll Lock going down toggle the console's locks, which light the LEDs in a packet of their own after the key's, as the console's keyboard handler does, unless a reader holds `EVIOCGRAB`. The pointer, `BTN_LEFT`, `BTN_RIGHT` and `BTN_MIDDLE`, `ABS_X` and `ABS_Y` from 0 to 32767 and `REL_WHEEL` notches, is QEMU's tablet's next HID report through hid-input: each button that changes with its HID usage (`0x90001` to `0x90003`) as `MSC_SCAN`, the axes that moved, clamped to their range, `REL_WHEEL` and `REL_WHEEL_HI_RES` at 120 a notch, and `SYN_REPORT`. Events of other types and codes, and the `MSC_SCAN`, `EV_LED` and `SYN_REPORT` events the Core adds itself, are ignored. The packets are stamped with Program time (the environment's `now`) and queued for every reader of the device, or only the one holding the grab; with no reader they are dropped and the device's state still changes. A read or `poll` waiting on the device resumes. Nothing happens without a running program, and a Testcase should never call it.
+
+Each `open()` is a reader with a queue of its own, 4,096 events where Linux's keyboard has 64; once a reader is that far behind, what it did not read is dropped for a `SYN_DROPPED` and the newest event, as evdev does. A read takes whole 24-byte events of the packets complete so far (EINVAL for a smaller buffer), waits for one unless `O_NONBLOCK` (EAGAIN), with the keyboard or the tablet in its `waitRequest`'s `wakeSources.inputDevices`; `poll` is always writable and readable once a packet is queued. Event times are in the reader's clock, `CLOCK_REALTIME` until `EVIOCSCLOCKID` asks for `CLOCK_MONOTONIC` or `CLOCK_BOOTTIME`, which throws the queued events away for a `SYN_DROPPED`.
+
+The state ioctls answer as evdev does: `EVIOCGKEY`, `EVIOCGLED`, `EVIOCGSND` and `EVIOCGSW` answer the state now and throw away that reader's queued events of their type; `EVIOCGABS` answers the tablet's axes (0 before any movement) and `EVIOCSABS` sets them; `EVIOCGREP` answers the keyboard's 250 and 33 ms, `EVIOCSREP` reads back atkbd's rounded values and changes no repeat, which are the host's; `EVIOCGRAB` is exclusive (EBUSY for a second); `EVIOCGMASK` and `EVIOCSMASK` filter a reader's events; `EVIOCREVOKE` ends a reader; `EVIOCGKEYCODE` and `EVIOCSKEYCODE` read and change the keyboard's keymap. An ioctl evdev does not know answers EINVAL, as evdev answers it, whatever its type. A write takes whole events, at most 170 at a time (EINVAL for less than one), and injects them as evdev does: an `EV_LED` lights the keyboard's LED, and an `EV_SND` reaches the PC Speaker's driver.
+
+Undo (ADR 0069): what a read took goes back at the front of its reader's queue, whether or not it waited for it, and so do the events an `EVIOCGKEY` and its relatives or `EVIOCSCLOCKID` threw away; the clock, the grab, a mask, an axis's absinfo, and what a write or `EVIOCSREP` delivered and changed are taken back too. The keys held, the pointer and the LEDs the lock keys set are live: after Undo the state ioctls answer the state as it is now. A queue that overflowed since cannot get its dropped events back. `EVIOCREVOKE` and `EVIOCSKEYCODE` are Undo barriers.
 
 ### Each run starts afresh
 

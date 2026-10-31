@@ -106,6 +106,8 @@ int WaitForDeviceRead(struct Machine *, int, u64, int);
 i64 WriteDevice(struct Machine *, int, const struct GuestSegment *, u32, int);
 i64 WriteDeviceGuestIovs(struct Machine *, int, i64, u32, int);
 bool IsPacedDevice(struct Machine *, int);
+bool IsJournaledDeviceFildes(struct Machine *, int);
+int IoctlString(struct Machine *, const char *, u64, i64);
 void DeviceForgetProgress(u64);
 i64 DeviceNow(void);
 void DeviceDrainSet(struct DeviceDrain *, u64, u64);

@@ -193,6 +193,14 @@ export type X86TerminalMode = {
 /** The input devices the host delivers events to; the guest's others never receive any. */
 export type X86InputDeviceId = 'keyboard' | 'tablet'
 
+/**
+ * One input event as Linux's `struct input_event` has it, without its time: `EV_KEY` with a
+ * `KEY_*` or `BTN_*` code and 1 down, 2 a repeat, 0 up; `EV_ABS` with `ABS_X` or `ABS_Y` and a
+ * position from 0 to 32767; `EV_REL` with `REL_WHEEL` and the notches turned, positive away from
+ * the user.
+ */
+export type X86InputEvent = { type: number; code: number; value: number }
+
 /** What can end a wait besides its deadline and a signal. */
 export type X86WakeSources = {
     /** Input given to the terminal (`provideInput()`). */

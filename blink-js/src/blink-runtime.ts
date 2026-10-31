@@ -43,6 +43,7 @@ import {
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
 import { decodeTerminalMode, decodeWakeSources, installDevices } from './devices'
 import { checkDisplayMode, FramebufferView } from './framebuffer'
+import { inputDeviceIndex, writeInputEvents } from './input'
 import {
     BlinkState,
     END_OF_INPUT,
@@ -54,6 +55,8 @@ import {
     type X86CompileResult,
     type X86ImplementedSyscall,
     type X86Input,
+    type X86InputDeviceId,
+    type X86InputEvent,
     type X86InputRequest,
     type X86WaitRequest,
     type X86Environment,
@@ -1219,6 +1222,32 @@ export class BlinkRuntime {
         return (this.framebuffer ??= new FramebufferView(this.module))
     }
     private framebuffer: FramebufferView | null = null
+
+    /**
+     * Delivers one report of the host's to the keyboard or the tablet, stamped with Program time,
+     * as the guest's hardware and drivers would deliver it (see the README's "Input devices"). A
+     * wait the device can end resumes: true for that. Nothing happens without a program.
+     */
+    sendInputReport(device: X86InputDeviceId, events: readonly X86InputEvent[]): boolean {
+        const index = inputDeviceIndex(device)
+        const report = this.module._blinkenlib_input_report
+        if (!report) return false
+        writeInputEvents(
+            this.heapBytes(),
+            this.module._blinkenlib_input_report_buffer!(),
+            this.module._blinkenlib_input_report_capacity!(),
+            events
+        )
+        if (!this.programSources) return false
+        const woke = report(index, events.length, this.hostNow(0), this.hostNow(1))
+        if (
+            woke &&
+            this.state === BlinkState.ProgramWaitPause &&
+            this.waitRequest?.wakeSources.inputDevices.includes(device)
+        )
+            return this.resumeWait()
+        return false
+    }
 
     /**
      * A host callback a system call reached, reported as an asynchronous callback's failure is
