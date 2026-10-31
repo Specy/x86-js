@@ -43,14 +43,25 @@ void update_clstruct(struct Machine *m);
  * and anything else is interrupted at least 5 times
  * per second, which is enough to have good renderer
  * updates on low end devices, despite some lag.
+ * It was 100,000 until October 2026, when
+ * RUN_SLICE_MAX, which has to stay below it, grew.
+ * The loop without history grew 1.5 to 1.9 times
+ * faster then, so 250,000 take 1.3 to 1.7 times as
+ * long as 100,000 did: about 10 ms where measured,
+ * so a device ten times slower still gets its event
+ * loop back about ten times a second.
  */
-#define MAX_CYCLES 100000
+#define MAX_CYCLES 250000
 
 /*
  * After this max amount of context switches,
- * the process will terminate with SIGXCPU
+ * the process will terminate with SIGXCPU: a
+ * hundred million instructions, as ever.
  */
-#define MAX_SWITCHES 1000
+#define MAX_SWITCHES 400
+
+/* The most instructions one blinkenlib_run_slice() runs, below MAX_CYCLES. */
+#define RUN_SLICE_MAX 200000
 
 int switches_count = 0;
 
@@ -353,11 +364,14 @@ static void ClearLastStepInfo(void) {
   active_step = false;
 }
 
-static void BeginRecordedStep(u32 control_flow) {
+static void BeginRecordedStep(void) {
+  u32 control_flow;
   if (!step_recording_enabled || !debugger_enabled || !m) return;
   if (active_step) return;
+  control_flow = GetControlFlowKind();
   ClearStepMemoryWrites();
-  memset(&last_step_info, 0, sizeof(last_step_info));
+  /* FinishRecordedStep() sets every field; until then there is none */
+  last_step_info.valid = false;
   active_pc_before = GetPc(m);
   active_sp_before = Read64(m->sp);
   active_flags_before = m->flags;
@@ -389,6 +403,14 @@ static bool PushRunBreakpoint(u64 address) {
   breakpoint.disable = false;
   breakpoint.oneshot = false;
   return PushBreakpoint(&run_breakpoints, &breakpoint) != -1;
+}
+
+/* Whether a Run breakpoint is at the instruction about to run, by its address
+ * or by its offset into CS, which differ only when CS has a base. */
+static bool AtRunBreakpoint(u64 pc) {
+  if (!run_breakpoints.i) return false;
+  if (IsAtBreakpoint(&run_breakpoints, pc) != -1) return true;
+  return pc != m->ip && IsAtBreakpoint(&run_breakpoints, m->ip) != -1;
 }
 
 static void ApplyPendingRunBreakpoints(void) {
@@ -464,7 +486,6 @@ void update_clstruct(struct Machine *m) {
 
 void runLoop() {
   int interrupt;
-  ssize_t breakpoint;
   m->nofault = false;
 
   // TODO: update global disassember struct with
@@ -480,7 +501,7 @@ void runLoop() {
         LoadInstruction(m, GetPc(m));
       } else {
       if (!active_identity) {
-        GuestTimerCheck(m);
+        if (guest_timer_armed) GuestTimerCheck(m);
         if (atomic_load_explicit(&m->attention, memory_order_acquire))
           CheckForSignals(m);
         if (s->exited) { m->canhalt = false; return; }
@@ -491,15 +512,12 @@ void runLoop() {
         PauseForRunControl(BLINKENLIB_STOP_LIMIT, SIGTRAP_CODE_RUN_LIMIT, pc);
         return;
       }
-      LoadInstruction(m, pc);  // not really needed like this
+      LoadInstruction(m, pc);
       pc = GetPc(m);
       if (!single_stepping) {
         if (skip_current_breakpoint && pc == skip_breakpoint_address) {
           skip_current_breakpoint = false;
-        } else if ((breakpoint = IsAtBreakpoint(&run_breakpoints, pc)) != -1 ||
-                   (breakpoint = IsAtBreakpoint(&run_breakpoints, m->ip)) !=
-                       -1) {
-          (void)breakpoint;
+        } else if (AtRunBreakpoint(pc)) {
           skip_current_breakpoint = true;
           skip_breakpoint_address = pc;
           PauseForRunControl(BLINKENLIB_STOP_BREAKPOINT,
@@ -510,9 +528,10 @@ void runLoop() {
       }
 
       if (!active_identity) active_identity = blinkenlib_next_identity();
-      BeginRecordedStep(GetControlFlowKind());
+      BeginRecordedStep();
       memory_sp_before = Read64(m->sp);
-      ExecuteInstruction(m);
+      // Both ways into this point decoded the instruction at the program counter.
+      ExecuteDecodedInstruction(m);
       u64 current_sp = Read64(m->sp);
       u64 distance = current_sp > memory_sp_before ? current_sp - memory_sp_before : memory_sp_before - current_sp;
       if (distance > 4096 || current_sp > memory_stack_top) memory_stack_top = current_sp;
@@ -789,7 +808,7 @@ void blinkenlib_run_slice(u32 budget, bool skip_at_pc) {
   if (!budget) budget = 1;
   single_stepping = false;
   native_slice = true;
-  blinkenlib_set_run_instruction_limit(budget < 50000 ? budget : 50000);
+  blinkenlib_set_run_instruction_limit(budget < RUN_SLICE_MAX ? budget : RUN_SLICE_MAX);
   skip_current_breakpoint = skip_at_pc;
   skip_breakpoint_address = GetPc(m);
   runLoop();
@@ -882,10 +901,16 @@ static u32 ArchitecturalFlags(u32 flags) {
 }
 
 /* The architectural RFLAGS (see ArchitecturalFlags()); the register snapshot
- * and the debugger history read the flags through here too. */
+ * reads the flags through here too. */
 EMSCRIPTEN_KEEPALIVE
 u32 blinkenlib_get_flags() {
   return m ? ArchitecturalFlags(m->flags) : 0;
+}
+
+/* The architectural word of a flags word Blink kept, for the debugger
+ * history, which keeps them as Blink does and hands out architectural ones. */
+u32 blinkenlib_architectural_flags(u32 flags) {
+  return ArchitecturalFlags(flags);
 }
 
 /* Fixed little-endian wasm32 layout: register IDs 0..16, PC, flags.

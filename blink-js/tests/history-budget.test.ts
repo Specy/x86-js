@@ -12,7 +12,8 @@
 //
 // `blinkenlib_history_budget` is a test-only export of the wasm, reached through
 // `wasmExports` because the package's glue does not bind it: it sets the budget
-// (0 leaves it) and returns the bytes the packets hold.
+// (0 leaves it) and returns the bytes the entries that aren't hollow hold: their
+// registers and the rest of their packets.
 import { describe, expect, it } from 'vitest'
 import { createX86Emulator, type X86Emulator } from '../src/x86-emulator'
 
@@ -54,7 +55,7 @@ async function start(source: string, capacity: number, budget?: number): Promise
     return emulator
 }
 
-/** The test-only export: sets the budget when given one, and returns the bytes the packets hold. */
+/** The test-only export: sets the budget when given one, and returns the bytes the entries hold. */
 function held(emulator: X86Emulator, budget = 0): number {
     const exports = emulator.module.wasmExports as unknown as Record<string, (bytes: number) => number>
     return exports.blinkenlib_history_budget!(budget) >>> 0

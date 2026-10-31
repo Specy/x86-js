@@ -535,6 +535,7 @@ void UndoVex(struct Machine *);
 void LoadInstruction(struct Machine *, u64);
 int LoadInstruction2(struct Machine *, u64);
 void ExecuteInstruction(struct Machine *);
+void ExecuteDecodedInstruction(struct Machine *);
 u64 AllocatePageTable(struct System *);
 u64 AllocateAnonymousPage(struct System *);
 void FreeAnonymousPage(struct System *, u8 *);

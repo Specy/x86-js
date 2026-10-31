@@ -142,6 +142,7 @@ u64 blinkenlib_get_brk();
 u64 blinkenlib_get_brk_start();
 u64 blinkenlib_get_stack_top();
 u32 blinkenlib_get_flags();
+u32 blinkenlib_architectural_flags(u32 flags);
 const u64 *blinkenlib_get_register_snapshot();
 const u8 *blinkenlib_get_fpu_snapshot();
 void blinkenlib_set_flags(u32 flags);

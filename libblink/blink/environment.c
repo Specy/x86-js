@@ -38,7 +38,7 @@ static struct timespec deadline;
  * Its elapsed time is monotonic even when CLOCK_REALTIME jumps. */
 static struct timespec timer_deadline;
 static int64_t timer_interval_us;
-static bool timer_armed;
+bool guest_timer_armed;
 static struct timespec TimerNow(void) {
   struct timespec now;
   HostNow(CLOCK_MONOTONIC, &now);
@@ -56,7 +56,7 @@ static struct timespec AddMicros(struct timespec now, int64_t us) {
   return AddTime(now, delta);
 }
 void GuestTimerReset(void) {
-  timer_armed = false;
+  guest_timer_armed = false;
   timer_interval_us = 0;
   timer_deadline = GetZeroTime();
 }
@@ -64,13 +64,13 @@ void GuestTimerCheck(struct Machine *m) {
   struct timespec now;
   struct timespec late, step;
   __int128 late_ns, interval_ns, remaining_ns;
-  if (!timer_armed || !m) return;
+  if (!guest_timer_armed || !m) return;
   now = TimerNow();
   if (CompareTime(now, timer_deadline) < 0) return;
   DebugHistoryMarkIrreversible();
   EnqueueSignal(m, SIGALRM_LINUX);
   if (!timer_interval_us) {
-    timer_armed = false;
+    guest_timer_armed = false;
     return;
   }
   late = SubtractTime(now, timer_deadline);
@@ -86,7 +86,7 @@ int GuestTimerGet(struct itimerval *out) {
   GuestTimerCheck(g_machine);
   out->it_interval = MicrosTimeval(timer_interval_us);
   out->it_value = MicrosTimeval(0);
-  if (!timer_armed) return 0;
+  if (!guest_timer_armed) return 0;
   now = TimerNow();
   left = SubtractTime(timer_deadline, now);
   /* Linux rounds a nonzero remaining interval up to one microsecond. */
@@ -108,8 +108,8 @@ int GuestTimerSet(const struct itimerval *value, struct itimerval *old) {
     return 0;
   }
   timer_interval_us = TimevalMicros(value->it_interval);
-  timer_armed = value->it_value.tv_sec || value->it_value.tv_usec;
-  if (timer_armed)
+  guest_timer_armed = value->it_value.tv_sec || value->it_value.tv_usec;
+  if (guest_timer_armed)
     timer_deadline = AddMicros(TimerNow(), TimevalMicros(value->it_value));
   return 0;
 }
@@ -121,7 +121,7 @@ unsigned GuestTimerAlarm(unsigned seconds) {
   return old.it_value.tv_sec + !!old.it_value.tv_usec;
 }
 int64_t GuestTimerDeadline(void) {
-  if (!timer_armed) return -1;
+  if (!guest_timer_armed) return -1;
   if (timer_deadline.tv_sec >= INT64_MAX / 1000000000)
     return INT64_MAX;
   return ToNanoseconds(timer_deadline);
