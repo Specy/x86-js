@@ -60,6 +60,7 @@
 #include "blink/debughistory.h"
 #include "blink/devices.h"
 #include "blink/endian.h"
+#include "blink/fbdev.h"
 #include "blink/flags.h"
 #include "blink/errno.h"
 #include "blink/flag.h"
@@ -2788,7 +2789,9 @@ static i64 SysPread(struct Machine *m, i32 fildes, i64 addr, u64 size,
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
       BeginReadJournal(m, &journal);
       JournalReadRange(m, addr, size);
-      RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
+      RESTARTABLE(rc = IsFramebufferFildes(m, fildes)
+                           ? PreadFramebuffer(fildes, iv.p, iv.i, offset)
+                           : VfsPreadv(fildes, iv.p, iv.i, offset));
       EndReadJournal(m, &journal, addr, rc);
     }
     FreeIovs(&iv);
@@ -2811,7 +2814,9 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
   if (size) {
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
-      RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
+      RESTARTABLE(rc = IsFramebufferFildes(m, fildes)
+                           ? PwriteFramebuffer(fildes, iv.p, iv.i, offset)
+                           : VfsPwritev(fildes, iv.p, iv.i, offset));
       if (rc != -1) SetReadAddr(m, addr, rc);
     }
     FreeIovs(&iv);
@@ -2903,6 +2908,8 @@ static i64 Preadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
       JournalGuestIovs(m, iovaddr, iovlen);
       if (offset == -1) {
         RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
+      } else if (IsFramebufferFildes(m, fildes)) {
+        rc = PreadFramebuffer(fildes, iv.p, iv.i, offset);
       } else {
         RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
       }
@@ -3015,6 +3022,8 @@ static i64 Pwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
           }
         } else if (offset == -1) {
           RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
+        } else if (IsFramebufferFildes(m, fildes)) {
+          rc = PwriteFramebuffer(fildes, iv.p, iv.i, offset);
         } else {
           RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
         }
@@ -3075,12 +3084,15 @@ static int CheckRwfFlags(i32 flags) {
 // after them; on x86-64 the high half is ignored, as linux ignores it.
 static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                       i64 offset, i64 offset_high, i32 flags) {
+  // a device without read_iter takes no flag but RWF_HIPRI
+  if ((flags & ~RWF_HIPRI_LINUX) && IsFramebufferFildes(m, fildes)) return eopnotsupp();
   if (CheckRwfFlags(flags) == -1) return -1;
   return Preadv(m, fildes, iovaddr, iovlen, offset);
 }
 
 static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                        i64 offset, i64 offset_high, i32 flags) {
+  if ((flags & ~RWF_HIPRI_LINUX) && IsFramebufferFildes(m, fildes)) return eopnotsupp();
   if (CheckRwfFlags(flags) == -1) return -1;
   return Pwritev(m, fildes, iovaddr, iovlen, offset, flags);
 }
@@ -3281,6 +3293,8 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
   if (!(fd = GetAndLockFd(m, fildes))) return -1;
   if (IsTerminalFd(fd) || IsBrowserPipe(fildes)) {
     rc = espipe();  // a terminal has no position
+  } else if (IsFramebufferFildes(m, fildes)) {
+    rc = SeekFramebuffer(fildes, offset, whence);
   } else if (!fd->dirstream) {
     rc = VfsSeek(fd->fildes, offset, XlatWhence(whence));
   } else if (whence == SEEK_SET_LINUX) {
@@ -3512,6 +3526,7 @@ static int CheckSyncable(int fildes) {
 }
 
 static int SysFsync(struct Machine *m, i32 fildes) {
+  if (IsFramebufferFildes(m, fildes)) return SyncFramebuffer(fildes);
   if (CheckSyncable(fildes) == -1) return -1;
 #ifdef F_FULLSYNC
   int rc;
@@ -3536,6 +3551,7 @@ static int SysFsync(struct Machine *m, i32 fildes) {
 }
 
 static int SysFdatasync(struct Machine *m, i32 fildes) {
+  if (IsFramebufferFildes(m, fildes)) return SyncFramebuffer(fildes);
   if (CheckSyncable(fildes) == -1) return -1;
 #ifdef F_FULLSYNC
   int rc;
@@ -6524,6 +6540,8 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
                                         i64 arg1, i64 arg2, i64 arg3,
                                         i64 arg4, i64 oldbrk) {
   if (result == -1) return;
+  // the framebuffer journals its file offset and what writes replace
+  if (FramebufferJournalsSyscall(m, call, arg1)) return;
   switch (call & 0xfff) {
     case 0x000: /* read: advances an open description or takes pipe bytes */
     case 0x013: /* readv */

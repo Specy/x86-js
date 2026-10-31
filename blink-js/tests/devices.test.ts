@@ -268,7 +268,7 @@ describe('ioctl', () => {
 
     it('answers ENOTTY on every device for what its milestone has not brought yet', async () => {
         const run = await probe(
-            ['fb0', 'dsp', 'mixer', 'midi', 'tty0'].flatMap((path) => [
+            ['dsp', 'mixer', 'midi', 'tty0'].flatMap((path) => [
                 `sys 2, ${path}, ${O_RDWR}`,
                 'mov r12, rax',
                 'sys 16, r12, 0x4600, buf', // FBIOGET_VSCREENINFO
@@ -277,7 +277,7 @@ describe('ioctl', () => {
                 'save'
             ])
         )
-        expect(run.results).toEqual(new Array(10).fill(ENOTTY))
+        expect(run.results).toEqual(new Array(8).fill(ENOTTY))
     })
 
     it('matches a sized request on its type and number, with the size it names', async () => {

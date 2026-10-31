@@ -27,6 +27,7 @@
 #include "blink/endian.h"
 #include "blink/machine.h"
 #include "blink/devices.h"
+#include "blink/fbdev.h"
 #include "blink/rde.h"
 #include "blink/terminal.h"
 #include <stdlib.h>
@@ -157,6 +158,7 @@ void DebugHistoryJournal(u32 kind, const void *data, u32 size) {
 /* Takes back what a journal record says, by its kind. */
 static void UndoJournal(u32 kind, const u8 *data, u32 size) {
   if (kind < 16) UndoTerminalJournal(kind, data, size);
+  else if (kind >= 32 && kind <= 35) UndoFramebufferJournal(kind, data, size);
 }
 static void AppendSplitWrite(const struct MachineWriteRecord *w, const u8 *old) {
   void *grown;

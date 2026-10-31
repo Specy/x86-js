@@ -201,8 +201,51 @@ export type X86WakeSources = {
     inputDevices: X86InputDeviceId[]
 }
 
+/**
+ * The machine's display mode, its `video=`: a width that is a multiple of 8 and a height, both 8
+ * to 1024 pixels. A program takes the mode set when it starts; the default is 320×240.
+ */
+export type X86DisplayMode = { width: number; height: number }
+
+/**
+ * The framebuffer `/dev/fb0` draws on, once the program has opened it: XRGB8888 pixels, one
+ * little-endian `0x00RRGGBB` word each, `lineLength` bytes a line, over twice the mode's height,
+ * of which the scanout shows `height` lines from `yoffset`. Every property is read from the Core
+ * when it is asked for, so one object stays current for the program.
+ */
+export type X86Framebuffer = {
+    /** The mode's width, in pixels. */
+    readonly width: number
+    /** The mode's height, in lines: the scanout shows this many. */
+    readonly height: number
+    /** Bytes from one line to the next: `width × 4`. */
+    readonly lineLength: number
+    /** The first line the scanout shows, 0 to `height`: `height` shows the second page. */
+    readonly yoffset: number
+    /** The program blanked the display (`FBIOBLANK`): show black. */
+    readonly blanked: boolean
+    /**
+     * The page the scanout shows, `height × lineLength` bytes: a view of the wasm heap, not a
+     * copy, which the program's next store changes. It is made again when the heap has grown or
+     * the scanout moved since the last call; empty once the program the framebuffer belonged to
+     * is cleared or another starts.
+     */
+    visible(): Uint8Array
+}
+
+/** The program presented a page: it panned, synced `/dev/fb0` or blanked it, or Undo did. */
+export type X86FramebufferPresent = {
+    /** The first line the scanout shows now. */
+    yoffset: number
+}
+
 export type X86EmulatorEventMap = {
     stateChange: { state: BlinkState; oldState: BlinkState }
+    /**
+     * The program panned the framebuffer, synced it or blanked it, or Undo moved the scanout:
+     * show `getFramebuffer().visible()` now.
+     */
+    framebufferPresent: X86FramebufferPresent
     /** The terminal's mode at each start of a program, and whenever the program changes it. */
     terminalMode: X86TerminalMode
     /**

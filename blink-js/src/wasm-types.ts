@@ -166,6 +166,18 @@ export type BlinkenlibModule = {
     _blinkenlib_device_link_path?(index: number): number
     _blinkenlib_device_link_target?(index: number): number
     _blinkenlib_input_devices_text?(): number
+    /** The program panned, synced or blanked the framebuffer: the line the scanout starts at. */
+    blinkFramebufferPresent?: (yoffset: number) => void
+    /** The next program's display mode; false for a size the machine does not take. */
+    _blinkenlib_set_display_mode?(width: number, height: number): boolean
+    /** The framebuffer's bytes in the heap, 0 until the program opens `/dev/fb0` (fbdev.c). */
+    _blinkenlib_framebuffer_pixels?(): number
+    _blinkenlib_framebuffer_size?(): number
+    _blinkenlib_framebuffer_width?(): number
+    _blinkenlib_framebuffer_height?(): number
+    _blinkenlib_framebuffer_line_length?(): number
+    _blinkenlib_framebuffer_yoffset?(): number
+    _blinkenlib_framebuffer_blanked?(): boolean
     _blinkenlib_get_brk(): bigint
     _blinkenlib_get_brk_start(): bigint
     _blinkenlib_get_stack_top(): bigint

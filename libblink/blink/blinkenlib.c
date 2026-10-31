@@ -10,6 +10,7 @@
 #include "blink/dis.h"
 #include "blink/debughistory.h"
 #include "blink/endian.h"
+#include "blink/fbdev.h"
 #include "blink/flags.h"
 #include "blink/high.h"
 #include "blink/loader.h"
@@ -651,6 +652,8 @@ void TearDown(void) {
   FreeMachine(m);
   m = g_machine = 0;
   s = 0;
+  // the framebuffer outlives its mappings until the next program starts
+  ResetFramebuffer();
 }
 
 EMSCRIPTEN_KEEPALIVE

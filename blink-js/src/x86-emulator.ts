@@ -29,7 +29,9 @@ import {
     type X86ExecutableOptions,
     type X86ProcessStart,
     type X86Progress,
-    type X86TerminalMode
+    type X86TerminalMode,
+    type X86DisplayMode,
+    type X86Framebuffer
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
@@ -84,7 +86,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         waitRequest: new Set(),
         unimplementedSyscall: new Set(),
         terminalMode: new Set(),
-        unsupportedDevice: new Set()
+        unsupportedDevice: new Set(),
+        framebufferPresent: new Set()
     }
 
     private lastCompileResult: X86CompileResult | null = null
@@ -163,6 +166,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 unsupportedDevice: (event) => {
                     const result = options.callbacks?.unsupportedDevice?.(event)
                     emulator?.emit('unsupportedDevice', event)
+                    return result
+                },
+                framebufferPresent: (event) => {
+                    const result = options.callbacks?.framebufferPresent?.(event)
+                    emulator?.emit('framebufferPresent', event)
                     return result
                 }
             }
@@ -366,6 +374,25 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         const waiting = this.runtime.isWaiting()
         if (this.runtime.sendSignal(signal) && waiting) this.resumedByInput = true
     }
+
+    /**
+     * The display mode `/dev/fb0` has from the next program start on, as the guest's `video=`
+     * sets it: a width that is a multiple of 8 and a height, both 8 to 1024; 320×240 until set.
+     * A size the machine does not take throws a RangeError.
+     */
+    setDisplayMode(mode: X86DisplayMode): void {
+        this.runtime.setDisplayMode(mode)
+    }
+
+    /**
+     * The framebuffer, once the program has opened `/dev/fb0`, and null before; it stays, as the
+     * program left it, until the next program starts or the session is cleared. Read its visible
+     * page at the end of each run slice, before each wait, at each `framebufferPresent` event and
+     * after Undo.
+     */
+    getFramebuffer(): X86Framebuffer | null {
+        return this.runtime.getFramebuffer()
+    }
     getInstructionsExecuted(): bigint {
         return this.runtime.getInstructionsExecuted()
     }
@@ -418,6 +445,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         this.eventHandlers.waitRequest.clear()
         this.eventHandlers.terminalMode.clear()
         this.eventHandlers.unsupportedDevice.clear()
+        this.eventHandlers.framebufferPresent.clear()
     }
 
     /** End the debug session before stopping its FileSystem capability; callbacks remain usable. */

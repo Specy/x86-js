@@ -15,6 +15,19 @@
   that never come yet; the raw MIDI port paces writes at 31,250 baud on Program
   time, a blocking write going on from what it queued each time Blink starts it
   over. See the README's "Devices".
+- `/dev/fb0` is the framebuffer (`docs/design/x86-devices-plan.md`, M2), as
+  Linux's DRM fbdev emulation answers on the QEMU guest's bochs display:
+  XRGB8888 over two pages of the display mode `setDisplayMode()` sets for the
+  next start (320×240 until then), the fixed and variable screen information,
+  `FBIOPUT_VSCREENINFO` answering as `drm_fb_helper_check_var()` does, panning,
+  `FBIO_WAITFORVSYNC` on the 1/60 s boundaries of Program time and
+  `FBIOBLANK`. `mmap` points the guest's pages into one buffer that `munmap`
+  never frees, and `read`, `write`, `pread64`, `pwrite64` and `lseek` reach the
+  same bytes. Stores through a mapping, what a `write` replaces, file offsets
+  and the device's settings are undoable. `getFramebuffer()` gives the page the
+  scanout shows as a view of the wasm heap, and the `framebufferPresent` event
+  marks pans, syncs, blanks and Undo moving the scanout. See the README's "The
+  framebuffer".
 - `X86WaitRequest` has `wakeSources`, the terminal and the input devices that
   can end a wait; `acceptsInput` stays until 8.0.0. A device that keeps time
   folds the moment it is ready into the deadline.
