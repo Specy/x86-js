@@ -96,6 +96,14 @@ terminal change shape, and programs find Linux's devices. The README's
   `SNDCTL_DSP_CHANNELS` takes its count unsigned (-1 is EINVAL); a fragment
   whose plugin buffers are too large makes the calls that apply it answer
   ENOMEM; `GETOSPACE` counts negative space in whole fragments down.
+- Every device but `/dev/fb0` has no file position, as on Linux: `pread64`,
+  `pwrite64`, `preadv`, `pwritev` and their v2 forms at an offset answer
+  ESPIPE before a read would wait, where they returned 0 or the length with
+  nothing done; `sendfile` from a device answers ESPIPE with an offset and
+  EINVAL without, and to a device but the console EINVAL. A reader of the PC
+  Speaker device waiting in `read`, `poll` or `select` wakes when a
+  `KDMKTONE` tone ends, since the silence can complete its packet. A write
+  to `/dev/dsp` or the MIDI port takes at most `MAX_RW_COUNT` bytes.
 - `X86WaitRequest` has `wakeSources`, the terminal and the input devices that
   can end a wait, and `terminalRead`, whether the instruction waiting is a
   read of the terminal, a raw read that `VTIME` times, which takes the input
