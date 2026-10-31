@@ -10,6 +10,7 @@ void GuestWaitFinish(struct Machine *);
 _Noreturn void GuestWaitHalt(struct Machine *, struct timespec, u32);
 _Noreturn void GuestWaitHaltWake(struct Machine *, struct timespec, u32,
                                  struct timespec);
+_Noreturn void GuestWaitHaltTerminalRead(struct Machine *, struct timespec);
 bool GuestWaitCancelled(void);
 bool GuestWaitInterrupted(struct Machine *);
 bool GuestWaitInterruptedRestartable(struct Machine *);

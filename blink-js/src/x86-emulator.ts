@@ -387,7 +387,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * Whether the terminal converts what `provideInput()` gives as `ICRNL`, `INLCR` and `IGNCR`
      * say, and what the program writes as `OPOST`'s `ONLCR` and `OCRNL` say, as Linux's line
      * discipline does: with both on, a program's `\n` reaches `stdout` as `\r\n` until it turns
-     * `ONLCR` off. Both are off unless asked for, until 8.0.0; a Testcase's scripted input, piped
+     * `ONLCR` off. Both are off unless asked for: a Testcase's scripted input, piped
      * on Linux, has no line discipline to go through.
      */
     setTerminalProcessing(processing: { input?: boolean; output?: boolean }): void {

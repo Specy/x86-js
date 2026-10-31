@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+For 8.0.0: the wait request, the state block, the history packets and the
+terminal change shape, and programs find Linux's devices. The README's
+"Migrating to 8.0.0" lists what a host has to change.
+
 - The machine has the QEMU guest's devices (`docs/design/x86-devices-plan.md`,
   M1 to M4). Its device nodes, `/dev/fb0`, `/dev/tty0`, `/dev/input/event0`
   to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and `/dev/snd/midiC1D0`
@@ -61,15 +65,25 @@
   was queued and not heard, and restores the MIDI channels and the speaker's
   tone. See the README's "Sound".
 - `X86WaitRequest` has `wakeSources`, the terminal and the input devices that
-  can end a wait; `acceptsInput` stays until 8.0.0. A device that keeps time
-  folds the moment it is ready into the deadline.
+  can end a wait, and `terminalRead`, whether the instruction waiting is a
+  read of the terminal, a raw read that `VTIME` times, which takes the input
+  that ends the wait, rather than a `poll` or `select` that only looks at it.
+  `acceptsInput` is gone: `wakeSources.terminal` says the same. A device that
+  keeps time folds the moment it is ready into the deadline.
+- `X86Project.includePaths` names directories of the Project that NASM
+  searches, as `-I`, for a `%include` or `incbin` it does not find in the
+  directory of the File it assembles, for every unit, the library's included.
+  A host offers include files of its own, such as a system's headers, as Files
+  under one of them, and diagnostics, instructions and breakpoints name them by
+  their Project paths. See the README's "Projects".
 - The terminal stores the termios a program sets, instead of ignoring it, and
   reports it: `getTerminalMode()` and the `terminalMode` event. Raw mode reads
   as `VMIN` and `VTIME` say, on Program time, and input given while no read
   waits is kept as type-ahead. `setTerminalProcessing()` turns on `ICRNL` and
-  its relatives for input and `OPOST`'s `ONLCR` and `OCRNL` for output, off
-  until 8.0.0. `sendSignal()` sends `SIGINT` or `SIGQUIT` as Ctrl+C and Ctrl+\
-  do under `ISIG`.
+  its relatives for input and `OPOST`'s `ONLCR` and `OCRNL` for output, which
+  stay off unless the host asks, so that what the program writes arrives as
+  it wrote it, as through a pipe. `sendSignal()` sends `SIGINT` or `SIGQUIT`
+  as Ctrl+C and Ctrl+\ do under `ISIG`.
 - A read of the terminal, a flush of its input and a change of its termios are
   journaled instead of being Undo barriers: Undo of a read that waited asks
   again, and type-ahead goes back (ADR 0069). The history packets carry the

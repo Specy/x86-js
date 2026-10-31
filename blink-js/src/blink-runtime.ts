@@ -1223,7 +1223,7 @@ export class BlinkRuntime {
      * Whether the terminal applies `ICRNL` and its relatives to the input `provideInput()` gives,
      * and `OPOST`'s `ONLCR` and `OCRNL` to what the program writes, as Linux's line discipline
      * does when the program's termios asks for them. Both are off until asked for, which keeps
-     * what a program writes reaching `stdout` as it wrote it; 8.0.0 turns them on.
+     * what a program writes reaching `stdout` as it wrote it, as through a pipe.
      */
     setTerminalProcessing(processing: { input?: boolean; output?: boolean }): void {
         this.terminalProcessing = { ...this.terminalProcessing, ...processing }
@@ -1857,17 +1857,13 @@ export class BlinkRuntime {
             this.clearWaitTransport()
             const deadline = this.module._blinkenlib_wait_deadline()
             const clock = this.module._blinkenlib_wait_clock()
-            const wakeSources = decodeWakeSources(
-                this.module._blinkenlib_wait_wake_sources?.() ??
-                    (this.module._blinkenlib_wait_input() ? 1 : 0)
-            )
             const request: X86WaitRequest = {
                 clock,
                 deadlineNanoseconds: deadline < 0n ? null : deadline,
                 remainingMilliseconds:
                     deadline < 0n ? null : millisecondsUntil(deadline, this.hostNow(clock)),
-                wakeSources,
-                acceptsInput: wakeSources.terminal,
+                wakeSources: decodeWakeSources(this.module._blinkenlib_wait_wake_sources()),
+                terminalRead: Boolean(this.module._blinkenlib_wait_terminal_read()),
                 instructionSerial: this.getCurrentInstructionSerial()!
             }
             this.waitRequest = request
@@ -2234,7 +2230,8 @@ function copyX86Project(project: X86Project): X86Project {
         entry: project.entry,
         files: copy(project.files),
         ...(project.library ? { library: copy(project.library) } : {}),
-        ...(project.startUnits ? { startUnits: copy(project.startUnits) } : {})
+        ...(project.startUnits ? { startUnits: copy(project.startUnits) } : {}),
+        ...(project.includePaths ? { includePaths: [...project.includePaths] } : {})
     }
 }
 

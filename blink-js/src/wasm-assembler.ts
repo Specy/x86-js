@@ -1,6 +1,6 @@
 import createNasm from './wasm/nasm.mjs'
 import { loadDisassembler, type Disassembler } from './disassembler'
-import { selectX86Source, stageX86Project } from './project'
+import { selectX86Source, stageX86Project, X86_PROJECT_ROOT } from './project'
 import { readResourceBytes, ResourceDownloadError } from './resources'
 import { parseDependencyList, x86TranslationUnitCandidates } from './translation-units'
 import type { X86BuildOptions, X86Project } from './types'
@@ -52,9 +52,18 @@ const DEPENDENCIES_PATH = '/unit.d'
  * `-g -F dwarf` is what makes the source map possible: the debugger reads
  * `.debug_line` out of the linked executable to map an address back to the line
  * it was written on. The working directory `selectX86Source` selects is what
- * lets NASM resolve `%include` itself.
+ * lets NASM resolve `%include` itself, and the Project's include paths follow
+ * these, as `-I`, for every unit.
  */
 const NASM_ARGS = ['-g', '-F', 'dwarf', '-felf64']
+
+/**
+ * NASM's `-I` for each of the Project's include paths: the staged directory, with the trailing
+ * slash NASM joins a written path to.
+ */
+function includeArguments(project: X86Project): string[] {
+    return (project.includePaths ?? []).map((path) => `-I${X86_PROJECT_ROOT}/${path}/`)
+}
 
 const NASM_WASM = new URL('./wasm/nasm.wasm', import.meta.url)
 /** What a download of `nasm.wasm` is called in progress and in errors. */
@@ -201,7 +210,14 @@ async function scanIncludedFiles(
         const source = selectX86Source(module.FS, project, path)
         // `-M` preprocesses and writes the dependency list without assembling, so a fragment that
         // cannot stand on its own costs nothing here; its diagnostics are deliberately discarded.
-        callNasm(module, ['-M', ...NASM_ARGS, source, '-o', OBJECT_PATH])
+        callNasm(module, [
+            '-M',
+            ...NASM_ARGS,
+            ...includeArguments(project),
+            source,
+            '-o',
+            OBJECT_PATH
+        ])
         for (const dependency of parseDependencyList(stdout(), project)) {
             if (dependency !== path) included.add(dependency)
         }
@@ -221,7 +237,8 @@ function withLibraryUnit(project: X86Project, path: string): X86Project {
         files: {
             ...project.files,
             [path]: (project.startUnits?.[path] ?? project.library?.[path])!
-        }
+        },
+        ...(project.includePaths ? { includePaths: project.includePaths } : {})
     }
 }
 
@@ -271,6 +288,7 @@ export const nasmWasmAssembler: WasmAssembler = {
             const dependencies = key === undefined ? [] : ['-MD', DEPENDENCIES_PATH]
             const unitStatus = callNasm(module, [
                 ...NASM_ARGS,
+                ...includeArguments(staged),
                 ...dependencies,
                 source,
                 '-o',

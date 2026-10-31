@@ -26,6 +26,9 @@ static u32 wake_sources;
  * time, so it is only folded into the deadline the host is told. */
 static bool wake_armed;
 static struct timespec wake_at;
+/* Whether the instruction waiting is a read of the terminal, which takes the
+ * input that ends the wait, where a poll of it only looks. */
+static bool terminal_read;
 static u64 saved_mask;
 static int wait_clock = CLOCK_MONOTONIC;
 static int reported_wait_clock = CLOCK_MONOTONIC;
@@ -146,7 +149,7 @@ void GuestWaitMask(struct Machine *m, u64 mask) {
 void GuestWaitFinish(struct Machine *m) {
   if (masked) m->sigmask = saved_mask;
   m->issigsuspend = false;
-  pending = masked = cancelled = wake_armed = false;
+  pending = masked = cancelled = wake_armed = terminal_read = false;
   wake_sources = 0;
   wait_clock = CLOCK_MONOTONIC;
   reported_wait_clock_valid = false;
@@ -160,37 +163,43 @@ void GuestWaitRestoreMask(struct Machine *m) {
   m->issigsuspend = false;
 }
 bool GuestWaitCancelled(void) { return cancelled; }
+static _Noreturn void Halt(struct Machine *m, struct timespec until, u32 wake,
+                           const struct timespec *at, bool read) {
+  deadline = GuestWaitDeadline(until);
+  pending = true;
+  wake_sources = wake;
+  wake_armed = at != 0;
+  if (at) wake_at = *at;
+  terminal_read = read;
+  reported_wait_clock_valid = false;
+  HaltMachine(m, kMachineWaitTrap);
+}
 /* Halts the instruction until `until` on the wait's clock, or until one of
  * the `wake` sources has something for it; it starts over when the host
  * resumes it. */
 _Noreturn void GuestWaitHalt(struct Machine *m, struct timespec until, u32 wake) {
-  deadline = GuestWaitDeadline(until);
-  pending = true;
-  wake_sources = wake;
-  wake_armed = false;
-  reported_wait_clock_valid = false;
-  HaltMachine(m, kMachineWaitTrap);
+  Halt(m, until, wake, 0, false);
 }
 /* As GuestWaitHalt(), and also until `at` on the monotonic clock, when a
  * device the instruction waits on becomes ready. */
 _Noreturn void GuestWaitHaltWake(struct Machine *m, struct timespec until,
                                  u32 wake, struct timespec at) {
-  deadline = GuestWaitDeadline(until);
-  pending = true;
-  wake_sources = wake;
-  wake_armed = true;
-  wake_at = at;
-  reported_wait_clock_valid = false;
-  HaltMachine(m, kMachineWaitTrap);
+  Halt(m, until, wake, &at, false);
+}
+/* Halts a read of the terminal until input comes or until `at` on the
+ * monotonic clock, when VTIME runs out: the host hears that the wait is a
+ * read, which takes what ends it. */
+_Noreturn void GuestWaitHaltTerminalRead(struct Machine *m, struct timespec at) {
+  Halt(m, GetMaxTime(), WAKE_TERMINAL, &at, true);
 }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_wait_cancel(void) { cancelled = true; }
 EMSCRIPTEN_KEEPALIVE
 bool blinkenlib_wait_pending(void) { return pending; }
 EMSCRIPTEN_KEEPALIVE
-bool blinkenlib_wait_input(void) { return wake_sources & WAKE_TERMINAL; }
-EMSCRIPTEN_KEEPALIVE
 u32 blinkenlib_wait_wake_sources(void) { return wake_sources; }
+EMSCRIPTEN_KEEPALIVE
+bool blinkenlib_wait_terminal_read(void) { return terminal_read; }
 EMSCRIPTEN_KEEPALIVE
 int64_t blinkenlib_wait_deadline(void) {
   int64_t timer = GuestTimerDeadline();

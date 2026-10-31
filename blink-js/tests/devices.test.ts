@@ -380,7 +380,7 @@ describe('a wait on a device', () => {
             expect(requests[0]).toMatchObject({
                 deadlineNanoseconds: null,
                 wakeSources: { terminal: false, inputDevices: ['keyboard'] },
-                acceptsInput: false
+                terminalRead: false
             })
             // input for the terminal is not for it
             emulator.provideInput('a\n')
@@ -425,7 +425,7 @@ describe('a wait on a device', () => {
             expect(await emulator.run(1_000_000)).toBe(EmulatorStatus.Waiting)
             const request = emulator.getWaitRequest()!
             expect(request.wakeSources).toEqual({ terminal: true, inputDevices: ['tablet'] })
-            expect(request.acceptsInput).toBe(true)
+            expect(request.terminalRead).toBe(false)
             expect(request.deadlineNanoseconds).not.toBeNull()
             expect(Math.round(request.remainingMilliseconds!)).toBe(1500)
             emulator.cancelWait()

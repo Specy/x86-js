@@ -190,7 +190,7 @@ describe('a read in raw mode', () => {
             expect(requests[0]).toMatchObject({
                 deadlineNanoseconds: 500000000n,
                 wakeSources: { terminal: true, inputDevices: [] },
-                acceptsInput: true
+                terminalRead: true
             })
         } finally {
             emulator.dispose()
@@ -242,6 +242,102 @@ describe('a read in raw mode', () => {
             expect(requests.map((request) => request.deadlineNanoseconds)).toEqual([200000000n])
         } finally {
             emulator.dispose()
+        }
+    })
+})
+
+describe('a wait request', () => {
+    /** Runs to the wait, then ends it: by its deadline when it has one, or by cancelling it. */
+    async function waitsOf(body: readonly string[]): Promise<X86WaitRequest[]> {
+        const requests: X86WaitRequest[] = []
+        const clock = virtualClock()
+        const emulator = await build(body, {
+            ...clock,
+            wait: (request, signal) => {
+                requests.push(request)
+                return clock.wait!(request, signal)
+            }
+        })
+        try {
+            expect(await settle(emulator)).toBe(EmulatorStatus.Terminated)
+            return requests
+        } finally {
+            emulator.dispose()
+        }
+    }
+    const pollTerminal = (milliseconds: number) => [
+        'mov dword [buf2], 0',
+        'mov word [buf2 + 4], 1', // POLLIN
+        `sys 7, buf2, 1, ${milliseconds}`
+    ]
+
+    it('says a raw read that VTIME times is a read of the terminal', async () => {
+        const [request] = await waitsOf([...raw(0, 3), 'sys 0, 0, buf, 8'])
+        expect(request).toMatchObject({
+            wakeSources: { terminal: true, inputDevices: [] },
+            terminalRead: true
+        })
+    })
+
+    it('says so for VTIME between bytes too, which waits once the first byte came', async () => {
+        const emulator = await build([...raw(3, 2), 'sys 0, 0, buf, 8'], virtualClock())
+        try {
+            const requests: X86WaitRequest[] = []
+            emulator.on('waitRequest', (request) => void requests.push(request))
+            emulator.provideInput('a')
+            expect(await settle(emulator)).toBe(EmulatorStatus.Terminated)
+            expect(requests.map((request) => request.terminalRead)).toEqual([true])
+        } finally {
+            emulator.dispose()
+        }
+    })
+
+    it('says a poll or select of the terminal is no read, though the terminal can end it', async () => {
+        const requests = await waitsOf([
+            ...pollTerminal(100),
+            'mov qword [buf2], 1', // fd 0
+            'mov qword [buf2 + 8], 0',
+            'mov qword [buf2 + 16], 100000', // 100 ms
+            'sys 23, 1, buf2, 0, 0, buf2 + 8'
+        ])
+        expect(requests).toHaveLength(2)
+        for (const request of requests)
+            expect(request).toMatchObject({
+                wakeSources: { terminal: true, inputDevices: [] },
+                terminalRead: false
+            })
+    })
+
+    it('says a sleep is no read, and forgets the read before it', async () => {
+        const requests = await waitsOf([
+            ...raw(0, 1),
+            'sys 0, 0, buf, 8',
+            'mov qword [buf2], 0',
+            'mov qword [buf2 + 8], 5000000', // 5 ms
+            'sys 35, buf2, 0',
+            ...pollTerminal(5)
+        ])
+        expect(requests.map((request) => [request.wakeSources.terminal, request.terminalRead])).toEqual(
+            [
+                [true, true],
+                [false, false],
+                [true, false]
+            ]
+        )
+    })
+
+    it('is never made for a read with nothing to time it, which is an input request', async () => {
+        for (const body of [['sys 0, 0, buf, 8'], [...raw(1, 0), 'sys 0, 0, buf, 8']]) {
+            const emulator = await build(body)
+            try {
+                const requests: X86WaitRequest[] = []
+                emulator.on('waitRequest', (request) => void requests.push(request))
+                expect(await emulator.run(1_000_000)).toBe(EmulatorStatus.WaitingForInput)
+                expect(emulator.getWaitRequest()).toBeNull()
+                expect(requests).toEqual([])
+            } finally {
+                emulator.dispose()
+            }
         }
     })
 })

@@ -163,7 +163,9 @@ export type BlinkenlibModule = {
     blinkSoundCut?: (lo: number, hi: number, device: number) => void
     UTF8ToString(pointer: number): string
     /** What can end the pending wait, as `WAKE_*` bits: 1 the terminal, 2 the keyboard, 4 the tablet. */
-    _blinkenlib_wait_wake_sources?(): number
+    _blinkenlib_wait_wake_sources(): number
+    /** Whether the pending wait is a read of the terminal rather than a poll of it. */
+    _blinkenlib_wait_terminal_read(): boolean
     /** The terminal's mode as `TERMINAL_MODE_*` bits (terminal.h). */
     _blinkenlib_terminal_mode?(): number
     _blinkenlib_set_terminal_processing?(input: boolean, output: boolean): void
@@ -211,7 +213,6 @@ export type BlinkenlibModule = {
     _blinkenlib_instructions_executed(): bigint
     _blinkenlib_active_instruction(): bigint
     _blinkenlib_wait_pending(): boolean
-    _blinkenlib_wait_input(): boolean
     _blinkenlib_wait_clock(): number
     _blinkenlib_wait_deadline(): bigint
     _blinkenlib_timer_deadline(): bigint

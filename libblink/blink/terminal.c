@@ -378,10 +378,7 @@ static bool HaltForInput(struct Machine *m, u64 size, bool timed,
     read_wait_tail = TailIndex();
   }
   wait_size = size;
-  if (timed) {
-    GuestWaitHaltWake(m, GetMaxTime(), WAKE_TERMINAL,
-                      DeviceTimespec(deadline));
-  }
+  if (timed) GuestWaitHaltTerminalRead(m, DeviceTimespec(deadline));
   HaltMachine(m, kMachineFakeTTYtrap);
 }
 

@@ -128,6 +128,14 @@ export type X86Project = {
     startUnits?: Readonly<Record<string, X86ProjectFile>>
     /** Support archive, searched after all user units. */
     library?: Readonly<Record<string, X86ProjectFile>>
+    /**
+     * Directories of the Project that NASM searches, in this order, for a `%include` or `incbin`
+     * it does not find in the directory of the File it assembles, as `-I` names them: a host that
+     * offers include files of its own, such as a system's headers, puts them among the Files under
+     * one of these. Diagnostics, instructions and Breakpoints name a File found there by its
+     * Project path, as they name every other. The blink-hosted assemblers do not search them.
+     */
+    includePaths?: readonly string[]
 }
 
 export type X86SourceLocation = {
@@ -340,8 +348,13 @@ export type X86WaitRequest = {
     remainingMilliseconds: number | null
     /** What can end the wait besides its deadline. */
     wakeSources: X86WakeSources
-    /** `wakeSources.terminal`, kept until 8.0.0, which removes it. */
-    acceptsInput: boolean
+    /**
+     * Whether the instruction waiting is a read of the terminal, which takes the input that ends
+     * the wait: a raw read that `VTIME` times. False for `poll`, `select`, a sleep and a device's
+     * wait, which input for the terminal can end without taking it. A read with nothing to time it
+     * is an input request instead (`inputRequest`, `WaitingForInput`), with no wait request.
+     */
+    terminalRead: boolean
     instructionSerial: string
 }
 /** Synchronous sources are selected before initialize/start, including loader AT_RANDOM. */
