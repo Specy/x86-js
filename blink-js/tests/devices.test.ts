@@ -17,10 +17,12 @@ const ENXIO = -6n
 const ENODEV = -19n
 const EINVAL = -22n
 const ENOTTY = -25n
+const ESPIPE = -29n
 
 const O_WRONLY = 1
 const O_RDWR = 2
 const O_NONBLOCK = 0x800
+const O_CREAT = 0x40
 const F_GETFL = 3
 const F_SETFL = 4
 
@@ -586,5 +588,101 @@ describe('a blocking write to a device that keeps time', () => {
         } finally {
             emulator.dispose()
         }
+    })
+})
+
+describe('a device without a file position', () => {
+    // Linux opens evdev and the raw MIDI port with stream_open(), OSS's dsp and mixer and the
+    // console's tty with nonseekable_open(), which take lseek, pread and pwrite away: ESPIPE,
+    // before a read that would wait waits. /dev/fb0 alone keeps its position.
+    it('answers ESPIPE to lseek and to a read or write at an offset, without waiting', async () => {
+        const run = await probe(
+            [
+                // the vector the vectored calls take: buf, 24 bytes
+                'mov qword [buf2], buf',
+                'mov qword [buf2 + 8], 24',
+                `sys 2, kbd, 0`, // blocking: a plain read would wait for a key
+                'mov r12, rax',
+                'sys 17, r12, buf, 24, 0', // pread64
+                'save',
+                'sys 295, r12, buf2, 1, 0', // preadv
+                'save',
+                'sys 327, r12, buf2, 1, 0, 0, 0', // preadv2 at an offset
+                'save',
+                'sys 17, r12, buf, 24, -1', // a negative offset is EINVAL first
+                'save',
+                'sys 8, r12, 0, 1', // lseek
+                'save',
+                `sys 2, kbd, ${O_RDWR}`,
+                'mov r13, rax',
+                'sys 18, r13, buf, 24, 0', // pwrite64
+                'save',
+                'sys 296, r13, buf2, 1, 0', // pwritev
+                'save',
+                `sys 2, dsp, ${O_WRONLY}`,
+                'mov r14, rax',
+                'sys 18, r14, buf, 64, 0',
+                'save',
+                'sys 328, r14, buf2, 1, 0, 0, 0', // pwritev2 at an offset
+                'save',
+                'sys 8, r14, 0, 0',
+                'save',
+                `sys 2, midi, ${O_RDWR}`,
+                'mov r15, rax',
+                'sys 17, r15, buf, 1, 0',
+                'save',
+                'sys 295, r15, buf2, 1, 0',
+                'save',
+                'sys 18, r15, buf, 3, 0',
+                'save',
+                `sys 2, mixer, ${O_RDWR}`,
+                'mov rbx, rax',
+                'sys 17, rbx, buf, 4, 0',
+                'save',
+                'sys 8, rbx, 0, 0',
+                'save',
+                `sys 2, tty0, ${O_RDWR}`,
+                'mov rbp, rax',
+                'sys 17, rbp, buf, 1, 0',
+                'save',
+                'sys 295, rbp, buf2, 1, 0',
+                'save',
+                'sys 18, rbp, buf, 1, 0',
+                'save',
+                'sys 8, rbp, 0, 0',
+                'save',
+                // the framebuffer reads at its offset
+                `sys 2, fb0, ${O_RDWR}`,
+                'mov r14, rax',
+                'sys 17, r14, buf, 16, 0',
+                'save',
+                // sendfile from a device: ESPIPE at an offset, else EINVAL (no splice_read)
+                'mov qword [buf2 + 64], 0',
+                'sys 40, 1, r12, buf2 + 64, 24',
+                'save',
+                'sys 40, 1, r12, 0, 24',
+                'save',
+                'sys 40, 1, r14, buf2 + 64, 16',
+                'save',
+                // nor does a device but the console take one (no splice_write)
+                `sys 2, file, ${O_RDWR | O_CREAT}, 0o644`,
+                'mov r15, rax',
+                'sys 1, r15, buf, 16',
+                'sys 40, r14, r15, buf2 + 64, 16',
+                'save'
+            ],
+            virtualClock()
+        )
+        expect(run.results).toEqual([
+            ...[ESPIPE, ESPIPE, ESPIPE, EINVAL, ESPIPE], // the keyboard, read
+            ...[ESPIPE, ESPIPE], // and written
+            ...[ESPIPE, ESPIPE, ESPIPE], // /dev/dsp: nothing played
+            ...[ESPIPE, ESPIPE, ESPIPE], // the raw MIDI port
+            ...[ESPIPE, ESPIPE], // /dev/mixer
+            ...[ESPIPE, ESPIPE, ESPIPE, ESPIPE], // /dev/tty0
+            16n,
+            ...[ESPIPE, EINVAL, EINVAL],
+            EINVAL
+        ])
     })
 })

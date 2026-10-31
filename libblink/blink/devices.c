@@ -478,11 +478,21 @@ u32 GetFdWakeSources(const struct Fd *fd, int events) {
 }
 
 /* When a device that keeps time becomes ready for `events`, in Program time,
- * or -1 when nothing but an event from outside can make it ready. */
+ * or -1 when nothing but an event from outside can make it ready: a sound
+ * device with room to write, or the PC Speaker device's reader when
+ * KDMKTONE's timer may complete its packet (EvdevReadyDeadline()). */
 i64 GetFdReadyDeadline(const struct Fd *fd, int events) {
+  i64 at = -1, sound;
   struct DeviceFile *df = fd->device;
-  if (!df || !(events & POLLOUT)) return -1;
-  return SoundReadyDeadline(df, events);
+  if (!df) return -1;
+  if ((events & POLLIN) && df->node->kind == DEVICE_INPUT) {
+    at = EvdevReadyDeadline(df);
+  }
+  if ((events & POLLOUT) && (sound = SoundReadyDeadline(df, events)) >= 0 &&
+      (at < 0 || sound < at)) {
+    at = sound;
+  }
+  return at;
 }
 
 /* Halts a blocking read a device has nothing for, before the read sets
@@ -491,6 +501,7 @@ i64 GetFdReadyDeadline(const struct Fd *fd, int events) {
  * 0 for a read that goes on to the device's readv(). */
 int WaitForDeviceRead(struct Machine *m, int fildes, u64 size, int oflags) {
   u32 wake;
+  i64 ready = -1;
   struct Fd *fd;
   struct DeviceFile *df;
   LOCK(&m->system->fds.lock);
@@ -503,6 +514,8 @@ int WaitForDeviceRead(struct Machine *m, int fildes, u64 size, int oflags) {
       // evdev refuses a buffer that cannot hold one event, waiting or not
       if (size < INPUT_EVENT_SIZE) return einval();
       if (!EvdevReadWaits(df)) return 0;
+      // once the reader is settled: a KDMKTONE timer still to come
+      ready = EvdevReadyDeadline(df);
       break;
     case DEVICE_MIDI:
     case DEVICE_CONSOLE:
@@ -512,6 +525,9 @@ int WaitForDeviceRead(struct Machine *m, int fildes, u64 size, int oflags) {
   }
   if (oflags & O_NONBLOCK) return 0;
   if (GuestWaitInterruptedRestartable(m)) return eintr();
+  if (ready >= 0) {
+    GuestWaitHaltWake(m, GetMaxTime(), wake, DeviceTimespec(ready));
+  }
   GuestWaitHalt(m, GetMaxTime(), wake);
 }
 
@@ -554,6 +570,37 @@ bool IsPacedDevice(struct Machine *m, int fildes) {
   return paced;
 }
 
+/* What kind of device `fildes` is (DEVICE_*), or 0 for anything else. */
+int GetDeviceKind(struct Machine *m, int fildes) {
+  int kind;
+  struct Fd *fd;
+  LOCK(&m->system->fds.lock);
+  kind = (fd = GetFd(&m->system->fds, fildes)) && fd->device
+             ? fd->device->node->kind
+             : 0;
+  UNLOCK(&m->system->fds.lock);
+  return kind;
+}
+
+/* Whether `fd` is a device without a file position: every one but the
+ * framebuffer. Linux opens them with stream_open() (evdev, the raw MIDI
+ * port) or nonseekable_open() (OSS's dsp and mixer, the console's tty), which
+ * take lseek(), pread() and pwrite() away from the file: ESPIPE, before the
+ * call looks at anything else of the file or waits. */
+bool IsDeviceFdUnseekable(const struct Fd *fd) {
+  return fd->device && fd->device->node->kind != DEVICE_FRAMEBUFFER;
+}
+
+bool IsUnseekableDeviceFildes(struct Machine *m, int fildes) {
+  bool unseekable;
+  struct Fd *fd;
+  LOCK(&m->system->fds.lock);
+  unseekable =
+      (fd = GetFd(&m->system->fds, fildes)) && IsDeviceFdUnseekable(fd);
+  UNLOCK(&m->system->fds.lock);
+  return unseekable;
+}
+
 /* Forgets the progress of a blocking write that instruction `identity` made,
  * which Undo of that instruction takes back. */
 void DeviceForgetProgress(u64 identity) {
@@ -585,11 +632,26 @@ i64 WriteDevice(struct Machine *m, int fildes,
   return SoundWrite(m, fildes, segments, count, oflags);
 }
 
-/* WriteDevice() for a writev()'s vectors. */
+/* How many bytes `segments` hold in all, no more than one call moves on
+ * Linux (MAX_RW_COUNT), so the sum never wraps; the system calls cut them to
+ * that already. */
+u64 GuestSegmentsSize(const struct GuestSegment *segments, u32 count) {
+  u32 i;
+  u64 size;
+  for (size = i = 0; i < count; ++i) {
+    size += MIN(segments[i].len, MAX_RW_COUNT_LINUX - size);
+  }
+  return size;
+}
+
+/* WriteDevice() for a writev()'s vectors. Linux takes at most MAX_RW_COUNT
+ * bytes in one call, the vectors past that cut short (__import_iovec()), so
+ * their total never overflows. */
 i64 WriteDeviceGuestIovs(struct Machine *m, int fildes, i64 iovaddr, u32 iovlen,
                          int oflags) {
   u32 i;
   i64 rc;
+  u64 len, total;
   struct GuestSegment *segments;
   const struct iovec_linux *iovs;
   if (!iovlen) return 0;
@@ -600,11 +662,15 @@ i64 WriteDeviceGuestIovs(struct Machine *m, int fildes, i64 iovaddr, u32 iovlen,
   if (!(segments = (struct GuestSegment *)malloc(iovlen * sizeof(*segments)))) {
     return enomem();
   }
-  for (i = 0; i < iovlen; ++i) {
+  for (total = i = 0; i < iovlen; ++i) {
+    len = Read64(iovs[i].len);
+    if (len > MAX_RW_COUNT_LINUX - total) len = MAX_RW_COUNT_LINUX - total;
     segments[i].addr = Read64(iovs[i].base);
-    segments[i].len = Read64(iovs[i].len);
+    segments[i].len = len;
+    total += len;
   }
-  // the system call frees it, or the run loop if the write halts to wait
+  // the system call frees it, or the run loop if the write halts to wait;
+  // AddToFreeList() frees it itself when it fails
   if (!AddToFreeList(m, segments)) return enomem();
   rc = WriteDevice(m, fildes, segments, iovlen, oflags);
   return rc;

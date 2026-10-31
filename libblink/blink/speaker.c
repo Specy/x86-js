@@ -127,6 +127,10 @@ void SpeakerSettle(void) {
   Expire(SoundNow());
 }
 
+i64 SpeakerTimerDeadline(void) {
+  return tone.timer && !Expired(SoundNow()) ? tone.stop : -1;
+}
+
 int SpeakerInputEvent(struct Machine *m, u16 type, u16 code, i32 value) {
   i64 now;
   // the input core passes the device only the sound codes it has

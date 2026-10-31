@@ -412,6 +412,29 @@ describe('/dev/dsp', () => {
         expect(results).toEqual([0n, 16000n, 4096n, 0n, 4096n, EAGAIN, 10n, 1n, 64000000n])
     })
 
+    it("takes no more than one call moves from a writev's vectors, whatever they add up to", async () => {
+        // three vectors of 2 GiB - 1 each: Linux cuts them at MAX_RW_COUNT, and a non-blocking
+        // write queues what fits of that
+        const vectors = [0, 16, 32].flatMap((at) => [
+            `mov qword [buf2 + ${at}], buf`,
+            `mov qword [buf2 + ${at + 8}], 0x7fffffff`
+        ])
+        const { results } = await probe([
+            ...openDsp(O_WRONLY | O_NONBLOCK),
+            ...intIoctl('r12', SNDCTL_DSP_SPEED, 16000),
+            `mov dword [buf], ${0x4000a}`,
+            `sys 16, r12, ${hex(SNDCTL_DSP_SETFRAGMENT)}, buf`,
+            ...vectors,
+            'sys 20, r12, buf2, 3',
+            'save',
+            `sys 2, midi, ${O_WRONLY | O_NONBLOCK}`,
+            'mov r13, rax',
+            'sys 20, r13, buf2, 3',
+            'save'
+        ])
+        expect(results).toEqual([0n, 16000n, 4096n, 4096n])
+    })
+
     it('hands the host stereo floats, whatever the format and the channels', async () => {
         const { heard } = await probe([
             // S16_LE, four channels: the first two are kept, as the route plugin keeps them

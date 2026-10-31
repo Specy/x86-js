@@ -1325,6 +1325,18 @@ bool EvdevReadWaits(struct DeviceFile *df) {
   return c && !c->revoked && !c->readable;
 }
 
+/* When a reader with no packet to read may get one without an event from
+ * outside, in Program time, or -1: a reader of the PC Speaker device, when
+ * KDMKTONE's timer will inject the silence that can complete its packet, as
+ * kd_nosound() does on Linux. The wait ends then and the read or poll asks
+ * again; if the silence did not complete the packet, it waits on. */
+i64 EvdevReadyDeadline(struct DeviceFile *df) {
+  struct EvdevClient *c = ClientOfFile(df);
+  if (!c || c->revoked || c->readable) return -1;
+  if (DeviceIndex(c->device) != INPUT_SPEAKER) return -1;
+  return SpeakerTimerDeadline();
+}
+
 static size_t IovsSize(const struct iovec *iov, int iovcnt) {
   int i;
   size_t size;

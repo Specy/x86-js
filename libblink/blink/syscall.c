@@ -2734,9 +2734,10 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
   if ((oflags & O_ACCMODE) == O_RDONLY) return ebadf();
-  // a device whose buffer drains in Program time queues and waits by itself
+  // a device whose buffer drains in Program time queues and waits by itself,
+  // at most MAX_RW_COUNT bytes in one call, as vfs_write() takes
   if (IsPacedDevice(m, fildes)) {
-    struct GuestSegment segment = {addr, size};
+    struct GuestSegment segment = {addr, MIN(size, MAX_RW_COUNT_LINUX)};
     return WriteDevice(m, fildes, &segment, 1, oflags);
   }
   if (size) {
@@ -2782,10 +2783,12 @@ static i64 SysPread(struct Machine *m, i32 fildes, i64 addr, u64 size,
   struct Iovs iv;
   struct ReadJournal journal;
   if (size > NUMERIC_MAX(size_t)) return eoverflow();
-  // a terminal has no position to read at
+  if ((i64)offset < 0) return einval();
+  // a terminal has no position to read at, nor has any device but /dev/fb0
   if ((terminal = IsTerminalFildes(m, fildes)) == -1) return -1;
   if (IsBrowserPipe(fildes)) return espipe();
   if (terminal) return espipe();
+  if (IsUnseekableDeviceFildes(m, fildes)) return espipe();
   if (CheckFdAccess(m, fildes, false, EBADF) == -1) return -1;
   if (size) {
     InitIovs(&iv);
@@ -2810,9 +2813,11 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
   int terminal;
   struct Iovs iv;
   if (size > NUMERIC_MAX(size_t)) return eoverflow();
+  if ((i64)offset < 0) return einval();
   if ((terminal = IsTerminalFildes(m, fildes)) == -1) return -1;
   if (IsBrowserPipe(fildes)) return espipe();
   if (terminal) return espipe();
+  if (IsUnseekableDeviceFildes(m, fildes)) return espipe();
   if (CheckFdAccess(m, fildes, true, EBADF) == -1) return -1;
   if (size) {
     InitIovs(&iv);
@@ -2873,7 +2878,7 @@ static i64 Preadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                   i64 offset) {
   i64 rc, size;
   int oflags;
-  bool terminal;
+  bool terminal, unseekable;
   struct Fd *fd;
   struct Iovs iv;
   struct ReadJournal journal;
@@ -2887,15 +2892,20 @@ static i64 Preadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
     unassert(readv_impl = fd->cb->readv);
     oflags = DeviceFileFlags(fd, BrowserPipeFlags(fildes, fd->oflags));
     terminal = IsTerminalFd(fd);
+    unseekable = IsDeviceFdUnseekable(fd);
   } else {
     readv_impl = 0;
     oflags = 0;
     terminal = false;
+    unseekable = false;
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
-  // a terminal has no position to read at
-  if ((terminal || IsBrowserPipe(fildes)) && offset != -1) return espipe();
+  // a terminal has no position to read at, nor has any device but /dev/fb0:
+  // ESPIPE before a device's read would wait
+  if ((terminal || unseekable || IsBrowserPipe(fildes)) && offset != -1) {
+    return espipe();
+  }
   if ((oflags & O_ACCMODE) == O_WRONLY) return ebadf();
   // nothing to read reads nothing, without waiting for the terminal
   if ((size = GetGuestIovsSize(m, iovaddr, iovlen)) <= 0) return size;
@@ -2932,7 +2942,7 @@ static i64 Pwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                    i64 offset, i32 flags) {
   i64 rc;
   int oflags;
-  bool terminal;
+  bool terminal, unseekable;
   off_t at, end;
   struct stat st;
   struct Fd *fd;
@@ -2947,14 +2957,17 @@ static i64 Pwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
     unassert(writev_impl = fd->cb->writev);
     oflags = DeviceFileFlags(fd, BrowserPipeFlags(fildes, fd->oflags));
     terminal = IsTerminalFd(fd);
+    unseekable = IsDeviceFdUnseekable(fd);
   } else {
     writev_impl = 0;
     oflags = 0;
     terminal = false;
+    unseekable = false;
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
-  if (IsBrowserPipe(fildes) && offset != -1) return espipe();
+  // a pipe has no position, nor has any device but /dev/fb0
+  if ((unseekable || IsBrowserPipe(fildes)) && offset != -1) return espipe();
   if (terminal) {
     // a terminal has no position: an offset is ESPIPE, and RWF_APPEND and
     // RWF_NOAPPEND change nothing
@@ -3112,9 +3125,20 @@ static i64 SysSendfile(struct Machine *m, i32 out_fd, i32 in_fd, i64 offsetaddr,
   if (CheckFdAccess(m, out_fd, true, EBADF) == -1) return -1;
   if (CheckFdAccess(m, in_fd, false, EBADF) == -1) return -1;
   // linux splices only from a regular file or a block device, and a
-  // terminal has no position to start at
-  if (IsTerminalFildes(m, in_fd) == 1 || IsBrowserPipe(in_fd)) {
-    return offsetaddr ? espipe() : einval();
+  // terminal has no position to start at; nor has any device but /dev/fb0,
+  // and none of them splices (no splice_read() in fbdev, evdev, OSS or raw
+  // MIDI; the console's tty would wait for keys VT1 never gets)
+  if (IsTerminalFildes(m, in_fd) == 1 || IsBrowserPipe(in_fd) ||
+      GetDeviceKind(m, in_fd)) {
+    return offsetaddr && GetDeviceKind(m, in_fd) != DEVICE_FRAMEBUFFER
+               ? espipe()
+               : einval();
+  }
+  // nor does any device but the console's tty take a splice (no
+  // splice_write())
+  if (GetDeviceKind(m, out_fd) &&
+      GetDeviceKind(m, out_fd) != DEVICE_CONSOLE) {
+    return einval();
   }
   // the output goes through the descriptor's callbacks, so that the
   // terminal gets it as writes

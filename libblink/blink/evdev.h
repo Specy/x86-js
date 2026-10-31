@@ -22,6 +22,7 @@
 int OpenEvdev(struct DeviceFile *);
 void ReleaseEvdev(struct DeviceFile *);
 bool EvdevReadWaits(struct DeviceFile *);
+i64 EvdevReadyDeadline(struct DeviceFile *);
 ssize_t ReadEvdev(int, const struct iovec *, int);
 ssize_t WriteEvdev(int, const struct iovec *, int);
 int PollEvdev(struct pollfd *, nfds_t, int);

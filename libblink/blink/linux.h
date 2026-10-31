@@ -728,6 +728,8 @@
 #define SOCK_RAW_LINUX    3
 
 #define IOV_MAX_LINUX 1024
+// the most one read or write moves: INT_MAX rounded down to a page
+#define MAX_RW_COUNT_LINUX 0x7ffff000
 #define NGROUPS_MAX_LINUX 65536
 
 #define RWF_HIPRI_LINUX     0x001

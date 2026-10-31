@@ -312,6 +312,52 @@ describe('the PC speaker', () => {
         ])
     })
 
+    it('wakes a reader waiting on the device when KDMKTONE’s timer completes its packet', async () => {
+        // six values, then KDMKTONE's tone the seventh: the silence its timer injects 12 ms on
+        // (three jiffies) is the eighth, which fills the packet, as kd_nosound() does on Linux
+        const tones = (counts: readonly number[]) => [
+            ...counts.map((count) => `sys 16, r12, ${KIOCSOUND}, ${count}`),
+            `sys 16, r12, ${KDMKTONE}, ${(10 << 16) | 2711}`
+        ]
+        const { results } = await probe([
+            `sys 2, speaker, 0`, // blocking
+            'mov r13, rax',
+            `sys 2, tty0, ${O_RDWR}`,
+            'mov r12, rax',
+            ...tones([2711, 0, 2711, 0]),
+            // poll with no timeout of its own
+            'mov dword [buf2], r13d',
+            'mov word [buf2 + 4], 1', // POLLIN
+            'sys 7, buf2, 1, -1',
+            'save',
+            'movzx eax, word [buf2 + 6]',
+            'save',
+            'sys 228, 1, buf2 + 64',
+            'saveq buf2 + 72',
+            'sys 0, r13, buf, 4096',
+            'save',
+            // and a read that waits by itself, the timer's SND_BELL 0 already in the packet
+            ...tones([2711, 0, 0]),
+            'sys 0, r13, buf, 4096',
+            ...saveEvents(9),
+            'sys 228, 1, buf2 + 64',
+            'saveq buf2 + 72'
+        ])
+        expect(results.slice(0, 4)).toEqual([1n, 1n, 12000000n, 216n])
+        expect(eventsOf(results.slice(5, 14))).toEqual([
+            [EV_SND, SND_BELL, 0], // the first timer's
+            [EV_SND, SND_TONE, 440],
+            [EV_SND, SND_TONE, 0],
+            [EV_SND, SND_BELL, 0],
+            [EV_SND, SND_TONE, 0],
+            [EV_SND, SND_BELL, 0],
+            [EV_SND, SND_TONE, 440],
+            [EV_SND, SND_TONE, 0], // the second's
+            [EV_SYN, SYN_REPORT, 0]
+        ])
+        expect([results[4], results[14]]).toEqual([216n, 24000000n])
+    })
+
     it('takes back what KIOCSOUND gave the device’s readers, and the tone', async () => {
         const emulator = await build([
             `sys 2, speaker, ${O_RDWR | O_NONBLOCK}`,

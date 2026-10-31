@@ -5,15 +5,29 @@ import type { BlinkenlibModule } from './wasm-types'
 export const X86_INPUT_DEVICES_FILE = '/proc/bus/input/devices'
 
 /**
- * The stream operations of every device node. Blink answers a program's reads, writes and
- * ioctls of a device itself, by the node's number, and only holds the host descriptor for its
- * number, so these are never asked for anything a program does.
+ * The stream operations of `/dev/fb0`. Blink answers a program's reads, writes and ioctls of a
+ * device itself, by the node's number, and only holds the host descriptor for its number, so
+ * these are never asked for anything a program does.
  */
 const DEVICE_STREAM_OPS = {
     read: () => 0,
     write: (_stream: unknown, _buffer: unknown, _offset: number, length: number) => length
 }
 
+/**
+ * The stream operations of every other device node, which has no file position on Linux
+ * (`stream_open()` or `nonseekable_open()`): a positional read or write that ever reached them
+ * fails with ESPIPE, as Blink answers it before.
+ */
+const UNSEEKABLE_DEVICE_STREAM_OPS = {
+    ...DEVICE_STREAM_OPS,
+    open: (stream: { seekable: boolean }) => {
+        stream.seekable = false
+    }
+}
+
+/** `DEVICE_FRAMEBUFFER` (devices.h): `/dev/fb0`, the one device with a file position. */
+const DEVICE_FRAMEBUFFER = 1
 /** `DEVICE_SERIAL` (devices.h): `/dev/ttyS0` and `/dev/console`, the program's own terminal. */
 const DEVICE_SERIAL = 8
 
@@ -56,9 +70,16 @@ export function installDevices(module: BlinkenlibModule, serialOutput?: SerialHo
     for (let index = 0; index < count; index++) {
         const path = text(module._blinkenlib_device_path!(index))
         const number = module._blinkenlib_device_number!(index)
-        const serial = module._blinkenlib_device_kind?.(index) === DEVICE_SERIAL
+        const kind = module._blinkenlib_device_kind?.(index)
         makeParent(path)
-        fs.registerDevice(number, serial ? serialOps : DEVICE_STREAM_OPS)
+        fs.registerDevice(
+            number,
+            kind === DEVICE_SERIAL
+                ? serialOps
+                : kind === DEVICE_FRAMEBUFFER
+                  ? DEVICE_STREAM_OPS
+                  : UNSEEKABLE_DEVICE_STREAM_OPS
+        )
         try {
             fs.unlink(path)
         } catch {

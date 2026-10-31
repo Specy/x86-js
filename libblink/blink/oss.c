@@ -868,7 +868,6 @@ static _Noreturn void HaltPass(struct Machine *m, struct DspPass *p) {
 
 i64 OssWrite(struct Machine *m, struct DeviceFile *df,
              const struct GuestSegment *segments, u32 count, int oflags) {
-  u32 i;
   i64 rc;
   u64 size, identity;
   struct DspPass p;
@@ -876,7 +875,7 @@ i64 OssWrite(struct Machine *m, struct DeviceFile *df,
     errno = ENXIO;
     return -1;
   }
-  for (size = i = 0; i < count; ++i) size += segments[i].len;
+  size = GuestSegmentsSize(segments, count);
   if (!size) return 0;
   identity = blinkenlib_active_instruction();
   if (df->progress_identity != identity) {

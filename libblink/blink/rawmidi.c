@@ -544,13 +544,12 @@ static i64 FinishWrite(struct DeviceFile *df, i64 rc) {
 i64 MidiWrite(struct Machine *m, struct DeviceFile *df,
               const struct GuestSegment *segments, u32 count, int oflags) {
   u8 chunk[512];
-  u32 i;
   i64 now, until = 0;
   u64 size, identity, rest, take, n, room, need;
   bool append = df->sound->append;
   struct MidiPass p;
   if (!df->sound->output) return ebadf();
-  for (size = i = 0; i < count; ++i) size += segments[i].len;
+  size = GuestSegmentsSize(segments, count);
   if (!size) return 0;
   if (append && size > port.capacity) {
     errno = EIO;

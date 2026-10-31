@@ -16,4 +16,10 @@ int SpeakerInputEvent(struct Machine *m, u16 type, u16 code, i32 value);
  * it before anything it does with the PC Speaker device's readers. */
 void SpeakerSettle(void);
 
+/* When KDMKTONE's timer ends the tone, in Program time, or -1 when no timer
+ * is running: the silence it injects then can complete the PC Speaker
+ * device's packet and wake a reader (kd_nosound()), so a reader waiting on
+ * the device waits until then too. */
+i64 SpeakerTimerDeadline(void);
+
 #endif /* BLINK_SPEAKER_H_ */
