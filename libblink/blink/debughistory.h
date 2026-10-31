@@ -4,8 +4,9 @@
 #include <stdbool.h>
 
 // The kinds of journal record a history packet carries (see debughistory.c),
-// each taken back by the file that wrote it. Room is left for the input
-// devices' reads and flushes (16 to 31) and the devices' settings (32 to 63).
+// each taken back by the file that wrote it, which owns a range of them: the
+// terminal 1 to 15 (here), the input devices 16 to 31 (evdev.h), the
+// framebuffer 32 to 35 (fbdev.h) and the sound devices 36 to 63 (sound.h).
 #define JOURNAL_TERMINAL_READ  1  // what a read of the terminal took
 #define JOURNAL_TERMINAL_FLUSH 2  // the terminal input TCFLSH or TCSETSF discarded
 #define JOURNAL_TERMINAL_MODE  3  // the termios before and after TCSETS

@@ -68,8 +68,13 @@ static const struct DeviceNode kDeviceNodes[] = {
     // OSS numbers a card's raw MIDI port 16 × card + 2: card 1 is snd-virmidi
     {"/dev/midi1", 14, 18, 0660, DEVICE_MIDI, -1},
     // ALSA's minors are dynamic on Debian; these are the static scheme's
-    // (card × 32, + 8 for raw MIDI, + 16 and + 24 for playback and capture)
+    // (card × 32, + 8 for raw MIDI, + 16 and + 24 for playback and capture,
+    // + the device). snd-virmidi makes four devices (midi_devs=4), which
+    // FluidSynth all plays; OSS's /dev/midi1 is device 0.
     {"/dev/snd/midiC1D0", 116, 40, 0660, DEVICE_MIDI, -1},
+    {"/dev/snd/midiC1D1", 116, 41, 0660, DEVICE_MIDI, -1},
+    {"/dev/snd/midiC1D2", 116, 42, 0660, DEVICE_MIDI, -1},
+    {"/dev/snd/midiC1D3", 116, 43, 0660, DEVICE_MIDI, -1},
     // the guest's nodes this design does not cover: opening one answers ENODEV
     {"/dev/dri/card0", 226, 0, 0660, DEVICE_UNSUPPORTED, -1},
     {"/dev/snd/controlC0", 116, 0, 0660, DEVICE_UNSUPPORTED, -1},
@@ -449,14 +454,29 @@ int WaitForDeviceRead(struct Machine *m, int fildes, u64 size, int oflags) {
   GuestWaitHalt(m, GetMaxTime(), wake);
 }
 
-/* Whether the reads and writes of `fildes` journal what they do, so that
- * they are no Undo barrier: an input device's (evdev.c). */
-bool IsJournaledDeviceFildes(struct Machine *m, int fildes) {
-  bool journaled;
+/* Whether a read (or, with `write`, a write) of `fildes` journals what it
+ * does, so that it is no Undo barrier: an input device's reads and writes
+ * (evdev.c), and what a write queues on /dev/dsp or the MIDI port (sound.c).
+ * The framebuffer journals the calls that reach it itself
+ * (FramebufferJournalsSyscall()); every other device's read or write that
+ * moves something stays a barrier. */
+bool IsJournaledDeviceFildes(struct Machine *m, int fildes, bool write) {
+  bool journaled = false;
   struct Fd *fd;
   LOCK(&m->system->fds.lock);
-  journaled = (fd = GetFd(&m->system->fds, fildes)) && fd->device &&
-              fd->device->node->kind == DEVICE_INPUT;
+  if ((fd = GetFd(&m->system->fds, fildes)) && fd->device) {
+    switch (fd->device->node->kind) {
+      case DEVICE_INPUT:
+        journaled = true;
+        break;
+      case DEVICE_DSP:
+      case DEVICE_MIDI:
+        journaled = write;
+        break;
+      default:
+        break;
+    }
+  }
   UNLOCK(&m->system->fds.lock);
   return journaled;
 }
@@ -540,17 +560,6 @@ void DeviceCloseWait(struct Machine *m, int fildes) {
   df = (fd = GetFd(&m->system->fds, fildes)) ? fd->device : 0;
   UNLOCK(&m->system->fds.lock);
   if (df && df->sound) SoundCloseWait(m, df);
-}
-
-/* Whether a write to `fildes` is journaled for Undo by its device rather
- * than an Undo barrier. */
-bool IsJournaledDeviceFd(struct Machine *m, int fildes) {
-  bool journaled;
-  struct Fd *fd;
-  LOCK(&m->system->fds.lock);
-  journaled = (fd = GetFd(&m->system->fds, fildes)) && IsJournaledSoundFd(fd);
-  UNLOCK(&m->system->fds.lock);
-  return journaled;
 }
 
 // ---------------------------------------------------------- exports for the wrapper

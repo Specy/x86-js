@@ -109,7 +109,7 @@ int WaitForDeviceRead(struct Machine *, int, u64, int);
 i64 WriteDevice(struct Machine *, int, const struct GuestSegment *, u32, int);
 i64 WriteDeviceGuestIovs(struct Machine *, int, i64, u32, int);
 bool IsPacedDevice(struct Machine *, int);
-bool IsJournaledDeviceFildes(struct Machine *, int);
+bool IsJournaledDeviceFildes(struct Machine *, int, bool);
 int IoctlString(struct Machine *, const char *, u64, i64);
 void DeviceForgetProgress(u64);
 i64 DeviceNow(void);
@@ -119,6 +119,5 @@ void DeviceDrainAdd(struct DeviceDrain *, i64, u64);
 i64 DeviceDrainDeadline(struct DeviceDrain *, i64, u64);
 struct timespec DeviceTimespec(i64);
 void DeviceCloseWait(struct Machine *, int);
-bool IsJournaledDeviceFd(struct Machine *, int);
 
 #endif /* BLINK_DEVICES_H_ */

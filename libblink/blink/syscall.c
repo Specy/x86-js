@@ -6548,14 +6548,17 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
   switch (call & 0xfff) {
     case 0x000: /* read: advances an open description or takes pipe bytes */
     case 0x013: /* readv */
+      /* the terminal and an input device journal what a read takes */
+      if (result > 0 && !IsTerminalFildes(m, arg1) &&
+          !IsJournaledDeviceFildes(m, arg1, false))
+        DebugHistoryMarkIrreversible();
+      break;
     case 0x001: /* write, except the deferred terminal transcript */
     case 0x014: /* writev */
-      /* an input device journals what it reads and writes (evdev.c), a
-       * sound device what a write queued (sound.c) */
+      /* an input device journals what a write injects, /dev/dsp and the MIDI
+       * port what it queues */
       if (result > 0 && !IsTerminalFildes(m, arg1) &&
-          !IsJournaledDeviceFildes(m, arg1) &&
-          !(((call & 0xfff) == 0x001 || (call & 0xfff) == 0x014) &&
-            IsJournaledDeviceFd(m, arg1)))
+          !IsJournaledDeviceFildes(m, arg1, true))
         DebugHistoryMarkIrreversible();
       break;
     case 0x011: /* pread64: a regular File does not move its offset */
@@ -6563,12 +6566,15 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
       break;
     case 0x147: /* preadv2 with offset -1 advances the open description */
       if (result > 0 && arg4 == -1 && !IsTerminalFildes(m, arg1) &&
-          !IsJournaledDeviceFildes(m, arg1))
+          !IsJournaledDeviceFildes(m, arg1, false))
+        DebugHistoryMarkIrreversible();
+      break;
+    case 0x148: /* pwritev2 with offset -1 is a writev */
+      if (result > 0 && (arg4 != -1 || !IsJournaledDeviceFildes(m, arg1, true)))
         DebugHistoryMarkIrreversible();
       break;
     case 0x012: /* pwrite64 */
     case 0x128: /* pwritev */
-    case 0x148: /* pwritev2 */
     case 0x0D9: /* getdents64: moves the directory cursor */
       if (result > 0) DebugHistoryMarkIrreversible();
       break;

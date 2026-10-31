@@ -191,13 +191,6 @@ void SoundCloseWait(struct Machine *m, struct DeviceFile *df) {
   }
 }
 
-/* Whether what a write to `fd` does is journaled for Undo, rather than
- * making the instruction a barrier. */
-bool IsJournaledSoundFd(const struct Fd *fd) {
-  return fd->device && (fd->device->node->kind == DEVICE_DSP ||
-                        fd->device->node->kind == DEVICE_MIDI);
-}
-
 i64 SoundWrite(struct Machine *m, int fildes,
                const struct GuestSegment *segments, u32 count, int oflags) {
   struct DeviceFile *df;

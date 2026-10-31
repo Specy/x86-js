@@ -1,6 +1,7 @@
-/* The raw MIDI port: snd-virmidi's card 1, device 0, at ALSA's
- * /dev/snd/midiC1D0 and, through OSS emulation, /dev/midi1, with FluidSynth
- * in the guest playing what leaves it (x86-devices.md, "The raw MIDI port").
+/* The raw MIDI port: snd-virmidi's card 1, at ALSA's /dev/snd/midiC1D0 to
+ * midiC1D3, its four devices, and, through OSS emulation, /dev/midi1, which is
+ * device 0, with FluidSynth in the guest playing what leaves them
+ * (x86-devices.md, "The raw MIDI port").
  *
  * Bytes leave at MIDI's 31,250 baud on Program time, ten bits each, behind
  * rawmidi's buffer (a page, 4 KiB, until PARAMS changes it), a documented
@@ -11,10 +12,13 @@
  * the system common messages take their time on the port but are not handed
  * on, since FluidSynth ignores what the encoder makes of them.
  *
- * Every open shares the one output substream, its buffer and its parser.
- * Linux gives an ALSA open without O_APPEND the next of the device's sixteen
- * substreams instead, each with a buffer and running status of its own; OSS
- * opens and O_APPEND opens share, as here.
+ * Every open of every device shares the one output substream, its buffer and
+ * its parser. Linux gives each device sixteen substreams, and an ALSA open
+ * without O_APPEND the next free one, each with a buffer and running status
+ * of its own; only OSS opens and O_APPEND opens of one device share, as here.
+ * Separate substreams, all feeding the one synthesizer, would need their
+ * bytes merged in the order they leave, and Undo's "what was heard" to be
+ * worked out across them, which the single queue here keeps simple.
  *
  * What the synthesizer has been told is kept twice: as of every byte queued,
  * which the messages are handed on from, and as of the bytes that have left,
@@ -698,6 +702,12 @@ static int GetWord(struct Machine *m, i64 addr, i32 *value) {
   return 0;
 }
 
+/* The device of the virtual card a node opens: ALSA's minor is card × 32 + 8
+ * + device, and OSS's /dev/midi1 is device 0 (rawmidi's midi_map). */
+static u32 MidiDevice(const struct DeviceNode *node) {
+  return node->major == 116 ? (node->minor - 8) % 32 : 0;
+}
+
 /* snd_rawmidi_info(), for the virtual card's port. */
 static int Info(struct Machine *m, struct DeviceFile *df, i64 addr) {
   u8 info[268];
@@ -712,7 +722,7 @@ static int Info(struct Machine *m, struct DeviceFile *df, i64 addr) {
     return enodev();
   }
   memset(info, 0, sizeof(info));
-  Write32(info + 0, 0);       // device
+  Write32(info + 0, MidiDevice(df->node));
   Write32(info + 4, 0);       // subdevice
   Write32(info + 8, stream);
   Write32(info + 12, 1);      // card

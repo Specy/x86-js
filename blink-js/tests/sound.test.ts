@@ -78,7 +78,8 @@ const PATHS: Record<string, string> = {
     mixer: '/dev/mixer',
     midi: '/dev/snd/midiC1D0',
     midi1: '/dev/midi1',
-    tty0: '/dev/tty0'
+    tty0: '/dev/tty0',
+    speaker: '/dev/input/event4'
 }
 
 const DATA = [
@@ -695,31 +696,37 @@ describe('the PC speaker', () => {
         expect(heard.cuts).toContainEqual({ after: 50000000n, device: 'speaker' })
     })
 
-    it("takes the pcspkr driver's EV_SND events", async () => {
-        const emulator = await build(['nop'])
-        try {
-            const heard = listen(emulator)
-            emulator.runtime.starti()
-            const event = emulator.module._blinkenlib_speaker_input_event!
-            event(0x12, 2, 440) // SND_TONE
-            event(0x12, 2, 20) // too low: silence
-            event(0x12, 1, 5) // SND_BELL: 1000 Hz
-            event(0x12, 1, 0)
-            event(0x12, 2, 32766)
-            event(0x12, 2, 32767) // too high
-            event(0x01, 2, 440) // not EV_SND
-            event(0x12, 0, 1) // SND_CLICK, which the speaker lacks
-            expect(heard.tone.map(({ hz }) => hz)).toEqual([
-                PIT / 2711,
-                0,
-                PIT / 1193,
-                0,
-                PIT / 36,
-                0
-            ])
-        } finally {
-            emulator.dispose()
-        }
+    it("takes the pcspkr driver's EV_SND events, written to /dev/input/event4", async () => {
+        const events: [number, number, number][] = [
+            [0x12, 2, 440], // SND_TONE
+            [0x12, 2, 20], // too low: silence
+            [0x12, 1, 5], // SND_BELL: 1000 Hz
+            [0x12, 1, 0],
+            [0x12, 2, 32766],
+            [0x12, 2, 32767], // too high
+            [0x01, 2, 440], // not EV_SND, which the speaker lacks
+            [0x12, 0, 1] // SND_CLICK, which the speaker lacks too
+        ]
+        const { results, heard } = await probe([
+            `sys 2, speaker, ${O_WRONLY}`,
+            'mov r12, rax',
+            ...events.flatMap(([type, code, value], index) => [
+                `mov word [buf + ${index * 24 + 16}], ${type}`,
+                `mov word [buf + ${index * 24 + 18}], ${code}`,
+                `mov dword [buf + ${index * 24 + 20}], ${value}`
+            ]),
+            `sys 1, r12, buf, ${events.length * 24}`,
+            'save'
+        ])
+        expect(results).toEqual([BigInt(events.length * 24)])
+        expect(heard.tone.map(({ hz }) => hz)).toEqual([
+            PIT / 2711,
+            0,
+            PIT / 1193,
+            0,
+            PIT / 36,
+            0
+        ])
     })
 })
 

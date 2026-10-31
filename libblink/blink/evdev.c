@@ -17,9 +17,10 @@
  * report, which hid-input turns into MSC_SCAN and the buttons, the axes and
  * the wheel with its hi-res twin (drivers/hid/hid-input.c). The console's
  * keyboard handler sees the keyboard's events and toggles the lock LEDs
- * (drivers/tty/vt/keyboard.c), except while a reader holds EVIOCGRAB. A
- * write goes in as evdev_write() injects it, and an event the PC Speaker's
- * driver takes reaches SpeakerInputEvent().
+ * (drivers/tty/vt/keyboard.c), except while a reader holds EVIOCGRAB, and
+ * sounds the PC Speaker for /dev/tty0's KIOCSOUND and KDMKTONE (kd_mksound(),
+ * EvdevConsoleSound()). A write goes in as evdev_write() injects it, and an
+ * event the PC Speaker's driver takes reaches SpeakerInputEvent() (speaker.c).
  *
  * Each reader's queue holds 4,096 events, where Linux holds 64 for the
  * keyboard; past that, __pass_event()'s rule drops what was unread for a
@@ -53,6 +54,7 @@
 #include "blink/errno.h"
 #include "blink/fds.h"
 #include "blink/macros.h"
+#include "blink/speaker.h"
 #include "blink/thread.h"
 #include "blink/timespec.h"
 
@@ -87,6 +89,8 @@
 #define SW_MAX_LINUX          0x10
 #define LED_MAX_LINUX         0x0f
 #define SND_MAX_LINUX         0x07
+#define SND_BELL_LINUX        0x01
+#define SND_TONE_LINUX        0x02
 #define FF_MAX_LINUX          0x7f
 #define REP_MAX_LINUX         0x01
 #define INPUT_PROP_MAX_LINUX  0x1f
@@ -1247,6 +1251,15 @@ static struct EvdevClient *ClientOf(int fildes) {
   return df ? ClientOfFile(df) : 0;
 }
 
+/* What the console's KDMKTONE timer did by now reaches the PC Speaker before
+ * a reader of it reads, polls, writes or asks (speaker.c keeps the timer
+ * lazily). */
+static void SettleConsole(const struct EvdevClient *c) {
+  if (c && !c->revoked && DeviceIndex(c->device) == INPUT_SPEAKER) {
+    SpeakerSettle();
+  }
+}
+
 /* evdev_open(): a reader of its own, which every event reaches from now on. */
 int OpenEvdev(struct DeviceFile *df) {
   struct EvdevClient *c, **last;
@@ -1278,6 +1291,7 @@ void ReleaseEvdev(struct DeviceFile *df) {
 /* Whether a blocking read of the reader has to wait for a packet. */
 bool EvdevReadWaits(struct DeviceFile *df) {
   struct EvdevClient *c = ClientOfFile(df);
+  SettleConsole(c);
   return c && !c->revoked && !c->readable;
 }
 
@@ -1332,6 +1346,7 @@ ssize_t ReadEvdev(int fildes, const struct iovec *iov, int iovcnt) {
   size = IovsSize(iov, iovcnt);
   if (size && size < INPUT_EVENT_BYTES) return einval();
   if (c->revoked) return enodev();
+  SettleConsole(c);
   if (!c->readable) return eagain();
   n = MIN(size / INPUT_EVENT_BYTES, c->readable);
   CopyToIovs(iov, iovcnt, EventAt(c, 0), (size_t)n * INPUT_EVENT_BYTES);
@@ -1448,6 +1463,7 @@ ssize_t WriteEvdev(int fildes, const struct iovec *iov, int iovcnt) {
   size = MIN(IovsSize(iov, iovcnt), EVDEV_WRITE_MAX);
   if (size && size < INPUT_EVENT_BYTES) return einval();
   if (c->revoked) return enodev();
+  SettleConsole(c);
   now = ProgramNow();
   BeginInject(&before, c->device);
   for (offset = 0; offset + INPUT_EVENT_BYTES <= size;
@@ -1458,6 +1474,30 @@ ssize_t WriteEvdev(int fildes, const struct iovec *iov, int iovcnt) {
   }
   EndInject(c->device, &before, now);
   return size - size % INPUT_EVENT_BYTES;
+}
+
+/* kd_sound_helper(), for the one device with EV_SND the console's keyboard
+ * handler is connected to, the PC Speaker: SND_TONE `hz`, and SND_BELL 0
+ * after it when `hz` is silence, injected through the handler's handle as
+ * Program time `at` has them, so that they reach the speaker's driver
+ * (SpeakerInputEvent()) and the device's readers as on Linux: in the packet
+ * being built, which only a SYN_REPORT or a full buffer passes on. A reader
+ * holding EVIOCGRAB keeps them out; false then. Journaled as a write is. */
+bool EvdevConsoleSound(u32 hz, i64 at) {
+  struct InputDevice *dev;
+  struct InputState before;
+  struct InputTime t;
+  Initialize();
+  dev = devices + INPUT_SPEAKER;
+  if (dev->grab) return false;
+  t = ProgramNow();
+  t.real -= t.mono - at;
+  t.mono = at;
+  BeginInject(&before, dev);
+  InjectEvent(dev, EV_SND_LINUX, SND_TONE_LINUX, hz, t, true);
+  if (!hz) InjectEvent(dev, EV_SND_LINUX, SND_BELL_LINUX, 0, t, true);
+  EndInject(dev, &before, t);
+  return true;
 }
 
 /* evdev_poll(): always writable, readable with a whole packet queued, and
@@ -1473,6 +1513,7 @@ int PollEvdev(struct pollfd *fds, nfds_t nfds, int timeout) {
     } else if (c->revoked) {
       fds[i].revents = POLLHUP | POLLERR;
     } else {
+      SettleConsole(c);
       fds[i].revents = fds[i].events & POLLOUT;
       if (c->readable) fds[i].revents |= fds[i].events & POLLIN;
     }
@@ -1926,6 +1967,7 @@ int IoctlEvdev(struct Machine *m, int fildes, u64 request, i64 addr) {
   const struct InputIdentity *identity;
   if (!(c = ClientOf(fildes))) return ebadf();
   if (c->revoked) return enodev();
+  SettleConsole(c);
   dev = c->device;
   identity = Identity(dev);
   switch (cmd) {
@@ -2166,13 +2208,6 @@ void UndoEvdevJournal(u32 kind, const u8 *p, u32 size) {
     default:
       break;
   }
-}
-
-/* The PC speaker's driver when the sound devices bring none: it takes what
- * pcspkr_event() takes and plays nothing. */
-__attribute__((weak)) int SpeakerInputEvent(struct Machine *m, u16 type,
-                                            u16 code, i32 value) {
-  return type == EV_SND_LINUX ? 0 : -1;
 }
 
 // ------------------------------------------------- exports for the wrapper

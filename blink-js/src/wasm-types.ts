@@ -161,8 +161,6 @@ export type BlinkenlibModule = {
     ) => void
     /** `device` is 0 for every device, 1 `/dev/dsp`, 2 the MIDI port, 3 the PC speaker. */
     blinkSoundCut?: (lo: number, hi: number, device: number) => void
-    /** What one EV_SND event written to the PC Speaker's evdev node does (speaker.c). */
-    _blinkenlib_speaker_input_event?(type: number, code: number, value: number): number
     UTF8ToString(pointer: number): string
     /** What can end the pending wait, as `WAKE_*` bits: 1 the terminal, 2 the keyboard, 4 the tablet. */
     _blinkenlib_wait_wake_sources?(): number

@@ -19,15 +19,6 @@
 #define JOURNAL_EVDEV_MASK   21  // a reader's EVIOCSMASK mask before it changed
 #define JOURNAL_EVDEV_ABS    22  // an axis's absinfo before and after EVIOCSABS
 
-// The PC speaker's driver, Linux's pcspkr_event(): what a write to
-// /dev/input/event4 sounds. evdev.c parses the write as evdev_write() does
-// and calls this where the input core calls the driver: for every EV_SND
-// event of a code the speaker has (SND_BELL, SND_TONE), whether or not it
-// changes anything, and for SYN_CONFIG. The sound devices define it; the
-// default here, weak, takes EV_SND and plays nothing. Returns 0, or -1 for an
-// event the driver refuses, which changes nothing for the program.
-int SpeakerInputEvent(struct Machine *m, u16 type, u16 code, i32 value);
-
 int OpenEvdev(struct DeviceFile *);
 void ReleaseEvdev(struct DeviceFile *);
 bool EvdevReadWaits(struct DeviceFile *);
@@ -36,6 +27,7 @@ ssize_t WriteEvdev(int, const struct iovec *, int);
 int PollEvdev(struct pollfd *, nfds_t, int);
 int IoctlEvdev(struct Machine *, int, u64, i64);
 void ResetInputDevices(void);
+bool EvdevConsoleSound(u32, i64);
 void UndoEvdevJournal(u32, const u8 *, u32);
 
 #endif /* BLINK_EVDEV_H_ */

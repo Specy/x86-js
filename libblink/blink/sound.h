@@ -57,7 +57,6 @@ bool IsSoundDevice(const struct DeviceNode *);
 int SoundOpen(struct DeviceFile *, int);
 void SoundRelease(struct DeviceFile *);
 void SoundCloseWait(struct Machine *, struct DeviceFile *);
-bool IsJournaledSoundFd(const struct Fd *);
 i64 SoundWrite(struct Machine *, int, const struct GuestSegment *, u32, int);
 i64 SoundReadyDeadline(struct DeviceFile *, int);
 void ResetSound(void);

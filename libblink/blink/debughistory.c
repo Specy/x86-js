@@ -157,7 +157,34 @@ void DebugHistoryJournal(u32 kind, const void *data, u32 size) {
   journal_used += 8 + size;
   ++journal_count;
 }
-/* Takes back what a journal record says, by its kind. */
+/* Each owner's kinds stay in its range (debughistory.h), so UndoJournal()
+ * hands every record to the file that wrote it. */
+#define JOURNAL_KIND_IN(kind, first, last) \
+  _Static_assert((kind) >= (first) && (kind) <= (last), #kind " out of range")
+JOURNAL_KIND_IN(JOURNAL_TERMINAL_READ, 1, 15);
+JOURNAL_KIND_IN(JOURNAL_TERMINAL_FLUSH, 1, 15);
+JOURNAL_KIND_IN(JOURNAL_TERMINAL_MODE, 1, 15);
+JOURNAL_KIND_IN(JOURNAL_EVDEV_READ, 16, 31);
+JOURNAL_KIND_IN(JOURNAL_EVDEV_FLUSH, 16, 31);
+JOURNAL_KIND_IN(JOURNAL_EVDEV_CLOCK, 16, 31);
+JOURNAL_KIND_IN(JOURNAL_EVDEV_INJECT, 16, 31);
+JOURNAL_KIND_IN(JOURNAL_EVDEV_GRAB, 16, 31);
+JOURNAL_KIND_IN(JOURNAL_EVDEV_MASK, 16, 31);
+JOURNAL_KIND_IN(JOURNAL_EVDEV_ABS, 16, 31);
+JOURNAL_KIND_IN(JOURNAL_FRAMEBUFFER_STATE, 32, 35);
+JOURNAL_KIND_IN(JOURNAL_FRAMEBUFFER_POSITION, 32, 35);
+JOURNAL_KIND_IN(JOURNAL_FRAMEBUFFER_BYTES, 32, 35);
+JOURNAL_KIND_IN(JOURNAL_DSP_PASS, 36, 47);
+JOURNAL_KIND_IN(JOURNAL_DSP_STATUS, 36, 47);
+JOURNAL_KIND_IN(JOURNAL_MIXER_LEVELS, 36, 47);
+JOURNAL_KIND_IN(JOURNAL_MIDI_WRITE, 48, 55);
+JOURNAL_KIND_IN(JOURNAL_MIDI_PARAMS, 48, 55);
+JOURNAL_KIND_IN(JOURNAL_MIDI_PVERSION, 48, 55);
+JOURNAL_KIND_IN(JOURNAL_TONE, 56, 59);
+JOURNAL_KIND_IN(JOURNAL_CONSOLE_TERMIOS, 56, 59);
+
+/* Takes back what a journal record says, by its kind, by the file that owns
+ * the kind. */
 static void UndoJournal(u32 kind, const u8 *data, u32 size) {
   if (kind < 16) UndoTerminalJournal(kind, data, size);
   else if (kind < 32) UndoEvdevJournal(kind, data, size);

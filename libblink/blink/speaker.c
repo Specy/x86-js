@@ -1,18 +1,22 @@
 /* The PC speaker: Linux's pcspkr input device, which a program sounds by
  * writing EV_SND events to /dev/input/event4, and the virtual console's
  * KIOCSOUND and KDMKTONE on /dev/tty0, which reach the same speaker through
- * the keyboard handler (x86-devices.md, "The PC speaker").
+ * the keyboard handler and the input core, so that the device's readers see
+ * them too (x86-devices.md, "The PC speaker"; evdev.c).
  *
  * The speaker is one tone: channel 2 of the PIT at 1193182 ÷ count Hz, or
  * silence. It follows the Synth's rules under Undo, as a chip with one
  * register: Undo puts the tone back as it was and sounds it again if need
- * be. */
+ * be. KDMKTONE's timer is kept lazily: the end of the tone is on the host's
+ * timeline from the start, and the silence it injects reaches the input
+ * device the next time anything asks (SpeakerSettle()). */
 #include <errno.h>
 #include <string.h>
 
 #include "blink/debughistory.h"
 #include "blink/endian.h"
 #include "blink/errno.h"
+#include "blink/evdev.h"
 #include "blink/linux.h"
 #include "blink/machine.h"
 #include "blink/sound.h"
@@ -30,6 +34,7 @@
 struct Tone {
   u32 count;  // the PIT divisor sounding, 0 for silence
   u8 timer;   // a KDMKTONE that ends the tone at `stop` is pending
+  u8 ending;  // and the host has its end, the silence at `stop`, already
   i64 stop;
 };
 
@@ -37,23 +42,25 @@ static struct Tone tone;
 static struct termios_linux console_termios;
 static bool console_termios_known;
 
+// The console is sounding the speaker through the input core, at `console_at`
+// in Program time, and has journaled the tone already.
+static bool console;
+static i64 console_at;
+
 static double ToneHz(u32 count) {
   return count ? (double)PIT_TICK_RATE / count : 0;
 }
 
-/* kd_nosound(), when KDMKTONE's timer has gone off by `now`. */
-static void Settle(i64 now) {
-  if (tone.timer && now >= tone.stop) {
-    tone.timer = 0;
-    tone.count = 0;
-  }
+static bool Expired(i64 now) {
+  return tone.timer && now >= tone.stop;
 }
 
 static void Journal(void) {
-  u8 record[13];
+  u8 record[14];
   Write32(record, tone.count);
   record[4] = tone.timer;
   Write64(record + 5, tone.stop);
+  record[13] = tone.ending;
   DebugHistoryJournal(JOURNAL_TONE, record, sizeof(record));
 }
 
@@ -69,35 +76,77 @@ static void Sound(u16 code, i32 value, i64 now) {
   SoundEmitTone(now, ToneHz(count));
 }
 
+/* The console's tone through the input core (evdev.c): to the driver, and to
+ * the speaker device's readers. A reader's grab keeps it out. */
+static bool ConsoleSound(u32 hz, i64 at) {
+  bool reached;
+  console = true;
+  console_at = at;
+  reached = EvdevConsoleSound(hz, at);
+  console = false;
+  return reached;
+}
+
+/* kd_nosound(): KDMKTONE's timer went off at `stop`, by `now`, and injects
+ * silence. The host already has the silence when the start reached the
+ * speaker; it gets it now when the start was kept out by a grab. */
+static void Expire(i64 now) {
+  i64 stop;
+  if (!Expired(now)) return;
+  Journal();
+  stop = tone.stop;
+  if (tone.ending) tone.count = 0;
+  tone.timer = 0;
+  tone.ending = 0;
+  ConsoleSound(0, stop);
+}
+
+/* What KDMKTONE's timer did by now reaches the speaker and its input device:
+ * evdev.c asks before anything it does with the speaker's readers. */
+void SpeakerSettle(void) {
+  Expire(SoundNow());
+}
+
 int SpeakerInputEvent(struct Machine *m, u16 type, u16 code, i32 value) {
   i64 now;
   // the input core passes the device only the sound codes it has
   if (type != EV_SND || (code != SND_BELL && code != SND_TONE)) return 0;
-  now = SoundNow();
-  Settle(now);
-  Journal();
+  if (console) {
+    now = console_at;
+  } else {
+    // a write to /dev/input/event4, which settled the timer first
+    now = SoundNow();
+    Journal();
+    if (Expired(now)) {
+      if (tone.ending) tone.count = 0;
+      tone.timer = 0;
+      tone.ending = 0;
+    }
+  }
   Sound(code, value, now);
   return 0;
 }
 
 /* kd_mksound(): any call cancels a KDMKTONE still running, then the tone
- * reaches the speaker as SND_TONE, and silence as SND_BELL 0 too; a duration
- * ends it that many jiffies later. */
+ * reaches the speaker as SND_TONE, and silence as SND_BELL 0 too, through the
+ * input core; a duration ends it that many jiffies later. */
 static void MakeSound(u32 hz, u32 ticks) {
+  bool reached;
   i64 now = SoundNow();
-  Settle(now);
+  Expire(now);
   Journal();
   if (tone.timer) {
     // the end it scheduled is no longer coming
+    if (tone.ending) SoundEmitCut(now, SOUND_SPEAKER);
     tone.timer = 0;
-    SoundEmitCut(now, SOUND_SPEAKER);
+    tone.ending = 0;
   }
-  Sound(SND_TONE, hz, now);
-  if (!hz) Sound(SND_BELL, 0, now);
+  reached = ConsoleSound(hz, now);
   if (hz && ticks) {
     tone.timer = 1;
     tone.stop = now + (i64)ticks * JIFFY_NS;
-    SoundEmitTone(tone.stop, 0);
+    // the end, when the start sounded; one kept out comes when it expires
+    if ((tone.ending = reached)) SoundEmitTone(tone.stop, 0);
   }
 }
 
@@ -200,11 +249,15 @@ void UndoSpeakerJournal(u32 kind, const u8 *data, u32 size) {
       tone.count = Read32(data);
       tone.timer = data[4];
       tone.stop = Read64(data + 5);
-      Settle(now);
-      // the tone as it was, and its end if one is still coming
+      tone.ending = data[13];
+      // the tone as it was, and its end if one is still coming; a KDMKTONE
+      // that ran out meanwhile is silent, and its timer reaches the input
+      // device the next time anything asks
       SoundEmitCut(now, SOUND_SPEAKER);
-      SoundEmitTone(now, ToneHz(tone.count));
-      if (tone.timer) SoundEmitTone(tone.stop, 0);
+      SoundEmitTone(now, Expired(now) && tone.ending ? 0 : ToneHz(tone.count));
+      if (tone.timer && tone.ending && !Expired(now)) {
+        SoundEmitTone(tone.stop, 0);
+      }
       break;
     case JOURNAL_CONSOLE_TERMIOS:
       memcpy(ConsoleTermios(), data, sizeof(struct termios_linux));
@@ -213,13 +266,3 @@ void UndoSpeakerJournal(u32 kind, const u8 *data, u32 size) {
       break;
   }
 }
-
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-/* What a write of one input event to the PC Speaker's node does to the
- * speaker, for a host without the evdev device's writes to reach it. */
-EMSCRIPTEN_KEEPALIVE
-int blinkenlib_speaker_input_event(u32 type, u32 code, i32 value) {
-  return SpeakerInputEvent(g_machine, type, code, value);
-}
-#endif

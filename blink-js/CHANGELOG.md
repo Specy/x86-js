@@ -2,39 +2,38 @@
 
 ## Unreleased
 
-- The groundwork for the x86 devices (`docs/design/x86-devices-plan.md`, M1).
-  The machine has the QEMU guest's device nodes, `/dev/fb0`, `/dev/tty0`,
-  `/dev/input/event0` to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and
-  `/dev/snd/midiC1D0`, udev's links to the input devices and
-  `/proc/bus/input/devices`, made from one table in the Core and put back at
-  every start. `open()` finds a device by its node's number; the nodes the
+- The machine has the QEMU guest's devices (`docs/design/x86-devices-plan.md`,
+  M1 to M4). Its device nodes, `/dev/fb0`, `/dev/tty0`, `/dev/input/event0`
+  to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and `/dev/snd/midiC1D0`
+  to `midiC1D3`, udev's links to the input devices and
+  `/proc/bus/input/devices` are made from one table in the Core and put back
+  at every start. `open()` finds a device by its node's number; the nodes the
   machine does not cover open with ENODEV and raise the new `unsupportedDevice`
   event. What `open()` makes is an open file description that `dup()` shares
   with its `O_NONBLOCK`. An ioctl nothing knows answers ENOTTY instead of
-  EINVAL. The input devices answer their identity ioctls and wait for events
-  that never come yet; the raw MIDI port paces writes at 31,250 baud on Program
-  time, a blocking write going on from what it queued each time Blink starts it
-  over. See the README's "Devices".
-- `/dev/fb0` is the framebuffer (`docs/design/x86-devices-plan.md`, M2), as
-  Linux's DRM fbdev emulation answers on the QEMU guest's bochs display:
-  XRGB8888 over two pages of the display mode `setDisplayMode()` sets for the
-  next start (320×240 until then), the fixed and variable screen information,
-  `FBIOPUT_VSCREENINFO` answering as `drm_fb_helper_check_var()` does, panning,
-  `FBIO_WAITFORVSYNC` on the 1/60 s boundaries of Program time and
-  `FBIOBLANK`. `mmap` points the guest's pages into one buffer that `munmap`
-  never frees, and `read`, `write`, `pread64`, `pwrite64` and `lseek` reach the
-  same bytes. Stores through a mapping, what a `write` replaces, file offsets
-  and the device's settings are undoable. `getFramebuffer()` gives the page the
-  scanout shows as a view of the wasm heap, and the `framebufferPresent` event
-  marks pans, syncs, blanks and Undo moving the scanout. See the README's "The
-  framebuffer".
-- The input devices (`docs/design/x86-devices-plan.md`, M3): `/dev/input/event0`
-  to `event4` answer evdev as Linux 6.12 does for the guest's Power Button, AT
-  keyboard, PS/2 mouse, QEMU USB tablet and PC Speaker, with each one's
-  identity and capabilities, readers' queues of 4,096 events with evdev's
-  `SYN_DROPPED`, the state ioctls (`EVIOCGKEY`, `EVIOCGLED`, `EVIOCGABS` and
-  the rest), `EVIOCGREP` and `EVIOCSREP`, `EVIOCSCLOCKID`, `EVIOCGRAB`, masks,
-  keymaps and writes; an ioctl evdev does not know answers EINVAL. The new
+  EINVAL, but where the driver answers otherwise: evdev and `/dev/dsp` EINVAL,
+  `/dev/mixer` ENXIO. A blocking write to a device that paces it goes on from
+  what it queued each time Blink starts it over. Every start finds every
+  device as the machine boots it, whatever the last run left. See the README's
+  "Devices".
+- `/dev/fb0` is the framebuffer (M2), as Linux's DRM fbdev emulation answers on
+  the QEMU guest's bochs display: XRGB8888 over two pages of the display mode
+  `setDisplayMode()` sets for the next start (320×240 until then), the fixed
+  and variable screen information, `FBIOPUT_VSCREENINFO` answering as
+  `drm_fb_helper_check_var()` does, panning, `FBIO_WAITFORVSYNC` on the 1/60 s
+  boundaries of Program time and `FBIOBLANK`. `mmap` points the guest's pages
+  into one buffer that `munmap` never frees, and `read`, `write`, `pread64`,
+  `pwrite64` and `lseek` reach the same bytes. Stores through a mapping, what a
+  `write` replaces, file offsets and the device's settings are undoable.
+  `getFramebuffer()` gives the page the scanout shows as a view of the wasm
+  heap, and the `framebufferPresent` event marks pans, syncs, blanks and Undo
+  moving the scanout. See the README's "The framebuffer".
+- The input devices (M3): `/dev/input/event0` to `event4` answer evdev as
+  Linux 6.12 does for the guest's Power Button, AT keyboard, PS/2 mouse, QEMU
+  USB tablet and PC Speaker, with each one's identity and capabilities,
+  readers' queues of 4,096 events with evdev's `SYN_DROPPED`, the state
+  ioctls (`EVIOCGKEY`, `EVIOCGLED`, `EVIOCGABS` and the rest), `EVIOCGREP` and
+  `EVIOCSREP`, `EVIOCSCLOCKID`, `EVIOCGRAB`, masks, keymaps and writes. The new
   `sendInputReport(device, events)` delivers a host key or pointer event to
   the keyboard or the tablet as the guest's hardware and drivers make it:
   `MSC_SCAN`, the lock keys' LEDs, `REL_WHEEL_HI_RES` and `SYN_REPORT`,
@@ -43,24 +42,24 @@
   (ADR 0069). `/proc/bus/input/devices` is generated from the same table; the
   Power Button now lists `KEY_WAKEUP`, as Linux 6.12's has it. See the
   README's "Input devices".
-- The sound devices (`docs/design/x86-devices-plan.md`, M4). `/dev/dsp` and
-  `/dev/mixer` behave as Linux 6.12's snd-pcm-oss and snd-mixer-oss on the
-  guest's HDA card (QEMU's `hda-duplex`): 8000 Hz U8 mono at open, the fixed
-  `GETFMTS` mask, settings written back, the buffer and fragments the kernel
-  computes through its plugins, `SETFRAGMENT` once, whole-fragment transfers,
-  blocking and non-blocking writes paced on Program time, `GETOSPACE`,
-  `GETODELAY`, `GETOPTR`, `SYNC`, `RESET`, a `close()` that plays the buffer
-  out, and the mixer's `VOLUME` and `IGAIN`. The raw MIDI port sends at
-  31,250 baud behind rawmidi's buffer and answers its ioctls; the PC speaker
-  takes `EV_SND` events and `/dev/tty0`'s `KIOCSOUND` and `KDMKTONE`, and
-  `/dev/tty0` is a tty. What they play leaves the Core as the new `pcm`,
-  `midi`, `tone`, `mixer` and `soundCut` events, on Program time. Writes to
-  `/dev/dsp` and the MIDI port and the devices' settings are journaled rather
-  than Undo barriers: Undo puts settings back and cuts what was queued and not
-  heard, and restores the MIDI channels and the speaker's tone. See the
-  README's "Sound".
-- `/dev/dsp` answers EINVAL and `/dev/mixer` ENXIO for a request they do not
-  know, as their drivers do, where they answered ENOTTY.
+- The sound devices (M4). `/dev/dsp` and `/dev/mixer` behave as Linux 6.12's
+  snd-pcm-oss and snd-mixer-oss on the guest's HDA card (QEMU's
+  `hda-duplex`): 8000 Hz U8 mono at open, the fixed `GETFMTS` mask, settings
+  written back, the buffer and fragments the kernel computes through its
+  plugins, `SETFRAGMENT` once, whole-fragment transfers, blocking and
+  non-blocking writes paced on Program time, `GETOSPACE`, `GETODELAY`,
+  `GETOPTR`, `SYNC`, `RESET`, a `close()` that plays the buffer out, and the
+  mixer's `VOLUME` and `IGAIN`. snd-virmidi's four raw MIDI devices and
+  `/dev/midi1` send at 31,250 baud behind rawmidi's buffer and answer its
+  ioctls. The PC speaker sounds for `EV_SND` events written to
+  `/dev/input/event4` and for `/dev/tty0`'s `KIOCSOUND` and `KDMKTONE`, which
+  reach it through the input core as on Linux, so the device's readers see
+  them too; `/dev/tty0` is a tty. What they play leaves the Core as the new
+  `pcm`, `midi`, `tone`, `mixer` and `soundCut` events, on Program time.
+  Writes to `/dev/dsp` and the MIDI ports and the devices' settings are
+  journaled rather than Undo barriers: Undo puts settings back and cuts what
+  was queued and not heard, and restores the MIDI channels and the speaker's
+  tone. See the README's "Sound".
 - `X86WaitRequest` has `wakeSources`, the terminal and the input devices that
   can end a wait; `acceptsInput` stays until 8.0.0. A device that keeps time
   folds the moment it is ready into the deadline.
