@@ -64,6 +64,8 @@ struct DeviceLink {
   const char *target;
 };
 
+struct SoundFile;
+
 // Time a device keeps lazily, from Program time (see DeviceDrain*): a buffer
 // that drains at a fixed rate whenever it holds something.
 struct DeviceDrain {
@@ -84,7 +86,8 @@ struct DeviceFile {
   // the instruction `progress_identity` only.
   u64 progress_identity;
   u64 progress;
-  struct DeviceDrain drain;
+  // the sound devices' own state for this open (sound.h), or null
+  struct SoundFile *sound;
 };
 
 const struct DeviceNode *GetDeviceNodes(int *);
@@ -112,5 +115,7 @@ u64 DeviceDrainLevel(struct DeviceDrain *, i64);
 void DeviceDrainAdd(struct DeviceDrain *, i64, u64);
 i64 DeviceDrainDeadline(struct DeviceDrain *, i64, u64);
 struct timespec DeviceTimespec(i64);
+void DeviceCloseWait(struct Machine *, int);
+bool IsJournaledDeviceFd(struct Machine *, int);
 
 #endif /* BLINK_DEVICES_H_ */

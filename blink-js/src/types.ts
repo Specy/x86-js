@@ -201,8 +201,59 @@ export type X86WakeSources = {
     inputDevices: X86InputDeviceId[]
 }
 
+/** A sound device a `soundCut` names: `/dev/dsp`, the raw MIDI port or the PC speaker. */
+export type X86SoundDevice = 'dsp' | 'midi' | 'speaker'
+
+/**
+ * Samples `/dev/dsp` gives the card, decoded: stereo, interleaved, at the rate the program set,
+ * the first heard at `start`. Each is a fragment, handed on the moment the card takes it.
+ */
+export type X86PcmEvent = {
+    /** When the first frame plays, in nanoseconds of Program time's monotonic clock. */
+    start: bigint
+    /** Frames a second, as `SNDCTL_DSP_SPEED` set it; the host resamples. */
+    rate: number
+    /** Left and right, -1 to 1, one pair a frame. */
+    frames: Float32Array
+}
+
+/** One complete message the raw MIDI port hands the synthesizer. */
+export type X86MidiEvent = {
+    /** When its last byte leaves the port, in nanoseconds of Program time. */
+    at: bigint
+    /** The whole message, its status included even when the program used running status. */
+    message: Uint8Array
+}
+
+/** The PC speaker's square wave from `at` on, at the frequency the timer makes; 0 is silence. */
+export type X86ToneEvent = { at: bigint; hz: number }
+
+/**
+ * The gains the program's mixer puts on `/dev/dsp`: `VOLUME` and `PCM`, 0 to 100 for the left and
+ * the right. A channel the card has no control for stays at 100, whatever the program wrote to it.
+ */
+export type X86MixerEvent = { volume: [number, number]; pcm: [number, number] }
+
+/**
+ * Drop everything scheduled after `after` (nanoseconds of Program time) for `device`, or for every
+ * sound device without one: Undo, `SNDCTL_DSP_RESET`, the MIDI port's `DROP`, a signal that ends
+ * the program, and the end of the machine (`clearExecution()`, a new start) cut what has not been
+ * heard yet.
+ */
+export type X86SoundCutEvent = { after: bigint; device?: X86SoundDevice }
+
 export type X86EmulatorEventMap = {
     stateChange: { state: BlinkState; oldState: BlinkState }
+    /** Samples `/dev/dsp` gives the card. */
+    pcm: X86PcmEvent
+    /** A message the raw MIDI port gives the synthesizer. */
+    midi: X86MidiEvent
+    /** The PC speaker's tone changes. */
+    tone: X86ToneEvent
+    /** The mixer's gains on `/dev/dsp`, at each start of a program and at every change. */
+    mixer: X86MixerEvent
+    /** What was scheduled after a time no longer plays. */
+    soundCut: X86SoundCutEvent
     /** The terminal's mode at each start of a program, and whenever the program changes it. */
     terminalMode: X86TerminalMode
     /**

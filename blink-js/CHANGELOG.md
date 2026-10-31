@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- The sound devices (`docs/design/x86-devices-plan.md`, M4). `/dev/dsp` and
+  `/dev/mixer` behave as Linux 6.12's snd-pcm-oss and snd-mixer-oss on the
+  guest's HDA card (QEMU's `hda-duplex`): 8000 Hz U8 mono at open, the fixed
+  `GETFMTS` mask, settings written back, the buffer and fragments the kernel
+  computes through its plugins, `SETFRAGMENT` once, whole-fragment transfers,
+  blocking and non-blocking writes paced on Program time, `GETOSPACE`,
+  `GETODELAY`, `GETOPTR`, `SYNC`, `RESET`, a `close()` that plays the buffer
+  out, and the mixer's `VOLUME` and `IGAIN`. The raw MIDI port sends at
+  31,250 baud behind rawmidi's buffer and answers its ioctls; the PC speaker
+  takes `EV_SND` events and `/dev/tty0`'s `KIOCSOUND` and `KDMKTONE`, and
+  `/dev/tty0` is a tty. What they play leaves the Core as the new `pcm`,
+  `midi`, `tone`, `mixer` and `soundCut` events, on Program time. Writes to
+  `/dev/dsp` and the MIDI port and the devices' settings are journaled rather
+  than Undo barriers: Undo puts settings back and cuts what was queued and not
+  heard, and restores the MIDI channels and the speaker's tone. See the
+  README's "Sound".
+- `/dev/dsp` answers EINVAL and `/dev/mixer` ENXIO for a request they do not
+  know, as their drivers do, where they answered ENOTTY.
+
 - The groundwork for the x86 devices (`docs/design/x86-devices-plan.md`, M1).
   The machine has the QEMU guest's device nodes, `/dev/fb0`, `/dev/tty0`,
   `/dev/input/event0` to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and

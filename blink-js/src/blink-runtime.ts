@@ -42,6 +42,7 @@ import {
 } from './file-system'
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
 import { decodeTerminalMode, decodeWakeSources, installDevices } from './devices'
+import { soundCut, soundTime } from './sound'
 import {
     BlinkState,
     END_OF_INPUT,
@@ -59,7 +60,12 @@ import {
     type X86Progress,
     type X86Project,
     type X86SourceLocation,
-    type X86TerminalMode
+    type X86MidiEvent,
+    type X86MixerEvent,
+    type X86PcmEvent,
+    type X86SoundCutEvent,
+    type X86TerminalMode,
+    type X86ToneEvent
 } from './types'
 import { observeCallbackResult, type MaybePromise } from './callbacks'
 import { X86_FPU_STATE_SIZE, emptyFpuStateBlock } from './fpu-state'
@@ -166,6 +172,16 @@ export type BlinkRuntimeCallbacks = {
     terminalMode?: (mode: X86TerminalMode) => MaybePromise<void>
     /** A program opened a device node the machine does not cover; the open failed with ENODEV. */
     unsupportedDevice?: (event: { path: string }) => MaybePromise<void>
+    /** Samples `/dev/dsp` gives the card, with the Program time they start playing. */
+    pcm?: (event: X86PcmEvent) => MaybePromise<void>
+    /** A complete message the raw MIDI port gives the synthesizer, with the time it arrives. */
+    midi?: (event: X86MidiEvent) => MaybePromise<void>
+    /** The PC speaker's tone from a time on. */
+    tone?: (event: X86ToneEvent) => MaybePromise<void>
+    /** The mixer's gains on `/dev/dsp`, at each start of a program and at every change. */
+    mixer?: (event: X86MixerEvent) => MaybePromise<void>
+    /** Drop what was scheduled after a time. */
+    soundCut?: (event: X86SoundCutEvent) => MaybePromise<void>
 }
 
 export type BlinkRuntimeOptions = {
@@ -337,6 +353,30 @@ export class BlinkRuntime {
         }
         module.blinkUnsupportedDevice = (path) => {
             if (runtime?.programSources) runtime.report(callbacks.unsupportedDevice, { path })
+        }
+        // The sound devices' timeline (sound.c), from system calls, Undo and the end of a run
+        module.blinkSoundPcm = (lo, hi, rate, frames) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.pcm, { start: soundTime(lo, hi), rate, frames })
+        }
+        module.blinkSoundMidi = (lo, hi, message) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.midi, { at: soundTime(lo, hi), message })
+        }
+        module.blinkSoundTone = (lo, hi, hz) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.tone, { at: soundTime(lo, hi), hz })
+        }
+        module.blinkSoundMixer = (volumeLeft, volumeRight, pcmLeft, pcmRight) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.mixer, {
+                    volume: [volumeLeft, volumeRight],
+                    pcm: [pcmLeft, pcmRight]
+                })
+        }
+        module.blinkSoundCut = (lo, hi, device) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.soundCut, soundCut(soundTime(lo, hi), device))
         }
         module.onUnimplementedSyscall = (number) => {
             if (runtime?.programSources)
@@ -2003,7 +2043,12 @@ function withDefaultCallbacks(
         unimplementedSyscall: callbacks.unimplementedSyscall ?? (() => undefined),
         waitRequest: callbacks.waitRequest ?? (() => undefined),
         terminalMode: callbacks.terminalMode ?? (() => undefined),
-        unsupportedDevice: callbacks.unsupportedDevice ?? (() => undefined)
+        unsupportedDevice: callbacks.unsupportedDevice ?? (() => undefined),
+        pcm: callbacks.pcm ?? (() => undefined),
+        midi: callbacks.midi ?? (() => undefined),
+        tone: callbacks.tone ?? (() => undefined),
+        mixer: callbacks.mixer ?? (() => undefined),
+        soundCut: callbacks.soundCut ?? (() => undefined)
     }
 }
 
