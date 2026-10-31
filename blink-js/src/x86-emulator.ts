@@ -89,7 +89,12 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         unimplementedSyscall: new Set(),
         terminalMode: new Set(),
         unsupportedDevice: new Set(),
-        framebufferPresent: new Set()
+        framebufferPresent: new Set(),
+        pcm: new Set(),
+        midi: new Set(),
+        tone: new Set(),
+        mixer: new Set(),
+        soundCut: new Set()
     }
 
     private lastCompileResult: X86CompileResult | null = null
@@ -173,6 +178,31 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 framebufferPresent: (event) => {
                     const result = options.callbacks?.framebufferPresent?.(event)
                     emulator?.emit('framebufferPresent', event)
+                    return result
+                },
+                pcm: (event) => {
+                    const result = options.callbacks?.pcm?.(event)
+                    emulator?.emit('pcm', event)
+                    return result
+                },
+                midi: (event) => {
+                    const result = options.callbacks?.midi?.(event)
+                    emulator?.emit('midi', event)
+                    return result
+                },
+                tone: (event) => {
+                    const result = options.callbacks?.tone?.(event)
+                    emulator?.emit('tone', event)
+                    return result
+                },
+                mixer: (event) => {
+                    const result = options.callbacks?.mixer?.(event)
+                    emulator?.emit('mixer', event)
+                    return result
+                },
+                soundCut: (event) => {
+                    const result = options.callbacks?.soundCut?.(event)
+                    emulator?.emit('soundCut', event)
                     return result
                 }
             }
@@ -463,6 +493,11 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         this.eventHandlers.terminalMode.clear()
         this.eventHandlers.unsupportedDevice.clear()
         this.eventHandlers.framebufferPresent.clear()
+        this.eventHandlers.pcm.clear()
+        this.eventHandlers.midi.clear()
+        this.eventHandlers.tone.clear()
+        this.eventHandlers.mixer.clear()
+        this.eventHandlers.soundCut.clear()
     }
 
     /** End the debug session before stopping its FileSystem capability; callbacks remain usable. */

@@ -13,9 +13,9 @@
  *
  * Each device is a struct FdCb of its own. What open() made is the open file
  * description, a struct DeviceFile that dup() shares and the last close()
- * releases, as Linux's struct file is. Their semantics come with the
- * milestones that follow this one: until then a device opens, answers ENOTTY
- * to the ioctls it does not know yet, and reads and writes as said below. */
+ * releases, as Linux's struct file is. The sound devices, /dev/dsp,
+ * /dev/mixer, the raw MIDI port and /dev/tty0's tone ioctls, are in sound.c,
+ * oss.c, rawmidi.c and speaker.c. */
 #include "blink/devices.h"
 
 #include <errno.h>
@@ -37,6 +37,7 @@
 #include "blink/fbdev.h"
 #include "blink/linux.h"
 #include "blink/macros.h"
+#include "blink/sound.h"
 #include "blink/syscall.h"
 #include "blink/thread.h"
 #include "blink/timespec.h"
@@ -97,10 +98,6 @@ static const struct DeviceLink kDeviceLinks[] = {
      "../mouse1"},
 };
 
-// The raw MIDI port's pacing: MIDI's 31,250 baud, ten bits a byte, behind a
-// 4 KiB buffer (x86-devices.md, "The raw MIDI port").
-#define MIDI_BYTES_PER_SECOND 3125
-#define MIDI_BUFFER_BYTES     4096
 
 // struct input_event on x86-64: a timeval, then type, code and value.
 #define INPUT_EVENT_SIZE 24
@@ -143,6 +140,7 @@ struct DeviceFile *RetainDeviceFile(struct DeviceFile *df) {
 void ReleaseDeviceFile(struct DeviceFile *df) {
   if (!df || --df->references) return;
   if (df->node->kind == DEVICE_INPUT) ReleaseEvdev(df);
+  SoundRelease(df);
   free(df);
 }
 
@@ -261,8 +259,8 @@ static size_t IovsSize(const struct iovec *iov, int iovcnt) {
   return size;
 }
 
-// Reads and writes the devices have no semantics for before their milestone:
-// fbdev's come with M2, OSS's with M4.
+// Reads and writes the devices have no semantics for: fbdev's come with M2;
+// OSS's mixer has neither, and reading /dev/dsp is recording, not covered.
 static ssize_t ReadNothing(int fildes, const struct iovec *iov, int iovcnt) {
   return einval();
 }
@@ -306,22 +304,6 @@ static int PollWritable(struct pollfd *fds, nfds_t nfds, int timeout) {
   return ready;
 }
 
-// Writable while its buffer has room.
-static int PollMidi(struct pollfd *fds, nfds_t nfds, int timeout) {
-  nfds_t i;
-  int ready;
-  struct DeviceFile *df;
-  for (ready = i = 0; i < nfds; ++i) {
-    fds[i].revents = 0;
-    if ((df = GetDeviceFile(fds[i].fd)) &&
-        DeviceDrainLevel(&df->drain, DeviceNow()) < df->drain.capacity) {
-      fds[i].revents = fds[i].events & POLLOUT;
-    }
-    if (fds[i].revents) ++ready;
-  }
-  return ready;
-}
-
 static int IoctlUnknown(struct Machine *m, int fildes, u64 request, i64 addr) {
   return enotty();
 }
@@ -357,15 +339,15 @@ static const struct FdCb kFdCbFramebuffer =
     DEVICE_CB(ReadFramebuffer, WriteFramebuffer, PollReady, IoctlFramebuffer);
 static const struct FdCb kFdCbInput =
     DEVICE_CB(ReadEvdev, WriteEvdev, PollEvdev, IoctlEvdev);
+// the dsp's and the port's writes go through WriteDevice(), which paces them
 static const struct FdCb kFdCbDsp =
-    DEVICE_CB(ReadNothing, WriteNothing, PollReady, IoctlUnknown);
+    DEVICE_CB(ReadNothing, WriteNothing, OssPoll, OssIoctl);
 static const struct FdCb kFdCbMixer =
-    DEVICE_CB(ReadNothing, WriteNothing, PollReady, IoctlUnknown);
-// writes go through WriteDevice(), which paces them
+    DEVICE_CB(ReadNothing, WriteNothing, PollReady, MixerIoctl);
 static const struct FdCb kFdCbMidi =
-    DEVICE_CB(ReadNever, WriteNothing, PollMidi, IoctlUnknown);
+    DEVICE_CB(ReadNever, WriteNothing, MidiPoll, MidiIoctl);
 static const struct FdCb kFdCbConsole =
-    DEVICE_CB(ReadNever, WriteDiscarded, PollWritable, IoctlUnknown);
+    DEVICE_CB(ReadNever, WriteDiscarded, PollWritable, ConsoleIoctl);
 
 const struct FdCb *GetDeviceCb(const struct DeviceNode *node) {
   switch (node->kind) {
@@ -394,8 +376,9 @@ int OpenDevice(struct Machine *m, struct Fd *fd, const struct DeviceNode *node) 
   df->references = 1;
   df->node = node;
   df->status = fd->oflags & SETFL_FLAGS;
-  if (node->kind == DEVICE_MIDI) {
-    DeviceDrainSet(&df->drain, MIDI_BUFFER_BYTES, MIDI_BYTES_PER_SECOND);
+  if (IsSoundDevice(node) && SoundOpen(df, fd->oflags) == -1) {
+    free(df);
+    return -1;
   }
   if (node->kind == DEVICE_FRAMEBUFFER && OpenFramebuffer() == -1) {
     free(df);
@@ -433,10 +416,7 @@ u32 GetFdWakeSources(const struct Fd *fd, int events) {
 i64 GetFdReadyDeadline(const struct Fd *fd, int events) {
   struct DeviceFile *df = fd->device;
   if (!df || !(events & POLLOUT)) return -1;
-  if (df->node->kind == DEVICE_MIDI) {
-    return DeviceDrainDeadline(&df->drain, DeviceNow(), 1);
-  }
-  return -1;
+  return SoundReadyDeadline(df, events);
 }
 
 /* Halts a blocking read a device has nothing for, before the read sets
@@ -487,7 +467,8 @@ bool IsPacedDevice(struct Machine *m, int fildes) {
   struct Fd *fd;
   LOCK(&m->system->fds.lock);
   paced = (fd = GetFd(&m->system->fds, fildes)) && fd->device &&
-          fd->device->node->kind == DEVICE_MIDI;
+          (fd->device->node->kind == DEVICE_DSP ||
+           fd->device->node->kind == DEVICE_MIDI);
   UNLOCK(&m->system->fds.lock);
   return paced;
 }
@@ -510,95 +491,17 @@ void DeviceForgetProgress(u64 identity) {
   UNLOCK(&g_machine->system->fds.lock);
 }
 
-static i64 FinishWrite(struct DeviceFile *df) {
-  i64 done = df->progress;
-  df->progress = 0;
-  df->progress_identity = 0;
-  return done;
-}
-
-/* Reads `size` bytes at `offset` of what the segments hold together, checked
- * as a write's buffer is; -1 with EFAULT when one is not readable. */
-static int CopySegments(struct Machine *m, const struct GuestSegment *segments,
-                        u32 count, u64 offset, u8 *out, u64 size) {
-  u32 i;
-  u64 n;
-  for (i = 0; i < count && size; ++i) {
-    if (offset >= segments[i].len) {
-      offset -= segments[i].len;
-      continue;
-    }
-    n = MIN(size, segments[i].len - offset);
-    if (CopyFromUserRead(m, out, segments[i].addr + offset, n) == -1) {
-      return efault();
-    }
-    out += n;
-    size -= n;
-    offset = 0;
-  }
-  return 0;
-}
-
-/* A write to a device whose buffer drains in Program time, the raw MIDI port
- * for now: it queues what fits and, unless O_NONBLOCK, waits for room until
- * every byte is queued, as a blocking write on Linux does.
+/* A write to a device whose buffer drains in Program time, /dev/dsp or the
+ * raw MIDI port (sound.c): it queues what fits and, unless O_NONBLOCK, waits
+ * for room until every byte is queued, as a blocking write on Linux does.
  *
  * Blink runs a blocked instruction again from its start once the wait ends,
  * so the write keeps what it queued in the open file description, under the
  * instruction's identity; the write run again goes on from there, and Undo
- * of that instruction forgets it. The wait lasts until the rest fits or the
- * buffer is empty, which returns when Linux's would: once the last byte is
- * queued. The guest's bytes are only read, so nothing here is journaled. */
+ * of that instruction forgets it. */
 i64 WriteDevice(struct Machine *m, int fildes,
                 const struct GuestSegment *segments, u32 count, int oflags) {
-  i64 now;
-  u32 i;
-  u64 size, room, take, n, identity;
-  u8 chunk[512];
-  struct DeviceFile *df;
-  if (!(df = GetDeviceFile(fildes))) return ebadf();
-  for (size = i = 0; i < count; ++i) size += segments[i].len;
-  if (!size) return 0;
-  identity = blinkenlib_active_instruction();
-  if (df->progress_identity != identity) {
-    df->progress_identity = identity;
-    df->progress = 0;
-  }
-  for (;;) {
-    now = DeviceNow();
-    room = df->drain.capacity - DeviceDrainLevel(&df->drain, now);
-    take = MIN(room, size - df->progress);
-    while (take) {
-      n = MIN(take, sizeof(chunk));
-      // the bytes are checked and read as a write's are; M4 plays them
-      if (CopySegments(m, segments, count, df->progress, chunk, n) == -1) {
-        if (df->progress) return FinishWrite(df);
-        FinishWrite(df);
-        return efault();
-      }
-      DeviceDrainAdd(&df->drain, now, n);
-      df->progress += n;
-      take -= n;
-    }
-    if (df->progress == size) return FinishWrite(df);
-    if (oflags & O_NONBLOCK) {
-      return df->progress ? FinishWrite(df) : eagain();
-    }
-    // a signal ends a write that queued something with what it queued, and
-    // is delivered as the call returns; one that queued nothing restarts or
-    // fails with EINTR as every other wait does
-    if (df->progress && (GuestWaitCancelled() || (m->signals & ~m->sigmask))) {
-      return FinishWrite(df);
-    }
-    if (!df->progress && GuestWaitInterruptedRestartable(m)) {
-      FinishWrite(df);
-      return eintr();
-    }
-    room = MIN(size - df->progress, df->drain.capacity);
-    if (DeviceDrainDeadline(&df->drain, now, room) <= now) continue;
-    GuestWaitHaltWake(m, GetMaxTime(), 0,
-                      DeviceTimespec(DeviceDrainDeadline(&df->drain, now, room)));
-  }
+  return SoundWrite(m, fildes, segments, count, oflags);
 }
 
 /* WriteDevice() for a writev()'s vectors. */
@@ -624,6 +527,30 @@ i64 WriteDeviceGuestIovs(struct Machine *m, int fildes, i64 iovaddr, u32 iovlen,
   if (!AddToFreeList(m, segments)) return enomem();
   rc = WriteDevice(m, fildes, segments, iovlen, oflags);
   return rc;
+}
+
+/* What close() of `fildes` waits for before it releases the device, when it
+ * is the last descriptor of the description: a sound device's queue playing
+ * out. It halts the instruction while it waits and returns once it is done;
+ * the descriptor is still there when the instruction starts over. */
+void DeviceCloseWait(struct Machine *m, int fildes) {
+  struct Fd *fd;
+  struct DeviceFile *df;
+  LOCK(&m->system->fds.lock);
+  df = (fd = GetFd(&m->system->fds, fildes)) ? fd->device : 0;
+  UNLOCK(&m->system->fds.lock);
+  if (df && df->sound) SoundCloseWait(m, df);
+}
+
+/* Whether a write to `fildes` is journaled for Undo by its device rather
+ * than an Undo barrier. */
+bool IsJournaledDeviceFd(struct Machine *m, int fildes) {
+  bool journaled;
+  struct Fd *fd;
+  LOCK(&m->system->fds.lock);
+  journaled = (fd = GetFd(&m->system->fds, fildes)) && IsJournaledSoundFd(fd);
+  UNLOCK(&m->system->fds.lock);
+  return journaled;
 }
 
 // ---------------------------------------------------------- exports for the wrapper

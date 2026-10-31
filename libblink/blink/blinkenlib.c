@@ -22,6 +22,7 @@
 #include "blink/environment.h"
 #include "blink/evdev.h"
 #include "blink/signal.h"
+#include "blink/sound.h"
 #include "blink/x86.h"
 
 void update_clstruct(struct Machine *m);
@@ -213,6 +214,8 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
   if (sig != SIGTRAP || code < SIGTRAP_CODE_PREEMPT || code > SIGTRAP_CODE_WAIT) {
     m->system->exited = true;
     m->system->exitcode = 128 + sig;
+    // its release finds the signal: the sound drains no further
+    SoundProgramKilled();
   }
 #ifdef DEBUG
   if (sig != SIGTRAP) {
@@ -650,6 +653,8 @@ void TearDown(void) {
   // what the last program left open is closed, as its end would have,
   // before the next one opens anything
   if (m) SysCloseAll(m->system);
+  // nothing it scheduled plays any more
+  SoundTearDown();
   FreeMachine(m);
   m = g_machine = 0;
   s = 0;
@@ -709,6 +714,8 @@ void setupProgram(bool withdebugger) {
   ResetTerminal();
   // and on input devices with nothing held, lit or moved
   ResetInputDevices();
+  // and with the sound devices as the guest boots them
+  ResetSound();
   char *bios = 0;
   LoadProgram(m, progname_string, progname_string,
                process_arguments_set ? process_args : args, vars, bios);

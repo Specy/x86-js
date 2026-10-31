@@ -149,6 +149,20 @@ export type BlinkenlibModule = {
     blinkTerminalMode?: (mode: number) => void
     /** A program opened a device node the machine does not cover, named by its path. */
     blinkUnsupportedDevice?: (path: string) => void
+    /** Sound (sound.c): times in nanoseconds of Program time as their low and high 32 bits. */
+    blinkSoundPcm?: (lo: number, hi: number, rate: number, frames: Float32Array) => void
+    blinkSoundMidi?: (lo: number, hi: number, message: Uint8Array) => void
+    blinkSoundTone?: (lo: number, hi: number, hz: number) => void
+    blinkSoundMixer?: (
+        volumeLeft: number,
+        volumeRight: number,
+        pcmLeft: number,
+        pcmRight: number
+    ) => void
+    /** `device` is 0 for every device, 1 `/dev/dsp`, 2 the MIDI port, 3 the PC speaker. */
+    blinkSoundCut?: (lo: number, hi: number, device: number) => void
+    /** What one EV_SND event written to the PC Speaker's evdev node does (speaker.c). */
+    _blinkenlib_speaker_input_event?(type: number, code: number, value: number): number
     UTF8ToString(pointer: number): string
     /** What can end the pending wait, as `WAKE_*` bits: 1 the terminal, 2 the keyboard, 4 the tablet. */
     _blinkenlib_wait_wake_sources?(): number

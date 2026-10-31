@@ -61,6 +61,7 @@
 #include "blink/devices.h"
 #include "blink/endian.h"
 #include "blink/fbdev.h"
+#include "blink/sound.h"
 #include "blink/flags.h"
 #include "blink/errno.h"
 #include "blink/flag.h"
@@ -394,6 +395,8 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
   /* The debugger retains the machine so an exit instruction can be undone.
    * Every trapped exit must halt, including one replayed after an undo. */
   if (m->system->trapexit) {
+    // the sound the program left staged plays out (sound.c)
+    SoundProgramExit(m);
     m->system->exited = true;
     /* A parent sees only the low eight bits of the status, as wait(2)'s
      * WEXITSTATUS() does on Linux: exit(256) is exit(0), exit(-1) is 255. */
@@ -6547,9 +6550,12 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
     case 0x013: /* readv */
     case 0x001: /* write, except the deferred terminal transcript */
     case 0x014: /* writev */
-      /* an input device journals what it reads and writes (evdev.c) */
+      /* an input device journals what it reads and writes (evdev.c), a
+       * sound device what a write queued (sound.c) */
       if (result > 0 && !IsTerminalFildes(m, arg1) &&
-          !IsJournaledDeviceFildes(m, arg1))
+          !IsJournaledDeviceFildes(m, arg1) &&
+          !(((call & 0xfff) == 0x001 || (call & 0xfff) == 0x014) &&
+            IsJournaledDeviceFd(m, arg1)))
         DebugHistoryMarkIrreversible();
       break;
     case 0x011: /* pread64: a regular File does not move its offset */

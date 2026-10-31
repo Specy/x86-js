@@ -13,6 +13,7 @@ import { expectLinux, probeSource, quadwords } from './linux-probe'
 
 const ENOENT = -2n
 const EAGAIN = -11n
+const ENXIO = -6n
 const ENODEV = -19n
 const EINVAL = -22n
 const ENOTTY = -25n
@@ -266,7 +267,7 @@ describe('ioctl', () => {
         )
     })
 
-    it('answers ENOTTY on every device for what its milestone has not brought yet', async () => {
+    it("answers what each device's driver answers for a request it does not know", async () => {
         const run = await probe(
             ['dsp', 'mixer', 'midi', 'tty0'].flatMap((path) => [
                 `sys 2, ${path}, ${O_RDWR}`,
@@ -277,7 +278,12 @@ describe('ioctl', () => {
                 'save'
             ])
         )
-        expect(run.results).toEqual(new Array(8).fill(ENOTTY))
+        expect(run.results).toEqual([
+            ...[EINVAL, EINVAL], // snd-pcm-oss answers EINVAL for anything not its own
+            ...[ENXIO, ENXIO], // snd-mixer-oss: ENXIO for a request with no direction
+            ...[ENOTTY, ENOTTY], // rawmidi: ENOTTY for anything not of type 'W'
+            ...[ENOTTY, 0n] // the console sounds the speaker
+        ])
     })
 
     it('matches a sized request on its type and number, with the size it names', async () => {
