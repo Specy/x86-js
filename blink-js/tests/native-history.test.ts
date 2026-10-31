@@ -146,18 +146,22 @@ cell: dq 0
     })
 
     it("counts a breakpoint stop after several slices as the whole run's instructions", async () => {
-        // A loop of 60,000 two-instruction passes, then the breakpoint: three slices of 50,000.
+        // A loop of 250,000 two-instruction passes, then the breakpoint: two whole slices of
+        // 200,000 and the breakpoint in a third.
         const source =
             PREFIX +
-            'mov ecx, 60000\nnext:\ndec ecx\njnz next\nnop\nmov eax, 60\nxor edi, edi\nsyscall\n'
+            'mov ecx, 250000\nnext:\ndec ecx\njnz next\nnop\nmov eax, 60\nxor edi, edi\nsyscall\n'
         const emulator = await build(source)
+        const slices = vi.spyOn(emulator.runtime, 'runSlice')
         try {
             expect(await emulator.run(undefined, [source.split('\n').indexOf('nop')])).toBe(
                 EmulatorStatus.Running
             )
+            expect(slices).toHaveBeenCalledTimes(3)
             expect(emulator.stopReason?.kind).toBe('breakpoint')
-            expect(emulator.stopReason?.executedInstructions).toBe(120001n)
+            expect(emulator.stopReason?.executedInstructions).toBe(500001n)
         } finally {
+            vi.restoreAllMocks()
             emulator.dispose()
         }
     })
@@ -174,17 +178,18 @@ cell: dq 0
         const spies = methods.map((method) => vi.spyOn(emulator.runtime, method))
         const slices = vi.spyOn(emulator.runtime, 'runSlice')
         try {
-            await emulator.run(100005)
+            // two whole native slices of 200,000 and a third of 5
+            await emulator.run(400005)
             for (const spy of spies) expect(spy).not.toHaveBeenCalled()
             expect(slices).toHaveBeenCalledTimes(3)
-            expect(emulator.stopReason?.executedInstructions).toBe(100005n)
-            expect(emulator.getRegisterValue('rbx')).toBe(50003n)
+            expect(emulator.stopReason?.executedInstructions).toBe(400005n)
+            expect(emulator.getRegisterValue('rbx')).toBe(200003n)
             expect(emulator.getUndoHistory(10)).toHaveLength(3)
             for (let i = 0; i < 3; i++) emulator.undo()
-            expect(emulator.getRegisterValue('rbx')).toBe(50001n)
+            expect(emulator.getRegisterValue('rbx')).toBe(200001n)
             expect(emulator.canUndo()).toBe(false)
             await emulator.step()
-            expect(emulator.getRegisterValue('rbx')).toBe(50002n)
+            expect(emulator.getRegisterValue('rbx')).toBe(200002n)
         } finally {
             vi.restoreAllMocks()
             emulator.dispose()

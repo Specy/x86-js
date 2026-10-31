@@ -2102,12 +2102,9 @@ static bool CanJit(struct Machine *m) {
   return !GetFlag(m->flags, FLAGS_TF) && !IsJitDisabled(&m->system->jit);
 }
 
-void JitlessDispatch(P) {
+// Runs the instruction LoadInstruction() decoded at the program counter.
+static void DispatchDecoded(P) {
   bool singlestep = GetFlag(m->flags, FLAGS_TF);
-  ASM_LOGF("decoding [%s] at address %" PRIx64, DescribeOp(m, GetPc(m)),
-           GetPc(m));
-  COSTLY_STATISTIC(++instructions_dispatched);
-  LoadInstruction(m, GetPc(m));
   rde = m->xedd->op.rde;
   disp = m->xedd->op.disp;
   uimm0 = m->xedd->op.uimm0;
@@ -2125,6 +2122,14 @@ void JitlessDispatch(P) {
   if (singlestep && Mopcode(rde) != 0x105) {
     RaiseSingleStep(m);
   }
+}
+
+void JitlessDispatch(P) {
+  ASM_LOGF("decoding [%s] at address %" PRIx64, DescribeOp(m, GetPc(m)),
+           GetPc(m));
+  COSTLY_STATISTIC(++instructions_dispatched);
+  LoadInstruction(m, GetPc(m));
+  DispatchDecoded(A);
 }
 
 static void GeneralDispatch(P) {
@@ -2245,6 +2250,19 @@ void ExecuteInstruction(struct Machine *m) {
   }
 #else
   JitlessDispatch(DISPATCH_NOTHING);
+#endif
+}
+
+// ExecuteInstruction() for a caller that has just called LoadInstruction() at
+// the program counter, which the interpreter would otherwise do again.
+void ExecuteDecodedInstruction(struct Machine *m) {
+#ifdef HAVE_JIT
+  ExecuteInstruction(m);
+#else
+#if LOG_CPU
+  LogCpu(m);
+#endif
+  DispatchDecoded(DISPATCH_NOTHING);
 #endif
 }
 

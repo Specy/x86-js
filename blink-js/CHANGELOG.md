@@ -193,6 +193,27 @@ terminal change shape, and programs find Linux's devices. The README's
   the guest compares its deadline. In floating point, a short wait on a
   real-time clock far from zero could come out as 0 while the guest still
   waited, so a virtual clock advanced by it never reached the deadline.
+- Programs run faster: two and a half to four times as fast with the undo
+  history recording (the least on SSE and rep string loops, the most on
+  integer ones), 1.5 to 1.9 times without it, and a small program builds
+  about 25% faster, as the linker runs in the same loop. A step copies the
+  x87, SSE and AVX state only for an instruction that can change it, rather
+  than copying and comparing all of it twice per instruction; building with
+  `-DDEBUGHISTORY_CHECK_FPU` checks that list against every instruction a
+  program runs. An entry keeps the registers its step left as one block,
+  copied and compared a word at a time, and the registers it started from
+  only when something moved them between steps; its packet is built when it
+  is asked for, so the packets do not change. The byte budget counts an
+  entry's registers (152 bytes) and the rest of its packet, so the oldest
+  entries are hollowed at slightly different points. The new
+  `blinkenlib_history_header` gives an entry's header alone, without copying
+  its memory images, and the history reads it wherever it needs no more.
+  Every instruction is decoded once rather than twice, and the breakpoint and
+  interval timer checks cost nothing when there are none.
+- A native slice runs up to 200,000 instructions rather than 50,000, so a long
+  `run()` yields to the host a quarter as often. The linker and the assembler
+  are preempted every 250,000 instructions rather than 100,000, and still
+  stop at a hundred million.
 
 ## 7.0.0
 

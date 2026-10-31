@@ -17,6 +17,9 @@ bool GuestWaitInterruptedRestartable(struct Machine *);
 void GuestWaitClock(int);
 void GuestWaitRestoreMask(struct Machine *);
 void GuestTimerReset(void);
+/* Whether ITIMER_REAL is armed: the run loop reads it before every
+ * instruction, and calls GuestTimerCheck() only then. */
+extern bool guest_timer_armed;
 void GuestTimerCheck(struct Machine *);
 int GuestTimerGet(struct itimerval *);
 int GuestTimerSet(const struct itimerval *, struct itimerval *);

@@ -52,6 +52,12 @@ import {
     type X86FpuState
 } from './fpu-state'
 
+/**
+ * The most instructions one native slice runs (`RUN_SLICE_MAX` in blinkenlib.c): a run longer
+ * than that yields to the host between slices.
+ */
+const NATIVE_SLICE = 200_000
+
 /** What {@link X86Emulator.run} does with the breakpoint the program counter is on. */
 export type X86RunOptions = {
     /**
@@ -957,7 +963,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         let executed = 0
         let skipAtPc = options.skipBreakpointAtPc ?? true
         while (this.runtime.state === BlinkState.ProgramRunning) {
-            const budget = hasLimit ? Math.min(50000, limit - executed) : 50000
+            const budget = hasLimit ? Math.min(NATIVE_SLICE, limit - executed) : NATIVE_SLICE
             executed += this.runtime.runSlice(budget, breakpoints, skipAtPc)
             skipAtPc = false
             if (

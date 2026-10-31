@@ -69,6 +69,11 @@ export class NativeHistory {
                 'This blinkenlib.wasm does not count the entries it records: it has no blinkenlib_history_recorded'
             )
         }
+        if (!module._blinkenlib_history_header) {
+            throw new Error(
+                'This blinkenlib.wasm cannot give an undo history header alone: it has no _blinkenlib_history_header'
+            )
+        }
     }
 
     constructor(
@@ -131,7 +136,7 @@ export class NativeHistory {
 
     /** The serial of the entry `offset` places back from the newest, when the ring holds one. */
     private serial(offset: number): bigint | undefined {
-        const pointer = this.runtime.module._blinkenlib_history_entry!(offset)
+        const pointer = this.runtime.module._blinkenlib_history_header!(offset)
         return pointer ? this.view(pointer, 16).getBigUint64(8, true) : undefined
     }
 
@@ -147,7 +152,7 @@ export class NativeHistory {
     }
 
     previousFlags(): number | undefined {
-        const pointer = this.runtime.module._blinkenlib_history_entry!(0)
+        const pointer = this.runtime.module._blinkenlib_history_header!(0)
         return pointer ? this.view(pointer, HEADER).getUint32(40, true) : undefined
     }
 
@@ -169,7 +174,7 @@ export class NativeHistory {
         if (count === 0) return true
         if (count > this.depth() - skip) return false
         for (let offset = skip; offset < skip + count; offset++) {
-            const pointer = this.runtime.module._blinkenlib_history_entry!(offset)
+            const pointer = this.runtime.module._blinkenlib_history_header!(offset)
             if (!pointer || !this.view(pointer, 24).getUint32(20, true)) return false
         }
         return true
@@ -245,8 +250,11 @@ export class NativeHistory {
         >()
         const steps: ExecutionStep[] = []
         for (let index = 0; index < count; index++) {
-            const pointer = this.runtime.module._blinkenlib_history_entry!(skip + index)
-            const header = this.view(pointer, HEADER)
+            // The header alone, so a cached row never copies its packet's memory images.
+            const header = this.view(
+                this.runtime.module._blinkenlib_history_header!(skip + index),
+                HEADER
+            )
             const serial = header.getBigUint64(8, true)
             const length = header.getUint32(4, true)
             const undoable = Boolean(header.getUint32(20, true))
@@ -254,7 +262,10 @@ export class NativeHistory {
             const step =
                 cached?.length === length && cached.undoable === undoable
                     ? cached.step
-                    : this.decode(pointer, length)
+                    : this.decode(
+                          this.runtime.module._blinkenlib_history_entry!(skip + index),
+                          length
+                      )
             nextCache.set(serial, { length, undoable, step })
             steps.push(step)
         }

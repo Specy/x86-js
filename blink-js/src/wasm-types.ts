@@ -247,6 +247,7 @@ export type BlinkenlibModule = {
     _blinkenlib_history_clear?(): void
     _blinkenlib_history_count?(): number
     _blinkenlib_history_entry?(offset: number): number
+    _blinkenlib_history_header?(offset: number): number
     _blinkenlib_history_can_undo?(): boolean
     _blinkenlib_history_mark_irreversible?(): void
     _blinkenlib_history_undo?(): number
