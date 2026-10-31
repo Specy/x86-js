@@ -15,6 +15,21 @@
   that never come yet; the raw MIDI port paces writes at 31,250 baud on Program
   time, a blocking write going on from what it queued each time Blink starts it
   over. See the README's "Devices".
+- The input devices (`docs/design/x86-devices-plan.md`, M3): `/dev/input/event0`
+  to `event4` answer evdev as Linux 6.12 does for the guest's Power Button, AT
+  keyboard, PS/2 mouse, QEMU USB tablet and PC Speaker, with each one's
+  identity and capabilities, readers' queues of 4,096 events with evdev's
+  `SYN_DROPPED`, the state ioctls (`EVIOCGKEY`, `EVIOCGLED`, `EVIOCGABS` and
+  the rest), `EVIOCGREP` and `EVIOCSREP`, `EVIOCSCLOCKID`, `EVIOCGRAB`, masks,
+  keymaps and writes; an ioctl evdev does not know answers EINVAL. The new
+  `sendInputReport(device, events)` delivers a host key or pointer event to
+  the keyboard or the tablet as the guest's hardware and drivers make it:
+  `MSC_SCAN`, the lock keys' LEDs, `REL_WHEEL_HI_RES` and `SYN_REPORT`,
+  stamped with Program time. Reads, flushes and writes of an input device are
+  journaled rather than Undo barriers: Undo puts the events a read took back
+  (ADR 0069). `/proc/bus/input/devices` is generated from the same table; the
+  Power Button now lists `KEY_WAKEUP`, as Linux 6.12's has it. See the
+  README's "Input devices".
 - `X86WaitRequest` has `wakeSources`, the terminal and the input devices that
   can end a wait; `acceptsInput` stays until 8.0.0. A device that keeps time
   folds the moment it is ready into the deadline.

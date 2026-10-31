@@ -297,7 +297,8 @@ describe('ioctl', () => {
             'saved buf',
             `sys 16, r12, ${evdevString(0x08, 64)}, buf`, // EVIOCGUNIQ: the keyboard has none
             'save',
-            // the same type and number written rather than read is another request
+            // the same type and number written rather than read is another request, which
+            // evdev answers EINVAL, as it answers everything it does not know
             `sys 16, r12, 0x${(0x40000000 + 256 * 0x10000 + 0x4506).toString(16)}, buf`,
             'save',
             `sys 2, tablet, ${O_RDWR}`,
@@ -314,7 +315,7 @@ describe('ioctl', () => {
             BigInt.asIntN(64, 0xab41_0001_0001_0011n), // bus, vendor, product, version
             0x010001n,
             ENOENT,
-            ENOTTY,
+            EINVAL,
             21n // "28754-0000:00:04.0-1" and its NUL
         ])
     })

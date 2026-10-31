@@ -166,6 +166,21 @@ export type BlinkenlibModule = {
     _blinkenlib_device_link_path?(index: number): number
     _blinkenlib_device_link_target?(index: number): number
     _blinkenlib_input_devices_text?(): number
+    /** Where `_blinkenlib_input_report` reads a report's events, as int32 type, code and value. */
+    _blinkenlib_input_report_buffer?(): number
+    /** How many events that buffer holds. */
+    _blinkenlib_input_report_capacity?(): number
+    /**
+     * Delivers the report in the buffer to an input device (`INPUT_*`, devices.h) at the Program
+     * time given on the wall and monotonic clocks, in milliseconds: true when a reader got a whole
+     * packet.
+     */
+    _blinkenlib_input_report?(
+        device: number,
+        count: number,
+        realtimeMilliseconds: number,
+        monotonicMilliseconds: number
+    ): boolean
     _blinkenlib_get_brk(): bigint
     _blinkenlib_get_brk_start(): bigint
     _blinkenlib_get_stack_top(): bigint

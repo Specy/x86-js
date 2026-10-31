@@ -19,6 +19,7 @@
 #include "blink/syscall.h"
 #include "blink/terminal.h"
 #include "blink/environment.h"
+#include "blink/evdev.h"
 #include "blink/signal.h"
 #include "blink/x86.h"
 
@@ -703,6 +704,8 @@ void setupProgram(bool withdebugger) {
   OpenTerminalHostFds();
   // every program starts on a terminal in canonical mode
   ResetTerminal();
+  // and on input devices with nothing held, lit or moved
+  ResetInputDevices();
   char *bios = 0;
   LoadProgram(m, progname_string, progname_string,
                process_arguments_set ? process_args : args, vars, bios);

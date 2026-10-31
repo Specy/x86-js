@@ -29,7 +29,9 @@ import {
     type X86ExecutableOptions,
     type X86ProcessStart,
     type X86Progress,
-    type X86TerminalMode
+    type X86TerminalMode,
+    type X86InputDeviceId,
+    type X86InputEvent
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
@@ -365,6 +367,21 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     sendSignal(signal: number): void {
         const waiting = this.runtime.isWaiting()
         if (this.runtime.sendSignal(signal) && waiting) this.resumedByInput = true
+    }
+
+    /**
+     * Delivers what the host's keyboard or pointer did, one host event at a time, to the guest's
+     * AT keyboard (`/dev/input/event1`) or QEMU USB tablet (`event3`), as their hardware and
+     * drivers would: a key as the scan codes QEMU's keyboard sends, which become `MSC_SCAN`, the
+     * key and `SYN_REPORT`, with the lock LEDs' packet after; the pointer as one HID report, its
+     * buttons with their usages as `MSC_SCAN`, `ABS_X` and `ABS_Y` when they move, the wheel with
+     * `REL_WHEEL_HI_RES`, and `SYN_REPORT`. Every reader of the device gets it, or the one holding
+     * `EVIOCGRAB`, stamped with Program time; with no reader the device's state still changes. A
+     * read or `poll` waiting on the device resumes and starts over. Nothing happens when no
+     * program is running. Never call it in a Testcase, where no event ever arrives.
+     */
+    sendInputReport(device: X86InputDeviceId, events: readonly X86InputEvent[]): void {
+        if (this.runtime.sendInputReport(device, events)) this.resumedByInput = true
     }
     getInstructionsExecuted(): bigint {
         return this.runtime.getInstructionsExecuted()
