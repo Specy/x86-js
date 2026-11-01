@@ -3,7 +3,7 @@
 // or one that includes a File that changed, is assembled again. The caches outlive an emulator, so
 // each test writes sources of its own.
 import { afterEach, beforeEach, expect, it } from 'vitest'
-import { linkerRunCount } from '../src/blink-runtime'
+import { linkerRunCount } from '../src/linker-runs'
 import type { X86Project } from '../src/types'
 import { nasmInstanceCount } from '../src/wasm-assembler'
 import { createX86Emulator, type X86Emulator } from '../src/x86-emulator'

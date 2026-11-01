@@ -1,3 +1,4 @@
+import { countLinkerRun } from './linker-runs'
 import { readMemoryLayout, type X86MemoryLayout } from './memory-layout'
 import blinkenlib from './wasm/blinkenlib.js'
 import initBlinkWasm from './wasm/blinkenlib.wasm?init'
@@ -1835,7 +1836,7 @@ export class BlinkRuntime {
      * `stdout` and `stderr` callbacks, which are the program's.
      */
     private runTool(progname: '/assembler' | '/linker', command: string): void {
-        if (progname === '/linker') linkerRuns++
+        if (progname === '/linker') countLinkerRun()
         this.clearWaitTransport()
         ++this.generation
         this.programSources = false
@@ -2261,12 +2262,6 @@ let lastLink: {
     program: Uint8Array
     map: string | null
 } | null = null
-
-/** How many times a build ran `ld`, which a test reads to see a link reused. */
-let linkerRuns = 0
-export function linkerRunCount(): number {
-    return linkerRuns
-}
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
     if (a.length !== b.length) return false
