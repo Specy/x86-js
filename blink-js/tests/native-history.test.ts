@@ -101,13 +101,27 @@ cell: dq 0
         // through the same journal, and have to leave the same trace.
         const batched = await build(source)
         const stepped = await build(source)
+        // Serials count every instruction a Core instance ever recorded, the linker's included, so
+        // the second Build, whose link is the first one's reused, starts from another number: the
+        // two histories are compared from where each program started.
+        const starts = new Map<X86Emulator, bigint>()
+        const history = (emulator: X86Emulator) => {
+            const rows = emulator.getUndoHistory(100)
+            //the first check sees every entry since the program started
+            if (!starts.has(emulator)) {
+                const serials = rows.map((row) => BigInt(row.serial))
+                starts.set(emulator, serials.reduce((least, serial) => (serial < least ? serial : least)))
+            }
+            const start = starts.get(emulator)!
+            return rows.map((row) => ({ ...row, serial: String(BigInt(row.serial) - start) }))
+        }
         const check = () => {
             expect(batched.runtime.getRegisterSnapshot()).toEqual(
                 stepped.runtime.getRegisterSnapshot()
             )
             expect(batched.runtime.getFpuStateRaw()).toEqual(stepped.runtime.getFpuStateRaw())
             expect(batched.getCallStack()).toEqual(stepped.getCallStack())
-            expect(batched.getUndoHistory(100)).toEqual(stepped.getUndoHistory(100))
+            expect(history(batched)).toEqual(history(stepped))
             expect(batched.getFlags()).toEqual(stepped.getFlags())
         }
         try {

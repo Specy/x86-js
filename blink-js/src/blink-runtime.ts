@@ -773,14 +773,20 @@ export class BlinkRuntime {
         }
         // Only now: a program that does not assemble has nothing to link.
         await this.downloadTool(this.mode.binaries.linker, 'the linker', replacement)
-        this.writeExecutableSync(ENTRY_OBJECT, entry!.object)
+        // what the link reads, which a build running the same link again compares (`reuseLink`)
+        const linkInputs: LinkInput[] = []
+        const writeInput = (path: string, bytes: Uint8Array) => {
+            this.writeExecutableSync(path, bytes)
+            linkInputs.push({ path, bytes })
+        }
+        writeInput(ENTRY_OBJECT, entry!.object)
         const inputs = [ENTRY_OBJECT]
         const starts = others.filter((unit) =>
             Object.hasOwn(sourceProject.startUnits ?? {}, unit.path)
         )
         for (const [i, unit] of starts.entries()) {
             const object = `/start${i}.o`
-            this.writeExecutableSync(object, unit.object)
+            writeInput(object, unit.object)
             this.startObjectSources.set(object, `${X86_PROJECT_ROOT}/${unit.path}`)
             inputs.push(object)
         }
@@ -797,7 +803,7 @@ export class BlinkRuntime {
             ['/support.a', support]
         ] as const) {
             if (!units.length) continue
-            this.writeExecutableSync(
+            writeInput(
                 archivePath,
                 writeArchive(
                     units.map((unit) => ({
@@ -812,18 +818,32 @@ export class BlinkRuntime {
         // The map only says which of the Project's other Files the link took. Writing it is about a
         // quarter of a small program's link, so a Project without such Files goes without it.
         const mapped = userMembers.length > 0
-        this.beginLinking()
-        await defer()
-        this.throwIfSuperseded(replacement)
-        this.runTool(
-            '/linker',
+        const command =
             this.mode.binaries.linker
                 ?.link(inputs)
                 .replace(inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) +
-                (mapped ? ' -Map /program.map' : '')
-        )
-        await this.waitForState((state) => state !== BlinkState.Linking)
+            (mapped ? ' -Map /program.map' : '')
+        this.beginLinking()
+        await defer()
         this.throwIfSuperseded(replacement)
+        if (!this.reuseLink(command, linkInputs)) {
+            const logged = this.assemblerLogs.length
+            this.runTool('/linker', command)
+            await this.waitForState((state) => state !== BlinkState.Linking)
+            this.throwIfSuperseded(replacement)
+            if (this.state === BlinkState.ProgramLoaded && this.programBytes)
+                lastLink = {
+                    linker: this.mode.binaries.linker,
+                    command,
+                    inputs: linkInputs,
+                    logs: this.assemblerLogs.slice(logged),
+                    linkerLogs: this.linkerLogs ?? '',
+                    program: this.programBytes.slice(),
+                    map: mapped
+                        ? (this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string)
+                        : null
+                }
+        }
         if (mapped && this.state === BlinkState.ProgramLoaded) {
             const map = this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string
             for (const unit of userMembers) {
@@ -852,6 +872,39 @@ export class BlinkRuntime {
         this.buildProgress?.({ phase: 'download', resource })
         await bytes
         this.throwIfSuperseded(replacement)
+    }
+
+    /**
+     * Ends the link as the last one ended, without running `ld`, when this build would run the very
+     * same link: the same linker and command over byte-identical inputs, as a Build of a Program
+     * nothing changed does. The executable, the map and what the linker said are the last link's,
+     * and the program is taken as a finished link's is. Answers whether it did.
+     */
+    private reuseLink(command: string, inputs: readonly LinkInput[]): boolean {
+        const last = lastLink
+        if (
+            !last ||
+            last.linker !== this.mode.binaries.linker ||
+            last.command !== command ||
+            last.inputs.length !== inputs.length ||
+            !inputs.every(
+                (input, index) =>
+                    input.path === last.inputs[index]!.path &&
+                    sameBytes(input.bytes, last.inputs[index]!.bytes)
+            )
+        )
+            return false
+        // what running a tool would have done to the program and the run before it
+        this.clearWaitTransport()
+        ++this.generation
+        this.programSources = false
+        this.module._blinkenlib_abandon_execution()
+        this.assemblerLogs += last.logs
+        this.linkerLogs = last.linkerLogs
+        if (last.map !== null) this.module.FS.writeFile('/program.map', last.map)
+        this.writeExecutableSync(PROGRAM, last.program)
+        this.takeProgram()
+        return true
     }
 
     /** A build stops where it resumes once a later load or build has replaced its program. */
@@ -967,6 +1020,26 @@ export class BlinkRuntime {
      */
     getExecutable(): Uint8Array | null {
         return this.programBytes ? new Uint8Array(this.programBytes) : null
+    }
+
+    /**
+     * Whether the program held now is `program`, as `programIdentity` answered it for the same or
+     * an earlier build: the same executable's bytes, mapped onto Project Files of the same paths,
+     * which is all that what is read of it depends on.
+     */
+    isProgram(program: ProgramIdentity | null): boolean {
+        if (!program || !this.programBytes) return false
+        return (
+            program.layout === projectLayout(this.sourceProject) &&
+            (program.bytes === this.programBytes || sameBytes(program.bytes, this.programBytes))
+        )
+    }
+
+    /** The program held now, for `isProgram` to recognise later; null with none. */
+    programIdentity(): ProgramIdentity | null {
+        return this.programBytes
+            ? { bytes: this.programBytes, layout: projectLayout(this.sourceProject) }
+            : null
     }
 
     starti(): void {
@@ -1762,6 +1835,7 @@ export class BlinkRuntime {
      * `stdout` and `stderr` callbacks, which are the program's.
      */
     private runTool(progname: '/assembler' | '/linker', command: string): void {
+        if (progname === '/linker') linkerRuns++
         this.clearWaitTransport()
         ++this.generation
         this.programSources = false
@@ -2149,6 +2223,55 @@ function defaultScheduler(callback: () => void): void {
         return
     }
     setTimeout(callback, 0)
+}
+
+/** What `BlinkRuntime.isProgram` compares: an executable and the Project paths it maps onto. */
+export type ProgramIdentity = { readonly bytes: Uint8Array; readonly layout: string }
+
+/**
+ * The paths a program's source map can name, which are all a Project gives it besides its
+ * executable: its Files', its library units', its include paths and its Entry; none for a program
+ * loaded without sources.
+ */
+function projectLayout(project: X86Project | null): string {
+    if (!project) return ''
+    return JSON.stringify([
+        project.entry,
+        Object.keys(project.files).sort(),
+        Object.keys(project.library ?? {}).sort(),
+        Object.keys(project.startUnits ?? {}).sort(),
+        project.includePaths ?? []
+    ])
+}
+
+/** A file a link reads, as the build wrote it. */
+type LinkInput = { path: string; bytes: Uint8Array }
+
+/**
+ * The last link a build ran, which a build that would run the very same link reuses
+ * (`reuseLink`): `ld` runs as an emulated program, and took a second of a large C program's
+ * Build. One is kept, for every runtime, since rebuilding what was just built is what it is for.
+ */
+let lastLink: {
+    linker: unknown
+    command: string
+    inputs: readonly LinkInput[]
+    logs: string
+    linkerLogs: string
+    program: Uint8Array
+    map: string | null
+} | null = null
+
+/** How many times a build ran `ld`, which a test reads to see a link reused. */
+let linkerRuns = 0
+export function linkerRunCount(): number {
+    return linkerRuns
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.length !== b.length) return false
+    for (let index = 0; index < a.length; index++) if (a[index] !== b[index]) return false
+    return true
 }
 
 function defer(): Promise<void> {

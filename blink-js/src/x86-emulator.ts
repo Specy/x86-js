@@ -10,7 +10,12 @@ import {
     type StackFrame
 } from './interface'
 import { locateDiagnosticSpan, type AssemblerId, type AssemblerMode } from './assemblers'
-import { BlinkRuntime, type BlinkRuntimeCallbacks, type BlinkRuntimeOptions } from './blink-runtime'
+import {
+    BlinkRuntime,
+    type BlinkRuntimeCallbacks,
+    type BlinkRuntimeOptions,
+    type ProgramIdentity
+} from './blink-runtime'
 import {
     BlinkState,
     X86_REGISTER_NAMES,
@@ -105,6 +110,13 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     private lastCompileResult: X86CompileResult | null = null
     private lastSourceCode = ''
+    /**
+     * What `getCompiledInstructions` decoded, and of which program: it decodes every instruction
+     * the source map names, a few hundred milliseconds for a large program, which a Build asks for
+     * more than once and a Build of an unchanged Program asks for again.
+     */
+    private compiledInstructions: { program: ProgramIdentity; instructions: Instruction[] } | null =
+        null
     /** What `initialize()` was given: how many steps the history keeps, 0 recording none. */
     private undoSize = 0
     /** The undo history and call stack, both recorded inside the wasm. */
@@ -487,6 +499,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     dispose(): void {
         ++this.executionGeneration
+        this.compiledInstructions = null
         this.runtime.dispose()
         this.runtime.setStepRecording(false)
         this.clearExecutionTrace()
@@ -790,10 +803,16 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         // memory until execution starts. Load and pause at its entry before reading instruction
         // bytes; callers commonly request build metadata before their first step.
         if (this.runtime.state === BlinkState.ProgramLoaded) this.runtime.pauseAtEntry()
-        return this.runtime.getSourceMappedAddresses().flatMap((address) => {
+        const kept = this.compiledInstructions
+        if (kept && this.runtime.isProgram(kept.program))
+            return kept.instructions.map((instruction) => ({ ...instruction }))
+        const instructions = this.runtime.getSourceMappedAddresses().flatMap((address) => {
             const instruction = this.getInstructionAt(address)
             return instruction ? [instruction] : []
         })
+        const program = this.runtime.programIdentity()
+        this.compiledInstructions = program ? { program, instructions } : null
+        return instructions.map((instruction) => ({ ...instruction }))
     }
 
     getRegisterValues(): bigint[] {

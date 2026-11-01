@@ -214,6 +214,20 @@ terminal change shape, and programs find Linux's devices. The README's
   `run()` yields to the host a quarter as often. The linker and the assembler
   are preempted every 250,000 instructions rather than 100,000, and still
   stop at a hundred million.
+- A build of an unchanged Project redoes almost nothing. A Project unit is
+  kept assembled, by its path and text, under the rule library units already
+  followed (NASM read nothing but the unit, and the unit asks for no date or
+  time), and a unit whose `%include` scan found nothing but itself is not
+  scanned again. A build that would run the very same link as the last one,
+  the same linker and command over byte-identical objects and archives,
+  takes that link's executable, map and messages without running `ld`.
+  `getCompiledInstructions()` decodes a program once, keyed by its executable
+  and the paths of its Project, where the editor asked twice a build.
+  Rebuilding a C program of 4,000 lines, whose Generated assembly is 340 KB,
+  went from 2.1 s to under 0.1 s. History serials are opaque and count the
+  linker's instructions too, so a build whose link is reused starts its
+  program's serials from another number. `nasmInstanceCount()` and
+  `linkerRunCount()` count the NASM instances and `ld` runs, for tests.
 
 ## 7.0.0
 
