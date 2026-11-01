@@ -67,6 +67,7 @@ const ERRNO: Record<string, number> = {
     ENOENT: 44,
     ENOSPC: 51,
     ENOTDIR: 54,
+    ENOTEMPTY: 55,
     ENOTSUP: 138,
     EPERM: 63,
     ETXTBSY: 74,
@@ -76,11 +77,17 @@ const ERRNO: Record<string, number> = {
 /**
  * Emscripten owns the guest stream's shared offset (including dup). The capability sees only
  * positional reads and writes; its own handle cursor never advances twice.
+ *
+ * A Project has no empty Directories: one exists while a File's path runs through it. A folder the
+ * guest makes with mkdir is kept by the mount instead, for this run, so that Files can be created
+ * in it; the first File makes it a Directory of the Project, and one left empty is gone after the
+ * run.
  */
 export class ProjectFileSystemMount {
     private attached = true
     private opening = 0
     private readonly pendingNodes = new Set<ProjectNode>()
+    private readonly madeFolders = new Set<string>()
     private root: ProjectNode | null = null
     private readonly oldOpen: EmscriptenFS['open']
     private readonly wrappedOpen: EmscriptenFS['open']
@@ -259,9 +266,16 @@ export class ProjectFileSystemMount {
               ? this.translate(() =>
                     this.capability.fstat(node.openHandles!.values().next().value!)
                 )
-              : this.translate(() => this.capability.stat(node.projectPath))
+              : this.find(node.projectPath)
         if (!result) this.error('ENOENT')
         return result
+    }
+    /** What the Project has at a path, or a folder made by mkdir. */
+    private find(path: string): { kind: 'file' | 'directory'; size: number } | undefined {
+        return (
+            this.translate(() => this.capability.stat(path)) ??
+            (this.madeFolders.has(path) ? { kind: 'directory', size: 0 } : undefined)
+        )
     }
     private attributes(node: ProjectNode) {
         const stat = this.stat(node)
@@ -287,12 +301,20 @@ export class ProjectFileSystemMount {
         lookup: (parent: ProjectNode, name: string) => {
             this.ensureAttached()
             const path = this.path(parent, name)
-            const stat = this.translate(() => this.capability.stat(path))
+            const stat = this.find(path)
             if (!stat) this.error('ENOENT')
             return this.makeNode(parent, name, stat.kind, path)
         },
         mknod: (parent: ProjectNode, name: string, mode: number) => {
             this.ensureAttached()
+            if ((mode & 0o170000) === S_IFDIR) {
+                // Emscripten's mkdir has checked that nothing has the name. Undo cannot take the
+                // folder back, so it stops before the mkdir.
+                const path = this.path(parent, name)
+                this.madeFolders.add(path)
+                this.module._blinkenlib_history_mark_irreversible?.()
+                return this.makeNode(parent, name, 'directory', path)
+            }
             if ((mode & 0o170000) !== S_IFREG) this.error('ENOTSUP')
             const node = this.makeNode(parent, name, 'file', this.path(parent, name))
             node.pendingCreate = true
@@ -301,13 +323,19 @@ export class ProjectFileSystemMount {
         },
         readdir: (node: ProjectNode) => {
             this.ensureAttached()
-            return [
-                '.',
-                '..',
-                ...this.translate(() => this.capability.list(node.projectPath)).map(
-                    (entry) => entry.name
-                )
-            ]
+            const path = node.projectPath
+            const names = this.translate(() =>
+                path === '' || this.capability.stat(path)?.kind === 'directory'
+                    ? this.capability.list(path).map((entry) => entry.name)
+                    : []
+            )
+            const prefix = path ? `${path}/` : ''
+            for (const folder of this.madeFolders) {
+                const name = folder.slice(prefix.length)
+                if (folder.startsWith(prefix) && !name.includes('/') && !names.includes(name))
+                    names.push(name)
+            }
+            return ['.', '..', ...names]
         },
         rename: (node: ProjectNode, target: ProjectNode, name: string) => {
             if (node.projectKind === 'directory') this.error('EISDIR')
@@ -328,7 +356,17 @@ export class ProjectFileSystemMount {
             node.unlinked = true
             this.invalidateMissingAncestors(parent)
         },
-        rmdir: () => this.error('ENOTSUP'),
+        rmdir: (parent: ProjectNode, name: string) => {
+            const path = this.path(parent, name)
+            const inside = `${path}/`
+            if (
+                this.translate(() => this.capability.stat(path)) ||
+                [...this.madeFolders].some((folder) => folder.startsWith(inside))
+            )
+                this.error('ENOTEMPTY')
+            if (!this.madeFolders.delete(path)) this.error('ENOENT')
+            this.module._blinkenlib_history_mark_irreversible?.()
+        },
         setattr: () => this.error('ENOTSUP')
     }
     private readonly fileOps = {
@@ -463,7 +501,11 @@ export class ProjectFileSystemMount {
     }
 
     private invalidateMissingAncestors(node: ProjectNode): void {
-        while (node !== this.root && !this.capability.stat(node.projectPath)) {
+        while (
+            node !== this.root &&
+            !this.capability.stat(node.projectPath) &&
+            !this.madeFolders.has(node.projectPath)
+        ) {
             const parent = node.parent as ProjectNode
             this.module.FS.destroyNode(node)
             node = parent

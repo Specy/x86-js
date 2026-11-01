@@ -6,6 +6,11 @@ For 8.0.0: the wait request, the state block, the history packets and the
 terminal change shape, and programs find Linux's devices. The README's
 "Migrating to 8.0.0" lists what a host has to change.
 
+- `mkdir` under `/project` makes a Directory the mount keeps for the run, in
+  which Files can be created; the first File makes it a Directory of the
+  Project, and one left empty is gone after the run. `rmdir` removes it while
+  it is empty and answers ENOTEMPTY for a Directory that holds anything. Both
+  used to return EOPNOTSUPP.
 - The machine has the QEMU guest's devices (`docs/design/x86-devices-plan.md`,
   M1 to M4). Its device nodes, `/dev/fb0`, `/dev/tty0`, `/dev/input/event0`
   to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and `/dev/snd/midiC1D0`
