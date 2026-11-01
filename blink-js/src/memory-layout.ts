@@ -6,6 +6,7 @@ export type X86MemoryLayout = {
     sections: string[]
     /** Tuples of address, length, kind, section index, alignment. */
     items: bigint[]
+    /** The program's labels, code and data, each in the section it is in. */
     symbols: { name: string; address: bigint; section: number; fromLibrary: boolean; file?: string }[]
 }
 export function readMemoryLayout(elf: Uint8Array, units: readonly { path: string; object: Uint8Array }[], project: X86Project | null): X86MemoryLayout {
@@ -54,7 +55,7 @@ export function readMemoryLayout(elf: Uint8Array, units: readonly { path: string
     }
     for (const symbol of table.symbols) {
         if (symbol.type === 'file') { file = symbol.name === '/assembly.s' ? project?.entry : symbol.name.replace(`${X86_PROJECT_ROOT}/`, ''); continue }
-        if (!symbol.name || symbol.type === 'section' || !symbol.section || (symbol.section.flags & ELF_SECTION_FLAGS.execute)) continue
+        if (!symbol.name || symbol.type === 'section' || !symbol.section) continue
         const section = index.get(symbol.sectionIndex)
         if (section === undefined) continue
         const owner = symbol.binding === 'local' ? file : owners.get(symbol.name)
