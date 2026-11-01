@@ -62,6 +62,7 @@ export function stageX86Project(fs: EmscriptenFS, project: X86Project): void {
     // directory is made once rather than for each File in it (Emscripten finds the existing ones by
     // throwing), and text is encoded natively rather than by Emscripten's character loop.
     const directories = new Set<string>()
+    let entry: Uint8Array | undefined
     fs.mkdirTree(X86_PROJECT_ROOT)
     for (const [path, contents] of Object.entries(project.files)) {
         const absolutePath = `${X86_PROJECT_ROOT}/${path}`
@@ -70,7 +71,9 @@ export function stageX86Project(fs: EmscriptenFS, project: X86Project): void {
             fs.mkdirTree(directory)
             directories.add(directory)
         }
-        fs.writeFile(absolutePath, typeof contents === 'string' ? textEncoder.encode(contents) : contents)
+        const bytes = typeof contents === 'string' ? textEncoder.encode(contents) : contents
+        if (path === project.entry) entry = bytes
+        fs.writeFile(absolutePath, bytes)
         current.add(absolutePath)
     }
     for (const path of previous) {
@@ -84,7 +87,7 @@ export function stageX86Project(fs: EmscriptenFS, project: X86Project): void {
 
     // The assembler command remains stable at /assembly.s, avoiding command-string escaping for
     // arbitrary Project paths. Includes and incbins are resolved from the actual Entry directory.
-    fs.writeFile('/assembly.s', project.files[project.entry] as string)
+    fs.writeFile('/assembly.s', entry ?? textEncoder.encode(project.files[project.entry] as string))
     fs.chdir(projectDirectory(project.entry))
     stagedFiles.set(fs, current)
 }
