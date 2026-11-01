@@ -41,6 +41,7 @@
 #include "blink/syscall.h"
 #include "blink/terminal.h"
 #include "blink/debughistory.h"
+#include "blink/devices.h"
 #include "blink/browserpipe.h"
 #include "blink/thread.h"
 #include "blink/types.h"
@@ -267,6 +268,7 @@ static int IoctlFionbio(struct Machine *m, int fildes, i64 addr) {
   if ((rc = VfsFcntl(fildes, F_SETFL, oflags & SETFL_FLAGS)) != -1) {
     fd->oflags = oflags;
     BrowserPipeSetFlags(fildes, oflags);
+    DeviceFileSetFlags(fd, oflags);
   }
   UnlockFd(fd);
   return rc;
@@ -368,6 +370,41 @@ static int IoctlTiocsti(struct Machine *m, int fildes, i64 addr) {
 }
 #endif
 
+// The terminal's termios, which Blink stores as the program set it (see
+// terminal.c): TCGETS and its termios2 form read it back, the TCSETS family
+// replaces it, TCSETSF after discarding the input no read took.
+static int IoctlTerminalTcgets(struct Machine *m, u64 request, i64 addr) {
+  u32 cflag, ospeed;
+  struct termios2_linux gtio;
+  memset(&gtio, 0, sizeof(gtio));
+  GetTerminalTermios(&gtio.termios);
+  if (request == TCGETS_LINUX) {
+    return CopyToUserWrite(m, addr, &gtio.termios, sizeof(gtio.termios));
+  }
+  cflag = Read32(gtio.termios.cflag);
+  ospeed = LinuxBaudRate(cflag);
+  Write32(gtio.ospeed, ospeed);
+  Write32(gtio.ispeed,
+          cflag & CIBAUD_LINUX ? LinuxBaudRate(cflag >> 16) : ospeed);
+  return CopyToUserWrite(m, addr, &gtio, sizeof(gtio));
+}
+
+static int IoctlTerminalTcsets(struct Machine *m, u64 request, i64 addr) {
+  struct termios2_linux gtio;
+  bool termios2 = request == TCSETS2_LINUX || request == TCSETSW2_LINUX ||
+                  request == TCSETSF2_LINUX;
+  if (CopyFromUserRead(m, &gtio, addr,
+                       termios2 ? sizeof(gtio) : sizeof(gtio.termios)) == -1) {
+    return -1;
+  }
+  // output never queues, so draining it first (TCSETSW) waits for nothing
+  if (request == TCSETSF_LINUX || request == TCSETSF2_LINUX) {
+    FlushTerminalInput();
+  }
+  SetTerminalTermios(&gtio.termios);
+  return 0;
+}
+
 // The requests of a terminal's own that it answers itself, as a Linux
 // pseudo-terminal would, rather than passing them to the host descriptor
 // that only holds its number. The process is alone in its session and its
@@ -395,12 +432,9 @@ static int IoctlTerminal(struct Machine *m, u64 request, i64 addr) {
       return 0;
     case TCFLSH_LINUX:
       if (addr == TCIFLUSH_LINUX || addr == TCIOFLUSH_LINUX) {
-        // what the host gave and no read took is discarded; see
-        // TakeTerminalInput() about undo
-        if (HasTerminalInput()) {
-          DebugHistoryMarkIrreversible();
-          ClearTerminalInput();
-        }
+        // what the host gave and no read took is discarded, and journaled
+        // for Undo to put back
+        FlushTerminalInput();
       } else if (addr != TCOFLUSH_LINUX) {
         return einval();
       }
@@ -421,6 +455,7 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
   int (*tcsetattr_impl)(int, int, const struct termios *);
   int (*tcgetwinsize_impl)(int, struct winsize *);
   int (*tcsetwinsize_impl)(int, const struct winsize *);
+  int (*ioctl_impl)(struct Machine *, int, u64, i64);
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
@@ -429,7 +464,9 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
     unassert(tcgetwinsize_impl = fd->cb->tcgetwinsize);
     unassert(tcsetwinsize_impl = fd->cb->tcsetwinsize);
     terminal = IsTerminalFd(fd);
+    ioctl_impl = fd->cb->ioctl;
   } else {
+    ioctl_impl = 0;
     tcsetattr_impl = 0;
     tcgetattr_impl = 0;
     tcgetwinsize_impl = 0;
@@ -444,16 +481,18 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
   }
   if (terminal) {
     switch (request) {
-      case TIOCGWINSZ_LINUX:
-      case TIOCSWINSZ_LINUX:
       case TCGETS_LINUX:
+      case TCGETS2_LINUX:
+        return IoctlTerminalTcgets(m, request, addr);
       case TCSETS_LINUX:
       case TCSETSW_LINUX:
       case TCSETSF_LINUX:
-      case TCGETS2_LINUX:
       case TCSETS2_LINUX:
       case TCSETSW2_LINUX:
       case TCSETSF2_LINUX:
+        return IoctlTerminalTcsets(m, request, addr);
+      case TIOCGWINSZ_LINUX:
+      case TIOCSWINSZ_LINUX:
         break;  // through its callbacks, below
 #ifndef DISABLE_NONPOSIX
       case FIONBIO_LINUX:
@@ -463,6 +502,22 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
 #endif
       default:
         return IoctlTerminal(m, request, addr);
+    }
+  }
+  // A device answers its own requests, after the ones Linux's do_vfs_ioctl()
+  // answers for every descriptor, and ENOTTY for any it does not know.
+  if (ioctl_impl) {
+    switch (request) {
+#ifndef DISABLE_NONPOSIX
+      case FIONBIO_LINUX:
+        return IoctlFionbio(m, fildes, addr);
+      case FIOCLEX_LINUX:
+        return IoctlFioclex(m, fildes, true);
+      case FIONCLEX_LINUX:
+        return IoctlFioclex(m, fildes, false);
+#endif
+      default:
+        return ioctl_impl(m, fildes, request, addr);
     }
   }
   switch (request) {
@@ -557,7 +612,8 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
 #endif /* DISABLE_SOCKETS */
 #endif /* HAVE_SIOCGIFCONF */
     default:
+      // what Linux answers for a request nothing on the descriptor knows
       LOGF("missing ioctl %#" PRIx64, request);
-      return einval();
+      return enotty();
   }
 }

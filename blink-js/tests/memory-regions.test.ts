@@ -38,6 +38,11 @@ room: resb 16`
             true
         )
         expect(layout.symbols.find((symbol) => symbol.name === 'localData')?.fromLibrary).toBe(true)
+        //code labels too, in their executable section
+        const main = layout.symbols.find((symbol) => symbol.name === 'main')
+        expect(main).toMatchObject({ fromLibrary: false, file: 'main.asm' })
+        expect(layout.sections[main!.section]).toBe('.text')
+        expect(layout.symbols.find((symbol) => symbol.name === '_start')?.fromLibrary).toBe(true)
         const top = core.getStackTop()
         await core.step() // startup jump
         await core.step() // new stack

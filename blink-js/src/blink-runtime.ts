@@ -1,3 +1,4 @@
+import { countLinkerRun } from './linker-runs'
 import { readMemoryLayout, type X86MemoryLayout } from './memory-layout'
 import blinkenlib from './wasm/blinkenlib.js'
 import initBlinkWasm from './wasm/blinkenlib.wasm?init'
@@ -41,6 +42,10 @@ import {
     type FileSystemSkeleton
 } from './file-system'
 import { ProjectFileSystemMount, type X86ProjectFileSystem } from './project-file-system'
+import { decodeTerminalMode, decodeWakeSources, installDevices } from './devices'
+import { checkDisplayMode, FramebufferView } from './framebuffer'
+import { inputDeviceIndex, writeInputEvents } from './input'
+import { soundCut, soundTime } from './sound'
 import {
     BlinkState,
     END_OF_INPUT,
@@ -52,12 +57,23 @@ import {
     type X86CompileResult,
     type X86ImplementedSyscall,
     type X86Input,
+    type X86InputDeviceId,
+    type X86InputEvent,
     type X86InputRequest,
     type X86WaitRequest,
     type X86Environment,
     type X86Progress,
     type X86Project,
-    type X86SourceLocation
+    type X86SourceLocation,
+    type X86TerminalMode,
+    type X86DisplayMode,
+    type X86Framebuffer,
+    type X86FramebufferPresent,
+    type X86MidiEvent,
+    type X86MixerEvent,
+    type X86PcmEvent,
+    type X86SoundCutEvent,
+    type X86ToneEvent
 } from './types'
 import { observeCallbackResult, type MaybePromise } from './callbacks'
 import { X86_FPU_STATE_SIZE, emptyFpuStateBlock } from './fpu-state'
@@ -160,6 +176,22 @@ export type BlinkRuntimeCallbacks = {
     inputRequest?: (event: X86InputRequest) => MaybePromise<void>
     waitRequest?: (event: X86WaitRequest) => MaybePromise<void>
     unimplementedSyscall?: (event: { number: number; name: string }) => MaybePromise<void>
+    /** The terminal's mode at each start of a program, and whenever the program changes it. */
+    terminalMode?: (mode: X86TerminalMode) => MaybePromise<void>
+    /** A program opened a device node the machine does not cover; the open failed with ENODEV. */
+    unsupportedDevice?: (event: { path: string }) => MaybePromise<void>
+    /** The program panned, synced or blanked the framebuffer, or Undo moved its scanout. */
+    framebufferPresent?: (event: X86FramebufferPresent) => MaybePromise<void>
+    /** Samples `/dev/dsp` gives the card, with the Program time they start playing. */
+    pcm?: (event: X86PcmEvent) => MaybePromise<void>
+    /** A complete message the raw MIDI port gives the synthesizer, with the time it arrives. */
+    midi?: (event: X86MidiEvent) => MaybePromise<void>
+    /** The PC speaker's tone from a time on. */
+    tone?: (event: X86ToneEvent) => MaybePromise<void>
+    /** The mixer's gains on `/dev/dsp`, at each start of a program and at every change. */
+    mixer?: (event: X86MixerEvent) => MaybePromise<void>
+    /** Drop what was scheduled after a time. */
+    soundCut?: (event: X86SoundCutEvent) => MaybePromise<void>
 }
 
 export type BlinkRuntimeOptions = {
@@ -253,6 +285,8 @@ export class BlinkRuntime {
         this.mode = mode
         this.callbacks = callbacks
         this.scheduler = scheduler
+        // the devices are part of every program's file system, which each start puts back
+        installDevices(module, (fd, bytes) => this.deliverOutput(fd, bytes))
         this.skeleton = captureFileSystemSkeleton(module.FS)
     }
 
@@ -321,6 +355,42 @@ export class BlinkRuntime {
         ])
 
         runtime = new BlinkRuntime(module, mode, callbacks, scheduler, disassembler)
+        // Both arrive from inside a system call: a handler that throws is reported as an
+        // asynchronous one's failure, and the assembler's and linker's runs report nothing.
+        module.blinkTerminalMode = (bits) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.terminalMode, decodeTerminalMode(bits))
+        }
+        module.blinkUnsupportedDevice = (path) => {
+            if (runtime?.programSources) runtime.report(callbacks.unsupportedDevice, { path })
+        }
+        module.blinkFramebufferPresent = (yoffset) => {
+            if (runtime?.programSources) runtime.report(callbacks.framebufferPresent, { yoffset })
+        }
+        // The sound devices' timeline (sound.c), from system calls, Undo and the end of a run
+        module.blinkSoundPcm = (lo, hi, rate, frames) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.pcm, { start: soundTime(lo, hi), rate, frames })
+        }
+        module.blinkSoundMidi = (lo, hi, message) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.midi, { at: soundTime(lo, hi), message })
+        }
+        module.blinkSoundTone = (lo, hi, hz) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.tone, { at: soundTime(lo, hi), hz })
+        }
+        module.blinkSoundMixer = (volumeLeft, volumeRight, pcmLeft, pcmRight) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.mixer, {
+                    volume: [volumeLeft, volumeRight],
+                    pcm: [pcmLeft, pcmRight]
+                })
+        }
+        module.blinkSoundCut = (lo, hi, device) => {
+            if (runtime?.programSources)
+                runtime.report(callbacks.soundCut, soundCut(soundTime(lo, hi), device))
+        }
         module.onUnimplementedSyscall = (number) => {
             if (runtime?.programSources)
                 observeCallbackResult(
@@ -704,14 +774,20 @@ export class BlinkRuntime {
         }
         // Only now: a program that does not assemble has nothing to link.
         await this.downloadTool(this.mode.binaries.linker, 'the linker', replacement)
-        this.writeExecutableSync(ENTRY_OBJECT, entry!.object)
+        // what the link reads, which a build running the same link again compares (`reuseLink`)
+        const linkInputs: LinkInput[] = []
+        const writeInput = (path: string, bytes: Uint8Array) => {
+            this.writeExecutableSync(path, bytes)
+            linkInputs.push({ path, bytes })
+        }
+        writeInput(ENTRY_OBJECT, entry!.object)
         const inputs = [ENTRY_OBJECT]
         const starts = others.filter((unit) =>
             Object.hasOwn(sourceProject.startUnits ?? {}, unit.path)
         )
         for (const [i, unit] of starts.entries()) {
             const object = `/start${i}.o`
-            this.writeExecutableSync(object, unit.object)
+            writeInput(object, unit.object)
             this.startObjectSources.set(object, `${X86_PROJECT_ROOT}/${unit.path}`)
             inputs.push(object)
         }
@@ -728,7 +804,7 @@ export class BlinkRuntime {
             ['/support.a', support]
         ] as const) {
             if (!units.length) continue
-            this.writeExecutableSync(
+            writeInput(
                 archivePath,
                 writeArchive(
                     units.map((unit) => ({
@@ -743,18 +819,32 @@ export class BlinkRuntime {
         // The map only says which of the Project's other Files the link took. Writing it is about a
         // quarter of a small program's link, so a Project without such Files goes without it.
         const mapped = userMembers.length > 0
-        this.beginLinking()
-        await defer()
-        this.throwIfSuperseded(replacement)
-        this.runTool(
-            '/linker',
+        const command =
             this.mode.binaries.linker
                 ?.link(inputs)
                 .replace(inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) +
-                (mapped ? ' -Map /program.map' : '')
-        )
-        await this.waitForState((state) => state !== BlinkState.Linking)
+            (mapped ? ' -Map /program.map' : '')
+        this.beginLinking()
+        await defer()
         this.throwIfSuperseded(replacement)
+        if (!this.reuseLink(command, linkInputs)) {
+            const logged = this.assemblerLogs.length
+            this.runTool('/linker', command)
+            await this.waitForState((state) => state !== BlinkState.Linking)
+            this.throwIfSuperseded(replacement)
+            if (this.state === BlinkState.ProgramLoaded && this.programBytes)
+                lastLink = {
+                    linker: this.mode.binaries.linker,
+                    command,
+                    inputs: linkInputs,
+                    logs: this.assemblerLogs.slice(logged),
+                    linkerLogs: this.linkerLogs ?? '',
+                    program: this.programBytes.slice(),
+                    map: mapped
+                        ? (this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string)
+                        : null
+                }
+        }
         if (mapped && this.state === BlinkState.ProgramLoaded) {
             const map = this.module.FS.readFile('/program.map', { encoding: 'utf8' }) as string
             for (const unit of userMembers) {
@@ -783,6 +873,39 @@ export class BlinkRuntime {
         this.buildProgress?.({ phase: 'download', resource })
         await bytes
         this.throwIfSuperseded(replacement)
+    }
+
+    /**
+     * Ends the link as the last one ended, without running `ld`, when this build would run the very
+     * same link: the same linker and command over byte-identical inputs, as a Build of a Program
+     * nothing changed does. The executable, the map and what the linker said are the last link's,
+     * and the program is taken as a finished link's is. Answers whether it did.
+     */
+    private reuseLink(command: string, inputs: readonly LinkInput[]): boolean {
+        const last = lastLink
+        if (
+            !last ||
+            last.linker !== this.mode.binaries.linker ||
+            last.command !== command ||
+            last.inputs.length !== inputs.length ||
+            !inputs.every(
+                (input, index) =>
+                    input.path === last.inputs[index]!.path &&
+                    sameBytes(input.bytes, last.inputs[index]!.bytes)
+            )
+        )
+            return false
+        // what running a tool would have done to the program and the run before it
+        this.clearWaitTransport()
+        ++this.generation
+        this.programSources = false
+        this.module._blinkenlib_abandon_execution()
+        this.assemblerLogs += last.logs
+        this.linkerLogs = last.linkerLogs
+        if (last.map !== null) this.module.FS.writeFile('/program.map', last.map)
+        this.writeExecutableSync(PROGRAM, last.program)
+        this.takeProgram()
+        return true
     }
 
     /** A build stops where it resumes once a later load or build has replaced its program. */
@@ -898,6 +1021,26 @@ export class BlinkRuntime {
      */
     getExecutable(): Uint8Array | null {
         return this.programBytes ? new Uint8Array(this.programBytes) : null
+    }
+
+    /**
+     * Whether the program held now is `program`, as `programIdentity` answered it for the same or
+     * an earlier build: the same executable's bytes, mapped onto Project Files of the same paths,
+     * which is all that what is read of it depends on.
+     */
+    isProgram(program: ProgramIdentity | null): boolean {
+        if (!program || !this.programBytes) return false
+        return (
+            program.layout === projectLayout(this.sourceProject) &&
+            (program.bytes === this.programBytes || sameBytes(program.bytes, this.programBytes))
+        )
+    }
+
+    /** The program held now, for `isProgram` to recognise later; null with none. */
+    programIdentity(): ProgramIdentity | null {
+        return this.programBytes
+            ? { bytes: this.programBytes, layout: projectLayout(this.sourceProject) }
+            : null
     }
 
     starti(): void {
@@ -1130,14 +1273,106 @@ export class BlinkRuntime {
                 throw new TypeError('provideInput takes bytes, a string or END_OF_INPUT')
             this.module.blinkenlibProvideInput(bytes)
         }
-        if (this.state === BlinkState.ProgramWaitPause && this.waitRequest?.acceptsInput)
+        if (this.state === BlinkState.ProgramWaitPause && this.waitRequest?.wakeSources.terminal)
             return this.resumeWait()
+        return this.resumeRead()
+    }
+
+    /** Resumes a read that waited for input, which starts over: true when there was one. */
+    private resumeRead(): boolean {
         if (this.state !== BlinkState.ProgramReadlinePause) return false
         if (this.waitTimer !== null) clearTimeout(this.waitTimer)
         this.waitTimer = null
         this.setState(BlinkState.ProgramRunning)
         this.callNative(() => this.module._blinkenlib_faketty_resume())
         return true
+    }
+
+    /** The settings the program's terminal has now; canonical before any program ran. */
+    getTerminalMode(): X86TerminalMode {
+        return decodeTerminalMode(this.module._blinkenlib_terminal_mode?.() ?? 0x3f)
+    }
+
+    /**
+     * Whether the terminal applies `ICRNL` and its relatives to the input `provideInput()` gives,
+     * and `OPOST`'s `ONLCR` and `OCRNL` to what the program writes, as Linux's line discipline
+     * does when the program's termios asks for them. Both are off until asked for, which keeps
+     * what a program writes reaching `stdout` as it wrote it, as through a pipe.
+     */
+    setTerminalProcessing(processing: { input?: boolean; output?: boolean }): void {
+        this.terminalProcessing = { ...this.terminalProcessing, ...processing }
+        this.module._blinkenlib_set_terminal_processing?.(
+            this.terminalProcessing.input,
+            this.terminalProcessing.output
+        )
+    }
+    private terminalProcessing = { input: false, output: false }
+
+    /**
+     * Queues a signal for the program, as the terminal does for Ctrl+C (`SIGINT`, 2) and Ctrl+\
+     * (`SIGQUIT`, 3) under `ISIG`, discarding the input no read took unless `NOFLSH` is set. A
+     * running program takes it at its next instruction; a waiting one at once, as its wait ends
+     * and the call starts over. True when a program was there to take it.
+     */
+    sendSignal(signal: number): boolean {
+        if (!Number.isInteger(signal) || signal < 1 || signal > 64)
+            throw new RangeError(`Not a signal number: ${signal}`)
+        if (!this.programSources || !this.module._blinkenlib_send_signal?.(signal)) return false
+        if (this.state === BlinkState.ProgramWaitPause) this.resumeWait()
+        else this.resumeRead()
+        return true
+    }
+
+    /** The display mode the next program starts with, the guest's `video=`. */
+    setDisplayMode(mode: X86DisplayMode): void {
+        checkDisplayMode(mode)
+        if (!this.module._blinkenlib_set_display_mode?.(mode.width, mode.height))
+            throw new Error('This Core has no framebuffer')
+    }
+
+    /** The framebuffer the program opened, which lasts until the next program starts; or null. */
+    getFramebuffer(): X86Framebuffer | null {
+        if (!FramebufferView.exists(this.module)) return null
+        return (this.framebuffer ??= new FramebufferView(this.module))
+    }
+    private framebuffer: FramebufferView | null = null
+
+    /**
+     * Delivers one report of the host's to the keyboard or the tablet, stamped with Program time,
+     * as the guest's hardware and drivers would deliver it (see the README's "Input devices"). A
+     * wait the device can end resumes: true for that. Nothing happens without a program.
+     */
+    sendInputReport(device: X86InputDeviceId, events: readonly X86InputEvent[]): boolean {
+        const index = inputDeviceIndex(device)
+        const report = this.module._blinkenlib_input_report
+        if (!report) return false
+        writeInputEvents(
+            this.heapBytes(),
+            this.module._blinkenlib_input_report_buffer!(),
+            this.module._blinkenlib_input_report_capacity!(),
+            events
+        )
+        if (!this.programSources) return false
+        const woke = report(index, events.length, this.hostNow(0), this.hostNow(1))
+        if (
+            woke &&
+            this.state === BlinkState.ProgramWaitPause &&
+            this.waitRequest?.wakeSources.inputDevices.includes(device)
+        )
+            return this.resumeWait()
+        return false
+    }
+
+    /**
+     * A host callback a system call reached, reported as an asynchronous callback's failure is
+     * when it throws, so that nothing unwinds the wasm in the middle of the call.
+     */
+    private report<T>(callback: (event: T) => MaybePromise<void>, event: T): void {
+        try {
+            observeCallbackResult(callback(event))
+        } catch (error) {
+            observeCallbackResult(Promise.reject(error))
+        }
     }
 
     readMemoryBytes(address: bigint, length: bigint): Uint8Array {
@@ -1601,6 +1836,7 @@ export class BlinkRuntime {
      * `stdout` and `stderr` callbacks, which are the program's.
      */
     private runTool(progname: '/assembler' | '/linker', command: string): void {
+        if (progname === '/linker') countLinkerRun()
         this.clearWaitTransport()
         ++this.generation
         this.programSources = false
@@ -1701,7 +1937,8 @@ export class BlinkRuntime {
                 deadlineNanoseconds: deadline < 0n ? null : deadline,
                 remainingMilliseconds:
                     deadline < 0n ? null : millisecondsUntil(deadline, this.hostNow(clock)),
-                acceptsInput: Boolean(this.module._blinkenlib_wait_input()),
+                wakeSources: decodeWakeSources(this.module._blinkenlib_wait_wake_sources()),
+                terminalRead: Boolean(this.module._blinkenlib_wait_terminal_read()),
                 instructionSerial: this.getCurrentInstructionSerial()!
             }
             this.waitRequest = request
@@ -1927,7 +2164,15 @@ function withDefaultCallbacks(
         stateChange: callbacks.stateChange ?? (() => undefined),
         inputRequest: callbacks.inputRequest ?? (() => undefined),
         unimplementedSyscall: callbacks.unimplementedSyscall ?? (() => undefined),
-        waitRequest: callbacks.waitRequest ?? (() => undefined)
+        waitRequest: callbacks.waitRequest ?? (() => undefined),
+        terminalMode: callbacks.terminalMode ?? (() => undefined),
+        unsupportedDevice: callbacks.unsupportedDevice ?? (() => undefined),
+        framebufferPresent: callbacks.framebufferPresent ?? (() => undefined),
+        pcm: callbacks.pcm ?? (() => undefined),
+        midi: callbacks.midi ?? (() => undefined),
+        tone: callbacks.tone ?? (() => undefined),
+        mixer: callbacks.mixer ?? (() => undefined),
+        soundCut: callbacks.soundCut ?? (() => undefined)
     }
 }
 
@@ -1979,6 +2224,49 @@ function defaultScheduler(callback: () => void): void {
         return
     }
     setTimeout(callback, 0)
+}
+
+/** What `BlinkRuntime.isProgram` compares: an executable and the Project paths it maps onto. */
+export type ProgramIdentity = { readonly bytes: Uint8Array; readonly layout: string }
+
+/**
+ * The paths a program's source map can name, which are all a Project gives it besides its
+ * executable: its Files', its library units', its include paths and its Entry; none for a program
+ * loaded without sources.
+ */
+function projectLayout(project: X86Project | null): string {
+    if (!project) return ''
+    return JSON.stringify([
+        project.entry,
+        Object.keys(project.files).sort(),
+        Object.keys(project.library ?? {}).sort(),
+        Object.keys(project.startUnits ?? {}).sort(),
+        project.includePaths ?? []
+    ])
+}
+
+/** A file a link reads, as the build wrote it. */
+type LinkInput = { path: string; bytes: Uint8Array }
+
+/**
+ * The last link a build ran, which a build that would run the very same link reuses
+ * (`reuseLink`): `ld` runs as an emulated program, and took a second of a large C program's
+ * Build. One is kept, for every runtime, since rebuilding what was just built is what it is for.
+ */
+let lastLink: {
+    linker: unknown
+    command: string
+    inputs: readonly LinkInput[]
+    logs: string
+    linkerLogs: string
+    program: Uint8Array
+    map: string | null
+} | null = null
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.length !== b.length) return false
+    for (let index = 0; index < a.length; index++) if (a[index] !== b[index]) return false
+    return true
 }
 
 function defer(): Promise<void> {
@@ -2060,7 +2348,8 @@ function copyX86Project(project: X86Project): X86Project {
         entry: project.entry,
         files: copy(project.files),
         ...(project.library ? { library: copy(project.library) } : {}),
-        ...(project.startUnits ? { startUnits: copy(project.startUnits) } : {})
+        ...(project.startUnits ? { startUnits: copy(project.startUnits) } : {}),
+        ...(project.includePaths ? { includePaths: [...project.includePaths] } : {})
     }
 }
 

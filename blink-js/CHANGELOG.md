@@ -2,6 +2,136 @@
 
 ## Unreleased
 
+For 8.0.0: the wait request, the state block, the history packets and the
+terminal change shape, and programs find Linux's devices. The README's
+"Migrating to 8.0.0" lists what a host has to change.
+
+- The machine has the QEMU guest's devices (`docs/design/x86-devices-plan.md`,
+  M1 to M4). Its device nodes, `/dev/fb0`, `/dev/tty0`, `/dev/input/event0`
+  to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and `/dev/snd/midiC1D0`
+  to `midiC1D3`, udev's links and
+  `/proc/bus/input/devices` are made from one table in the Core and put back
+  at every start. `open()` finds a device by its node's number; the nodes the
+  machine does not cover open with ENODEV and raise the new `unsupportedDevice`
+  event. What `open()` makes is an open file description that `dup()` shares
+  with its `O_NONBLOCK`. An ioctl nothing knows answers ENOTTY instead of
+  EINVAL, but where the driver answers otherwise: evdev and `/dev/dsp` EINVAL,
+  `/dev/mixer` ENXIO. A blocking write to a device that paces it goes on from
+  what it queued each time Blink starts it over. Every start finds every
+  device as the machine boots it, whatever the last run left. See the README's
+  "Devices".
+- `/dev/fb0` is the framebuffer (M2), as Linux's DRM fbdev emulation answers on
+  the QEMU guest's bochs display: XRGB8888 over two pages of the display mode
+  `setDisplayMode()` sets for the next start (320×240 until then), the fixed
+  and variable screen information, `FBIOPUT_VSCREENINFO` answering as
+  `drm_fb_helper_check_var()` does, panning, `FBIO_WAITFORVSYNC` on the 1/60 s
+  boundaries of Program time and `FBIOBLANK`. `mmap` points the guest's pages
+  into one buffer that `munmap` never frees, and `read`, `write`, `pread64`,
+  `pwrite64` and `lseek` reach the same bytes. Stores through a mapping, what a
+  `write` replaces, file offsets and the device's settings are undoable.
+  `getFramebuffer()` gives the page the scanout shows as a view of the wasm
+  heap, and the `framebufferPresent` event marks pans, syncs, blanks and Undo
+  moving the scanout. See the README's "The framebuffer".
+- The input devices (M3): `/dev/input/event0` to `event4` answer evdev as
+  Linux 7.2 does for the guest's AT keyboard, PS/2 mouse, QEMU USB tablet, PC
+  Speaker and Power Button, with each one's identity and capabilities,
+  readers' queues of 4,096 events with evdev's `SYN_DROPPED`, the state
+  ioctls (`EVIOCGKEY`, `EVIOCGLED`, `EVIOCGABS` and the rest), `EVIOCGREP` and
+  `EVIOCSREP`, `EVIOCSCLOCKID`, `EVIOCGRAB`, masks, keymaps and writes. The new
+  `sendInputReport(device, events)` delivers a host key or pointer event to
+  the keyboard or the tablet as the guest's hardware and drivers make it:
+  `MSC_SCAN`, the lock keys' LEDs, `REL_WHEEL_HI_RES` and `SYN_REPORT`,
+  stamped with Program time. Reads, flushes and writes of an input device are
+  journaled rather than Undo barriers: Undo puts the events a read took back
+  (ADR 0069). `/proc/bus/input/devices` is generated from the same table; the
+  Power Button now lists `KEY_WAKEUP`, as Linux's has it. See the
+  README's "Input devices".
+- The sound devices (M4). `/dev/dsp` and `/dev/mixer` behave as Linux 7.2's
+  snd-pcm-oss and snd-mixer-oss on the guest's HDA card (QEMU's
+  `hda-duplex`): 8000 Hz U8 mono at open, the fixed `GETFMTS` mask, settings
+  written back, the buffer and fragments the kernel computes through its
+  plugins, `SETFRAGMENT` once, whole-fragment transfers, blocking and
+  non-blocking writes paced on Program time, `GETOSPACE`, `GETODELAY`,
+  `GETOPTR`, `SYNC`, `RESET`, a `close()` that plays the buffer out, and the
+  mixer's `VOLUME` and `IGAIN`. snd-virmidi's four raw MIDI devices and
+  `/dev/midi1` send at 31,250 baud behind rawmidi's buffer and answer its
+  ioctls. The PC speaker sounds for `EV_SND` events written to
+  `/dev/input/event3` and for `/dev/tty0`'s `KIOCSOUND` and `KDMKTONE`, which
+  reach it through the input core as on Linux, so the device's readers see
+  them too; `/dev/tty0` is a tty. What they play leaves the Core as the new
+  `pcm`, `midi`, `tone`, `mixer` and `soundCut` events, on Program time.
+  Writes to `/dev/dsp` and the MIDI ports and the devices' settings are
+  journaled rather than Undo barriers: Undo puts settings back and cuts what
+  was queued and not heard, and restores the MIDI channels and the speaker's
+  tone. See the README's "Sound".
+- The devices are the pinned guest's as its probe recorded them (M0,
+  `docs/research/x86-reference-guest.md`: QEMU 10.2.1, Debian 13 with Linux
+  7.2.11 from backports), where they were provisional. The input devices'
+  order is the guest's, `event0` the keyboard, `event1` the PS/2 mouse,
+  `event2` the tablet, `event3` the PC Speaker and `event4` the Power Button,
+  with its `/proc/bus/input/devices` text, udev's links (the tablet's `-mouse`
+  links lead to `js0`; `usbv2-` and `platform-LNXPWRBN:00-event` links are
+  new) and `sendInputReport()`'s indices. ALSA's minors are the guest's
+  dynamic ones (`midiC1D0` is 116:2). New nodes: `/dev/ttyS0` and
+  `/dev/console`, the serial line descriptors 0 to 2 are on, so `ttyname(0)`
+  answers `/dev/ttyS0`; `/dev/tty1`, the same console as `/dev/tty0`;
+  `/dev/dmmidi1` (device 0) and `/dev/amidi1` and `/dev/admmidi1` (device 1)
+  as raw MIDI ports; and, opening with ENODEV, `js0`, `controlC1`,
+  `controlC2`, `hwC0D0`, `pcmC2D0p`, `timer`, `/dev/mixer1`, `/dev/mixer2`,
+  `/dev/dsp2`, `/dev/audio2`, `/dev/uinput` and `/dev/tty2` to `/dev/tty63`,
+  with the `/dev/snd/by-path/`, `/dev/snd/by-id/` and `/dev/dri/by-path/`
+  links. `/dev/tty0` is mode 0600, its termios is what tty1's getty leaves,
+  and it answers `KDGETMODE`, `KDSETMODE`, `KDGKBMODE`, `KDSKBMODE`,
+  `KDGETLED`, `KDGKBLED` and `VT_GETSTATE`. The tablet has five buttons,
+  `BTN_SIDE` and `BTN_EXTRA` with their usages, and a keymap `EVIOCGKEYCODE`
+  and `EVIOCSKEYCODE` reach. A lock key's LED change arrives in the key's
+  release packet. The keyboard has Linux 7.2's keymap (F13 to F24). The
+  terminal starts with the serial line's termios as agetty leaves it (no
+  `ECHOCTL`, no `IEXTEN`, `IXOFF`, `IMAXBEL`, 9600 baud with `HUPCL` and
+  `CLOCAL`), and `X86TerminalMode` has `echoControl`. A pan of `/dev/fb0`
+  waits for the next vertical blank, and an `FBIOPUT_VSCREENINFO` that
+  changes anything for the second, as bochs-drm's commits do on 7.2;
+  `smem_len` is no longer rounded to pages. Raw MIDI's `PVERSION` is 2.0.5;
+  the mixer is `QEMU Generic` and its change counter starts at 14;
+  `SNDCTL_DSP_CHANNELS` takes its count unsigned (-1 is EINVAL); a fragment
+  whose plugin buffers are too large makes the calls that apply it answer
+  ENOMEM; `GETOSPACE` counts negative space in whole fragments down.
+- Every device but `/dev/fb0` has no file position, as on Linux: `pread64`,
+  `pwrite64`, `preadv`, `pwritev` and their v2 forms at an offset answer
+  ESPIPE before a read would wait, where they returned 0 or the length with
+  nothing done; `sendfile` from a device answers ESPIPE with an offset and
+  EINVAL without, and to a device but the console EINVAL. A reader of the PC
+  Speaker device waiting in `read`, `poll` or `select` wakes when a
+  `KDMKTONE` tone ends, since the silence can complete its packet. A write
+  to `/dev/dsp` or the MIDI port takes at most `MAX_RW_COUNT` bytes.
+- `X86WaitRequest` has `wakeSources`, the terminal and the input devices that
+  can end a wait, and `terminalRead`, whether the instruction waiting is a
+  read of the terminal, a raw read that `VTIME` times, which takes the input
+  that ends the wait, rather than a `poll` or `select` that only looks at it.
+  `acceptsInput` is gone: `wakeSources.terminal` says the same. A device that
+  keeps time folds the moment it is ready into the deadline.
+- `X86Project.includePaths` names directories of the Project that NASM
+  searches, as `-I`, for a `%include` or `incbin` it does not find in the
+  directory of the File it assembles, for every unit, the library's included.
+  A host offers include files of its own, such as a system's headers, as Files
+  under one of them, and diagnostics, instructions and breakpoints name them by
+  their Project paths. See the README's "Projects".
+- The terminal stores the termios a program sets, instead of ignoring it, and
+  reports it: `getTerminalMode()` and the `terminalMode` event. Raw mode reads
+  as `VMIN` and `VTIME` say, on Program time, and input given while no read
+  waits is kept as type-ahead. `setTerminalProcessing()` turns on `ICRNL` and
+  its relatives for input and `OPOST`'s `ONLCR` and `OCRNL` for output, which
+  stay off unless the host asks, so that what the program writes arrives as
+  it wrote it, as through a pipe. `sendSignal()` sends `SIGINT` or `SIGQUIT`
+  as Ctrl+C and Ctrl+\ do under `ISIG`.
+- A read of the terminal, a flush of its input and a change of its termios are
+  journaled instead of being Undo barriers: Undo of a read that waited asks
+  again, and type-ahead goes back (ADR 0069). The history packets carry the
+  journal after a 96-byte header, so their version is now 3.
+- A `rep` string instruction that writes more than the 64 KiB one instruction
+  keeps stops between iterations for the history and goes on at once: it stays
+  one step, one row and one instruction, and Undo restores all of it, up to
+  16 MiB.
 - The emulator runs VEX-encoded instructions: AVX, AVX2, FMA3, F16C, BMI1,
   BMI2, AES-NI, PCLMULQDQ and the SSE4.1 and SSE4.2 instructions. Of their
   legacy encodings, `pmulld`, `movntdqa`, `crc32` and `pclmulqdq` ran before
@@ -63,6 +193,41 @@
   the guest compares its deadline. In floating point, a short wait on a
   real-time clock far from zero could come out as 0 while the guest still
   waited, so a virtual clock advanced by it never reached the deadline.
+- Programs run faster: two and a half to four times as fast with the undo
+  history recording (the least on SSE and rep string loops, the most on
+  integer ones), 1.5 to 1.9 times without it, and a small program builds
+  about 25% faster, as the linker runs in the same loop. A step copies the
+  x87, SSE and AVX state only for an instruction that can change it, rather
+  than copying and comparing all of it twice per instruction; building with
+  `-DDEBUGHISTORY_CHECK_FPU` checks that list against every instruction a
+  program runs. An entry keeps the registers its step left as one block,
+  copied and compared a word at a time, and the registers it started from
+  only when something moved them between steps; its packet is built when it
+  is asked for, so the packets do not change. The byte budget counts an
+  entry's registers (152 bytes) and the rest of its packet, so the oldest
+  entries are hollowed at slightly different points. The new
+  `blinkenlib_history_header` gives an entry's header alone, without copying
+  its memory images, and the history reads it wherever it needs no more.
+  Every instruction is decoded once rather than twice, and the breakpoint and
+  interval timer checks cost nothing when there are none.
+- A native slice runs up to 200,000 instructions rather than 50,000, so a long
+  `run()` yields to the host a quarter as often. The linker and the assembler
+  are preempted every 250,000 instructions rather than 100,000, and still
+  stop at a hundred million.
+- A build of an unchanged Project redoes almost nothing. A Project unit is
+  kept assembled, by its path and text, under the rule library units already
+  followed (NASM read nothing but the unit, and the unit asks for no date or
+  time), and a unit whose `%include` scan found nothing but itself is not
+  scanned again. A build that would run the very same link as the last one,
+  the same linker and command over byte-identical objects and archives,
+  takes that link's executable, map and messages without running `ld`.
+  `getCompiledInstructions()` decodes a program once, keyed by its executable
+  and the paths of its Project, where the editor asked twice a build.
+  Rebuilding a C program of 4,000 lines, whose Generated assembly is 340 KB,
+  went from 2.1 s to under 0.1 s. History serials are opaque and count the
+  linker's instructions too, so a build whose link is reused starts its
+  program's serials from another number. `nasmInstanceCount()` and
+  `linkerRunCount()` count the NASM instances and `ld` runs, for tests.
 
 ## 7.0.0
 

@@ -6,7 +6,13 @@ import type { BlinkenlibModule } from './wasm-types'
 import { makeFrameColor, toHistoryPc } from './x86-emulator-utils'
 
 /** The version of debughistory.c's packets this reader decodes. */
-const PACKET_VERSION = 2
+const PACKET_VERSION = 3
+/**
+ * A packet's header. The journal of what the step did beyond the CPU and memory (what a read of
+ * the terminal took, the termios it set) comes last, for the wasm's own Undo; nothing here reads
+ * it.
+ */
+const HEADER = 96
 
 type FpuMutations = (
     before: Uint8Array,
@@ -15,7 +21,7 @@ type FpuMutations = (
     writes?: PokeWrite[]
 ) => void
 
-/** Reader for debughistory.c's v1 packets. Nothing here runs per instruction. */
+/** Reader for debughistory.c's v3 packets. Nothing here runs per instruction. */
 export class NativeHistory {
     /**
      * Decoded rows by serial, with the length of the packet each was decoded from: the history
@@ -61,6 +67,11 @@ export class NativeHistory {
         if (typeof module.wasmExports?.blinkenlib_history_recorded !== 'function') {
             throw new Error(
                 'This blinkenlib.wasm does not count the entries it records: it has no blinkenlib_history_recorded'
+            )
+        }
+        if (!module._blinkenlib_history_header) {
+            throw new Error(
+                'This blinkenlib.wasm cannot give an undo history header alone: it has no _blinkenlib_history_header'
             )
         }
     }
@@ -125,7 +136,7 @@ export class NativeHistory {
 
     /** The serial of the entry `offset` places back from the newest, when the ring holds one. */
     private serial(offset: number): bigint | undefined {
-        const pointer = this.runtime.module._blinkenlib_history_entry!(offset)
+        const pointer = this.runtime.module._blinkenlib_history_header!(offset)
         return pointer ? this.view(pointer, 16).getBigUint64(8, true) : undefined
     }
 
@@ -141,8 +152,8 @@ export class NativeHistory {
     }
 
     previousFlags(): number | undefined {
-        const pointer = this.runtime.module._blinkenlib_history_entry!(0)
-        return pointer ? this.view(pointer, 88).getUint32(40, true) : undefined
+        const pointer = this.runtime.module._blinkenlib_history_header!(0)
+        return pointer ? this.view(pointer, HEADER).getUint32(40, true) : undefined
     }
 
     canUndo(): boolean {
@@ -163,7 +174,7 @@ export class NativeHistory {
         if (count === 0) return true
         if (count > this.depth() - skip) return false
         for (let offset = skip; offset < skip + count; offset++) {
-            const pointer = this.runtime.module._blinkenlib_history_entry!(offset)
+            const pointer = this.runtime.module._blinkenlib_history_header!(offset)
             if (!pointer || !this.view(pointer, 24).getUint32(20, true)) return false
         }
         return true
@@ -239,8 +250,11 @@ export class NativeHistory {
         >()
         const steps: ExecutionStep[] = []
         for (let index = 0; index < count; index++) {
-            const pointer = this.runtime.module._blinkenlib_history_entry!(skip + index)
-            const header = this.view(pointer, 88)
+            // The header alone, so a cached row never copies its packet's memory images.
+            const header = this.view(
+                this.runtime.module._blinkenlib_history_header!(skip + index),
+                HEADER
+            )
             const serial = header.getBigUint64(8, true)
             const length = header.getUint32(4, true)
             const undoable = Boolean(header.getUint32(20, true))
@@ -248,7 +262,10 @@ export class NativeHistory {
             const step =
                 cached?.length === length && cached.undoable === undoable
                     ? cached.step
-                    : this.decode(pointer, length)
+                    : this.decode(
+                          this.runtime.module._blinkenlib_history_entry!(skip + index),
+                          length
+                      )
             nextCache.set(serial, { length, undoable, step })
             steps.push(step)
         }
@@ -267,7 +284,7 @@ export class NativeHistory {
         const mutations: ExecutionStep['mutations'] = []
         const writes: PokeWrite[] | undefined = poke ? [] : undefined
         const mask = view.getUint32(56, true)
-        let offset = 88
+        let offset = HEADER
         for (let index = 0; index < X86_REGISTER_NAMES.length; index++) {
             if (!(mask & (1 << index))) continue
             const old = view.getBigUint64(offset, true)

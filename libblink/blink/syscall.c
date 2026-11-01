@@ -58,7 +58,10 @@
 #include "blink/checked.h"
 #include "blink/debug.h"
 #include "blink/debughistory.h"
+#include "blink/devices.h"
 #include "blink/endian.h"
+#include "blink/fbdev.h"
+#include "blink/sound.h"
 #include "blink/flags.h"
 #include "blink/errno.h"
 #include "blink/flag.h"
@@ -392,6 +395,8 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
   /* The debugger retains the machine so an exit instruction can be undone.
    * Every trapped exit must halt, including one replayed after an undo. */
   if (m->system->trapexit) {
+    // the sound the program left staged plays out (sound.c)
+    SoundProgramExit(m);
     m->system->exited = true;
     /* A parent sees only the low eight bits of the status, as wait(2)'s
      * WEXITSTATUS() does on Linux: exit(256) is exit(0), exit(-1) is 255. */
@@ -818,7 +823,7 @@ static int SysFutexWaitAlone(struct Machine *m, i64 uaddr, u32 expect,
   }
   if (GuestWaitInterrupted(m)) return eintr();
   GuestWaitClock(clock);
-  GuestWaitHalt(m, deadline, false);
+  GuestWaitHalt(m, deadline, 0);
 }
 #endif
 
@@ -2682,7 +2687,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
     unassert(readv_impl = fd->cb->readv);
-    oflags = BrowserPipeFlags(fildes, fd->oflags);
+    oflags = DeviceFileFlags(fd, BrowserPipeFlags(fildes, fd->oflags));
     terminal = IsTerminalFd(fd);
   } else {
     readv_impl = 0;
@@ -2693,10 +2698,11 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   if (!fd) return -1;
   if ((oflags & O_ACCMODE) == O_WRONLY) return ebadf();
   if (!size) return 0;
-  // A read the terminal has nothing for halts here, before anything is set
-  // up or recorded, and starts over once the host has given it input.
-  if (terminal && !(oflags & O_NONBLOCK) && WaitForTerminalInput(m, size))
-    return eintr();
+  // A read the terminal or a device has nothing for halts here, before
+  // anything is set up or recorded, and starts over once the host has given
+  // it input or the time it waits for has passed.
+  if (terminal && WaitForTerminalInput(m, size, oflags)) return eintr();
+  if (WaitForDeviceRead(m, fildes, size, oflags) == -1) return -1;
   if (WaitForBrowserPipe(m, fildes, false, size, oflags)) return -1;
   InitIovs(&iv);
   if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
@@ -2720,7 +2726,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
     unassert(writev_impl = fd->cb->writev);
-    oflags = BrowserPipeFlags(fildes, fd->oflags);
+    oflags = DeviceFileFlags(fd, BrowserPipeFlags(fildes, fd->oflags));
   } else {
     writev_impl = 0;
     oflags = 0;
@@ -2728,6 +2734,12 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
   if ((oflags & O_ACCMODE) == O_RDONLY) return ebadf();
+  // a device whose buffer drains in Program time queues and waits by itself,
+  // at most MAX_RW_COUNT bytes in one call, as vfs_write() takes
+  if (IsPacedDevice(m, fildes)) {
+    struct GuestSegment segment = {addr, MIN(size, MAX_RW_COUNT_LINUX)};
+    return WriteDevice(m, fildes, &segment, 1, oflags);
+  }
   if (size) {
     if (WaitForBrowserPipe(m, fildes, true, size, oflags)) return -1;
     InitIovs(&iv);
@@ -2771,17 +2783,21 @@ static i64 SysPread(struct Machine *m, i32 fildes, i64 addr, u64 size,
   struct Iovs iv;
   struct ReadJournal journal;
   if (size > NUMERIC_MAX(size_t)) return eoverflow();
-  // a terminal has no position to read at
+  if ((i64)offset < 0) return einval();
+  // a terminal has no position to read at, nor has any device but /dev/fb0
   if ((terminal = IsTerminalFildes(m, fildes)) == -1) return -1;
   if (IsBrowserPipe(fildes)) return espipe();
   if (terminal) return espipe();
+  if (IsUnseekableDeviceFildes(m, fildes)) return espipe();
   if (CheckFdAccess(m, fildes, false, EBADF) == -1) return -1;
   if (size) {
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
       BeginReadJournal(m, &journal);
       JournalReadRange(m, addr, size);
-      RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
+      RESTARTABLE(rc = IsFramebufferFildes(m, fildes)
+                           ? PreadFramebuffer(fildes, iv.p, iv.i, offset)
+                           : VfsPreadv(fildes, iv.p, iv.i, offset));
       EndReadJournal(m, &journal, addr, rc);
     }
     FreeIovs(&iv);
@@ -2797,14 +2813,18 @@ static i64 SysPwrite(struct Machine *m, i32 fildes, i64 addr, u64 size,
   int terminal;
   struct Iovs iv;
   if (size > NUMERIC_MAX(size_t)) return eoverflow();
+  if ((i64)offset < 0) return einval();
   if ((terminal = IsTerminalFildes(m, fildes)) == -1) return -1;
   if (IsBrowserPipe(fildes)) return espipe();
   if (terminal) return espipe();
+  if (IsUnseekableDeviceFildes(m, fildes)) return espipe();
   if (CheckFdAccess(m, fildes, true, EBADF) == -1) return -1;
   if (size) {
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
-      RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
+      RESTARTABLE(rc = IsFramebufferFildes(m, fildes)
+                           ? PwriteFramebuffer(fildes, iv.p, iv.i, offset)
+                           : VfsPwritev(fildes, iv.p, iv.i, offset));
       if (rc != -1) SetReadAddr(m, addr, rc);
     }
     FreeIovs(&iv);
@@ -2858,7 +2878,7 @@ static i64 Preadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                   i64 offset) {
   i64 rc, size;
   int oflags;
-  bool terminal;
+  bool terminal, unseekable;
   struct Fd *fd;
   struct Iovs iv;
   struct ReadJournal journal;
@@ -2870,23 +2890,29 @@ static i64 Preadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
     unassert(readv_impl = fd->cb->readv);
-    oflags = BrowserPipeFlags(fildes, fd->oflags);
+    oflags = DeviceFileFlags(fd, BrowserPipeFlags(fildes, fd->oflags));
     terminal = IsTerminalFd(fd);
+    unseekable = IsDeviceFdUnseekable(fd);
   } else {
     readv_impl = 0;
     oflags = 0;
     terminal = false;
+    unseekable = false;
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
-  // a terminal has no position to read at
-  if ((terminal || IsBrowserPipe(fildes)) && offset != -1) return espipe();
+  // a terminal has no position to read at, nor has any device but /dev/fb0:
+  // ESPIPE before a device's read would wait
+  if ((terminal || unseekable || IsBrowserPipe(fildes)) && offset != -1) {
+    return espipe();
+  }
   if ((oflags & O_ACCMODE) == O_WRONLY) return ebadf();
   // nothing to read reads nothing, without waiting for the terminal
   if ((size = GetGuestIovsSize(m, iovaddr, iovlen)) <= 0) return size;
-  // a read the terminal has nothing for halts here, as SysRead() does
-  if (terminal && !(oflags & O_NONBLOCK) && WaitForTerminalInput(m, size))
-    return eintr();
+  // a read the terminal or a device has nothing for halts here, as SysRead()
+  // does
+  if (terminal && WaitForTerminalInput(m, size, oflags)) return eintr();
+  if (WaitForDeviceRead(m, fildes, size, oflags) == -1) return -1;
   if (WaitForBrowserPipe(m, fildes, false, size, oflags)) return -1;
   InitIovs(&iv);
   if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
@@ -2895,6 +2921,8 @@ static i64 Preadv(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
       JournalGuestIovs(m, iovaddr, iovlen);
       if (offset == -1) {
         RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
+      } else if (IsFramebufferFildes(m, fildes)) {
+        rc = PreadFramebuffer(fildes, iv.p, iv.i, offset);
       } else {
         RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
       }
@@ -2914,7 +2942,7 @@ static i64 Pwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                    i64 offset, i32 flags) {
   i64 rc;
   int oflags;
-  bool terminal;
+  bool terminal, unseekable;
   off_t at, end;
   struct stat st;
   struct Fd *fd;
@@ -2927,16 +2955,19 @@ static i64 Pwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
   if ((fd = GetFd(&m->system->fds, fildes))) {
     unassert(fd->cb);
     unassert(writev_impl = fd->cb->writev);
-    oflags = BrowserPipeFlags(fildes, fd->oflags);
+    oflags = DeviceFileFlags(fd, BrowserPipeFlags(fildes, fd->oflags));
     terminal = IsTerminalFd(fd);
+    unseekable = IsDeviceFdUnseekable(fd);
   } else {
     writev_impl = 0;
     oflags = 0;
     terminal = false;
+    unseekable = false;
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
-  if (IsBrowserPipe(fildes) && offset != -1) return espipe();
+  // a pipe has no position, nor has any device but /dev/fb0
+  if ((unseekable || IsBrowserPipe(fildes)) && offset != -1) return espipe();
   if (terminal) {
     // a terminal has no position: an offset is ESPIPE, and RWF_APPEND and
     // RWF_NOAPPEND change nothing
@@ -2946,6 +2977,10 @@ static i64 Pwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
   if ((oflags & O_ACCMODE) == O_RDONLY) return ebadf();
   i64 pipe_size = GetGuestIovsSize(m, iovaddr, iovlen);
   if (pipe_size < 0) return pipe_size;
+  if (IsPacedDevice(m, fildes)) {
+    if (offset != -1) return espipe();
+    return WriteDeviceGuestIovs(m, fildes, iovaddr, iovlen, oflags);
+  }
   if (WaitForBrowserPipe(m, fildes, true, pipe_size, oflags)) return -1;
   if (iovlen) {
     InitIovs(&iv);
@@ -3003,6 +3038,8 @@ static i64 Pwritev(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
           }
         } else if (offset == -1) {
           RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
+        } else if (IsFramebufferFildes(m, fildes)) {
+          rc = PwriteFramebuffer(fildes, iv.p, iv.i, offset);
         } else {
           RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
         }
@@ -3063,12 +3100,15 @@ static int CheckRwfFlags(i32 flags) {
 // after them; on x86-64 the high half is ignored, as linux ignores it.
 static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                       i64 offset, i64 offset_high, i32 flags) {
+  // a device without read_iter takes no flag but RWF_HIPRI
+  if ((flags & ~RWF_HIPRI_LINUX) && IsFramebufferFildes(m, fildes)) return eopnotsupp();
   if (CheckRwfFlags(flags) == -1) return -1;
   return Preadv(m, fildes, iovaddr, iovlen, offset);
 }
 
 static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
                        i64 offset, i64 offset_high, i32 flags) {
+  if ((flags & ~RWF_HIPRI_LINUX) && IsFramebufferFildes(m, fildes)) return eopnotsupp();
   if (CheckRwfFlags(flags) == -1) return -1;
   return Pwritev(m, fildes, iovaddr, iovlen, offset, flags);
 }
@@ -3085,9 +3125,20 @@ static i64 SysSendfile(struct Machine *m, i32 out_fd, i32 in_fd, i64 offsetaddr,
   if (CheckFdAccess(m, out_fd, true, EBADF) == -1) return -1;
   if (CheckFdAccess(m, in_fd, false, EBADF) == -1) return -1;
   // linux splices only from a regular file or a block device, and a
-  // terminal has no position to start at
-  if (IsTerminalFildes(m, in_fd) == 1 || IsBrowserPipe(in_fd)) {
-    return offsetaddr ? espipe() : einval();
+  // terminal has no position to start at; nor has any device but /dev/fb0,
+  // and none of them splices (no splice_read() in fbdev, evdev, OSS or raw
+  // MIDI; the console's tty would wait for keys VT1 never gets)
+  if (IsTerminalFildes(m, in_fd) == 1 || IsBrowserPipe(in_fd) ||
+      GetDeviceKind(m, in_fd)) {
+    return offsetaddr && GetDeviceKind(m, in_fd) != DEVICE_FRAMEBUFFER
+               ? espipe()
+               : einval();
+  }
+  // nor does any device but the console's tty take a splice (no
+  // splice_write())
+  if (GetDeviceKind(m, out_fd) &&
+      GetDeviceKind(m, out_fd) != DEVICE_CONSOLE) {
+    return einval();
   }
   // the output goes through the descriptor's callbacks, so that the
   // terminal gets it as writes
@@ -3269,6 +3320,8 @@ static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
   if (!(fd = GetAndLockFd(m, fildes))) return -1;
   if (IsTerminalFd(fd) || IsBrowserPipe(fildes)) {
     rc = espipe();  // a terminal has no position
+  } else if (IsFramebufferFildes(m, fildes)) {
+    rc = SeekFramebuffer(fildes, offset, whence);
   } else if (!fd->dirstream) {
     rc = VfsSeek(fd->fildes, offset, XlatWhence(whence));
   } else if (whence == SEEK_SET_LINUX) {
@@ -3500,6 +3553,7 @@ static int CheckSyncable(int fildes) {
 }
 
 static int SysFsync(struct Machine *m, i32 fildes) {
+  if (IsFramebufferFildes(m, fildes)) return SyncFramebuffer(fildes);
   if (CheckSyncable(fildes) == -1) return -1;
 #ifdef F_FULLSYNC
   int rc;
@@ -3524,6 +3578,7 @@ static int SysFsync(struct Machine *m, i32 fildes) {
 }
 
 static int SysFdatasync(struct Machine *m, i32 fildes) {
+  if (IsFramebufferFildes(m, fildes)) return SyncFramebuffer(fildes);
   if (CheckSyncable(fildes) == -1) return -1;
 #ifdef F_FULLSYNC
   int rc;
@@ -3762,7 +3817,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
     // the access mode and status flags, as linux keeps them: open() drops
     // the creation flags, close-on-exec belongs to the descriptor, and an
     // x86-64 kernel opens every file O_LARGEFILE
-    rc = (UnXlatOpenFlags(BrowserPipeFlags(fildes, fd->oflags)) &
+    rc = (UnXlatOpenFlags(DeviceFileFlags(fd, BrowserPipeFlags(fildes, fd->oflags))) &
           ~(O_CREAT_LINUX | O_EXCL_LINUX | O_NOCTTY_LINUX | O_TRUNC_LINUX |
             O_CLOEXEC_LINUX)) |
          (IsBrowserPipe(fildes) ? 0 : O_LARGEFILE_LINUX);
@@ -3785,6 +3840,7 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
       fd->oflags &= ~SETFL_FLAGS;
       fd->oflags |= fl;
       BrowserPipeSetFlags(fildes, fd->oflags);
+      DeviceFileSetFlags(fd, fd->oflags);
       rc = 0;
     } else {
       rc = -1;
@@ -4633,7 +4689,7 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
       if (rem) { Write64(gt.sec, ts.tv_sec); Write64(gt.nsec, ts.tv_nsec); if (CopyToUserWrite(m, rem, &gt, sizeof(gt)) == -1) return -1; }
       return eintr();
     }
-    GuestWaitHalt(m, deadline, false);
+    GuestWaitHalt(m, deadline, 0);
 #endif
     if (nanosleep(&ts, 0)) {
       unassert(errno == EINTR);
@@ -4692,7 +4748,7 @@ static int SysClockNanosleep(struct Machine *m, int clock, int flags,
     return eintr();
   }
   GuestWaitClock(sysclock);
-  GuestWaitHalt(m, until, false);
+  GuestWaitHalt(m, until, 0);
 #endif
 TryAgain:
 #if defined(TIMER_ABSTIME) && !defined(__OpenBSD__)
@@ -4792,7 +4848,7 @@ static int SysSigsuspend(struct Machine *m, i64 maskaddr, i64 sigsetsize) {
   GuestWaitMask(m, Read64(word));
   m->issigsuspend = true;
   if (GuestWaitInterrupted(m)) return eintr();
-  GuestWaitHalt(m, GetMaxTime(), false);
+  GuestWaitHalt(m, GetMaxTime(), 0);
 #else
   return SigsuspendActual(m, Read64(word));
 #endif
@@ -5187,7 +5243,8 @@ static i32 Select(struct Machine *m,          //
                   struct timespec *timeoutp,  //
                   const u64 *sigmaskp_guest) {
   int fildes, rc;
-  bool accepts_input = false;
+  u32 wake = 0;
+  i64 ready_at = -1, ready;
   i32 setsize;
   u64 oldmask_guest = 0;
   fd_set readfds, writefds, exceptfds, readyreadfds, readywritefds,
@@ -5258,11 +5315,16 @@ static i32 Select(struct Machine *m,          //
       }
       UNLOCK(&m->system->fds.lock);
       if (fd) {
-        if (IsTerminalFd(fd) && FD_ISSET(fildes, &readfds)) accepts_input = true;
         hfds[0].fd = fildes;
         hfds[0].events = ((FD_ISSET(fildes, &readfds) ? POLLIN : 0) |
                           (FD_ISSET(fildes, &writefds) ? POLLOUT : 0) |
                           (FD_ISSET(fildes, &exceptfds) ? POLLPRI : 0));
+        if (IsTerminalFd(fd) && FD_ISSET(fildes, &readfds)) wake |= WAKE_TERMINAL;
+        wake |= GetFdWakeSources(fd, hfds[0].events);
+        if ((ready = GetFdReadyDeadline(fd, hfds[0].events)) >= 0 &&
+            (ready_at < 0 || ready < ready_at)) {
+          ready_at = ready;
+        }
         switch (poll_impl(hfds, 1, 0)) {
           case 0:
             break;
@@ -5309,7 +5371,11 @@ static i32 Select(struct Machine *m,          //
       wait = FromMilliseconds(kPollingMs);
     }
 #ifdef __EMSCRIPTEN__
-    GuestWaitHalt(m, timeoutp ? deadline : GetMaxTime(), accepts_input);
+    if (ready_at >= 0) {
+      GuestWaitHaltWake(m, timeoutp ? deadline : GetMaxTime(), wake,
+                        DeviceTimespec(ready_at));
+    }
+    GuestWaitHalt(m, timeoutp ? deadline : GetMaxTime(), wake);
 #else
     nanosleep(&wait, 0);
 #endif
@@ -5445,7 +5511,8 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
   u64 gfdssize;
   struct Fd *fd;
   int fildes, rc, ev;
-  bool accepts_input = false;
+  u32 wake = 0;
+  i64 ready_at = -1, ready;
   struct pollfd hfds[1];
   struct pollfd_linux *gfds;
   struct timespec now, wait, remain;
@@ -5475,10 +5542,15 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
           if (fd) {
             hfds[0].fd = fildes;
             ev = Read16(gfds[i].events);
-            if (IsTerminalFd(fd) && (ev & POLLIN_LINUX)) accepts_input = true;
             hfds[0].events = (((ev & POLLIN_LINUX) ? POLLIN : 0) |
                               ((ev & POLLOUT_LINUX) ? POLLOUT : 0) |
                               ((ev & POLLPRI_LINUX) ? POLLPRI : 0));
+            if (IsTerminalFd(fd) && (ev & POLLIN_LINUX)) wake |= WAKE_TERMINAL;
+            wake |= GetFdWakeSources(fd, hfds[0].events);
+            if ((ready = GetFdReadyDeadline(fd, hfds[0].events)) >= 0 &&
+                (ready_at < 0 || ready < ready_at)) {
+              ready_at = ready;
+            }
             switch (poll_impl(hfds, 1, 0)) {
               case 0:
                 Write16(gfds[i].revents, 0);
@@ -5520,7 +5592,10 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
         }
 #ifdef __EMSCRIPTEN__
         if (GuestWaitCancelled()) return eintr();
-        GuestWaitHalt(m, deadline, accepts_input);
+        if (ready_at >= 0) {
+          GuestWaitHaltWake(m, deadline, wake, DeviceTimespec(ready_at));
+        }
+        GuestWaitHalt(m, deadline, wake);
 #else
         nanosleep(&wait, 0);
 #endif
@@ -5792,7 +5867,7 @@ static int SysPause(struct Machine *m) {
   int rc;
 #ifdef __EMSCRIPTEN__
   if (GuestWaitInterrupted(m)) return eintr();
-  GuestWaitHalt(m, GetMaxTime(), false);
+  GuestWaitHalt(m, GetMaxTime(), 0);
 #endif
   NORESTART(rc, pause());
   return rc;
@@ -6492,24 +6567,38 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
                                         i64 arg1, i64 arg2, i64 arg3,
                                         i64 arg4, i64 oldbrk) {
   if (result == -1) return;
+  // the framebuffer journals its file offset and what writes replace
+  if (FramebufferJournalsSyscall(m, call, arg1)) return;
   switch (call & 0xfff) {
     case 0x000: /* read: advances an open description or takes pipe bytes */
     case 0x013: /* readv */
+      /* the terminal and an input device journal what a read takes */
+      if (result > 0 && !IsTerminalFildes(m, arg1) &&
+          !IsJournaledDeviceFildes(m, arg1, false))
+        DebugHistoryMarkIrreversible();
+      break;
     case 0x001: /* write, except the deferred terminal transcript */
     case 0x014: /* writev */
-      if (result > 0 && !IsTerminalFildes(m, arg1))
+      /* an input device journals what a write injects, /dev/dsp and the MIDI
+       * port what it queues */
+      if (result > 0 && !IsTerminalFildes(m, arg1) &&
+          !IsJournaledDeviceFildes(m, arg1, true))
         DebugHistoryMarkIrreversible();
       break;
     case 0x011: /* pread64: a regular File does not move its offset */
     case 0x127: /* preadv */
       break;
     case 0x147: /* preadv2 with offset -1 advances the open description */
-      if (result > 0 && arg4 == -1 && !IsTerminalFildes(m, arg1))
+      if (result > 0 && arg4 == -1 && !IsTerminalFildes(m, arg1) &&
+          !IsJournaledDeviceFildes(m, arg1, false))
+        DebugHistoryMarkIrreversible();
+      break;
+    case 0x148: /* pwritev2 with offset -1 is a writev */
+      if (result > 0 && (arg4 != -1 || !IsJournaledDeviceFildes(m, arg1, true)))
         DebugHistoryMarkIrreversible();
       break;
     case 0x012: /* pwrite64 */
     case 0x128: /* pwritev */
-    case 0x148: /* pwritev2 */
     case 0x0D9: /* getdents64: moves the directory cursor */
       if (result > 0) DebugHistoryMarkIrreversible();
       break;
@@ -6524,11 +6613,10 @@ static void MarkUnjournaledSyscallEffect(struct Machine *m, u64 call, i64 result
     case 0x00C: /* brk: a query or refused change returns the old break */
       if (m->system->brk != oldbrk) DebugHistoryMarkIrreversible();
       break;
-    case 0x010: /* ioctl: only mutating terminal/descriptor operations */
+    case 0x010: /* ioctl: only mutating descriptor operations; the terminal
+                   journals its termios and the input it discards */
       switch (arg2) {
-        case TIOCSWINSZ_LINUX: case TCSETS_LINUX: case TCSETSW_LINUX:
-        case TCSETSF_LINUX: case TCSETS2_LINUX: case TCSETSW2_LINUX:
-        case TCSETSF2_LINUX: case TIOCSPGRP_LINUX: case FIONBIO_LINUX:
+        case TIOCSWINSZ_LINUX: case TIOCSPGRP_LINUX: case FIONBIO_LINUX:
         case FIOCLEX_LINUX: case FIONCLEX_LINUX:
           DebugHistoryMarkIrreversible();
       }

@@ -7,6 +7,7 @@
 #include "blink/signal.h"
 #include "blink/linux.h"
 #include "blink/debughistory.h"
+#include "blink/devices.h"
 #include <stdint.h>
 #include <limits.h>
 #ifdef __EMSCRIPTEN__
@@ -16,7 +17,18 @@ EM_JS(double, HostMilliseconds, (int clock), {
   catch (error) { Module.blinkHostError = error; return 0; }
 });
 #endif
-static bool pending, masked, cancelled, input_wait;
+static bool pending, masked, cancelled;
+/* What can end the wait besides its deadline, as WAKE_* bits (devices.h). */
+static u32 wake_sources;
+/* When a device the wait is on becomes ready, in Program time on the
+ * monotonic clock. Unlike `deadline`, which a wait keeps across the times its
+ * instruction starts over, a device's readiness is worked out again each
+ * time, so it is only folded into the deadline the host is told. */
+static bool wake_armed;
+static struct timespec wake_at;
+/* Whether the instruction waiting is a read of the terminal, which takes the
+ * input that ends the wait, where a poll of it only looks. */
+static bool terminal_read;
 static u64 saved_mask;
 static int wait_clock = CLOCK_MONOTONIC;
 static int reported_wait_clock = CLOCK_MONOTONIC;
@@ -26,7 +38,7 @@ static struct timespec deadline;
  * Its elapsed time is monotonic even when CLOCK_REALTIME jumps. */
 static struct timespec timer_deadline;
 static int64_t timer_interval_us;
-static bool timer_armed;
+bool guest_timer_armed;
 static struct timespec TimerNow(void) {
   struct timespec now;
   HostNow(CLOCK_MONOTONIC, &now);
@@ -44,7 +56,7 @@ static struct timespec AddMicros(struct timespec now, int64_t us) {
   return AddTime(now, delta);
 }
 void GuestTimerReset(void) {
-  timer_armed = false;
+  guest_timer_armed = false;
   timer_interval_us = 0;
   timer_deadline = GetZeroTime();
 }
@@ -52,13 +64,13 @@ void GuestTimerCheck(struct Machine *m) {
   struct timespec now;
   struct timespec late, step;
   __int128 late_ns, interval_ns, remaining_ns;
-  if (!timer_armed || !m) return;
+  if (!guest_timer_armed || !m) return;
   now = TimerNow();
   if (CompareTime(now, timer_deadline) < 0) return;
   DebugHistoryMarkIrreversible();
   EnqueueSignal(m, SIGALRM_LINUX);
   if (!timer_interval_us) {
-    timer_armed = false;
+    guest_timer_armed = false;
     return;
   }
   late = SubtractTime(now, timer_deadline);
@@ -74,7 +86,7 @@ int GuestTimerGet(struct itimerval *out) {
   GuestTimerCheck(g_machine);
   out->it_interval = MicrosTimeval(timer_interval_us);
   out->it_value = MicrosTimeval(0);
-  if (!timer_armed) return 0;
+  if (!guest_timer_armed) return 0;
   now = TimerNow();
   left = SubtractTime(timer_deadline, now);
   /* Linux rounds a nonzero remaining interval up to one microsecond. */
@@ -96,8 +108,8 @@ int GuestTimerSet(const struct itimerval *value, struct itimerval *old) {
     return 0;
   }
   timer_interval_us = TimevalMicros(value->it_interval);
-  timer_armed = value->it_value.tv_sec || value->it_value.tv_usec;
-  if (timer_armed)
+  guest_timer_armed = value->it_value.tv_sec || value->it_value.tv_usec;
+  if (guest_timer_armed)
     timer_deadline = AddMicros(TimerNow(), TimevalMicros(value->it_value));
   return 0;
 }
@@ -109,7 +121,7 @@ unsigned GuestTimerAlarm(unsigned seconds) {
   return old.it_value.tv_sec + !!old.it_value.tv_usec;
 }
 int64_t GuestTimerDeadline(void) {
-  if (!timer_armed) return -1;
+  if (!guest_timer_armed) return -1;
   if (timer_deadline.tv_sec >= INT64_MAX / 1000000000)
     return INT64_MAX;
   return ToNanoseconds(timer_deadline);
@@ -137,7 +149,8 @@ void GuestWaitMask(struct Machine *m, u64 mask) {
 void GuestWaitFinish(struct Machine *m) {
   if (masked) m->sigmask = saved_mask;
   m->issigsuspend = false;
-  pending = masked = cancelled = input_wait = false;
+  pending = masked = cancelled = wake_armed = terminal_read = false;
+  wake_sources = 0;
   wait_clock = CLOCK_MONOTONIC;
   reported_wait_clock_valid = false;
   deadline = GetZeroTime();
@@ -150,22 +163,49 @@ void GuestWaitRestoreMask(struct Machine *m) {
   m->issigsuspend = false;
 }
 bool GuestWaitCancelled(void) { return cancelled; }
-_Noreturn void GuestWaitHalt(struct Machine *m, struct timespec until, bool input) {
+static _Noreturn void Halt(struct Machine *m, struct timespec until, u32 wake,
+                           const struct timespec *at, bool read) {
   deadline = GuestWaitDeadline(until);
   pending = true;
-  input_wait = input;
+  wake_sources = wake;
+  wake_armed = at != 0;
+  if (at) wake_at = *at;
+  terminal_read = read;
   reported_wait_clock_valid = false;
   HaltMachine(m, kMachineWaitTrap);
+}
+/* Halts the instruction until `until` on the wait's clock, or until one of
+ * the `wake` sources has something for it; it starts over when the host
+ * resumes it. */
+_Noreturn void GuestWaitHalt(struct Machine *m, struct timespec until, u32 wake) {
+  Halt(m, until, wake, 0, false);
+}
+/* As GuestWaitHalt(), and also until `at` on the monotonic clock, when a
+ * device the instruction waits on becomes ready. */
+_Noreturn void GuestWaitHaltWake(struct Machine *m, struct timespec until,
+                                 u32 wake, struct timespec at) {
+  Halt(m, until, wake, &at, false);
+}
+/* Halts a read of the terminal until input comes or until `at` on the
+ * monotonic clock, when VTIME runs out: the host hears that the wait is a
+ * read, which takes what ends it. */
+_Noreturn void GuestWaitHaltTerminalRead(struct Machine *m, struct timespec at) {
+  Halt(m, GetMaxTime(), WAKE_TERMINAL, &at, true);
 }
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_wait_cancel(void) { cancelled = true; }
 EMSCRIPTEN_KEEPALIVE
 bool blinkenlib_wait_pending(void) { return pending; }
 EMSCRIPTEN_KEEPALIVE
-bool blinkenlib_wait_input(void) { return input_wait; }
+u32 blinkenlib_wait_wake_sources(void) { return wake_sources; }
+EMSCRIPTEN_KEEPALIVE
+bool blinkenlib_wait_terminal_read(void) { return terminal_read; }
 EMSCRIPTEN_KEEPALIVE
 int64_t blinkenlib_wait_deadline(void) {
   int64_t timer = GuestTimerDeadline();
+  /* a device's readiness is on the monotonic clock, as the timer is */
+  if (wake_armed && (timer < 0 || ToNanoseconds(wake_at) < timer))
+    timer = ToNanoseconds(wake_at);
   int64_t wait = deadline.tv_sec == GetMaxTime().tv_sec ? -1 : ToNanoseconds(deadline);
   reported_wait_clock = wait_clock;
   reported_wait_clock_valid = true;

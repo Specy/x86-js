@@ -224,7 +224,10 @@ describe('wait lifecycle and Linux readiness', () => {
         async (_name, body) => {
             const emulator = await make([...body])
             expect(await emulator.run(100000)).toBe(EmulatorStatus.Waiting)
-            expect(emulator.getWaitRequest()?.acceptsInput).toBe(true)
+            expect(emulator.getWaitRequest()).toMatchObject({
+                wakeSources: { terminal: true },
+                terminalRead: false
+            })
             expect(emulator.canUndo()).toBe(false)
             expect(() => emulator.beginPoke()).toThrow(/waiting/)
             expect(() => emulator.initialize(10)).toThrow(/waiting/)
@@ -255,7 +258,8 @@ describe('wait lifecycle and Linux readiness', () => {
             ])
             expect(await emulator.run(100000)).toBe(EmulatorStatus.Waiting)
             expect(emulator.getWaitRequest()).toMatchObject({
-                acceptsInput: false,
+                wakeSources: { terminal: false, inputDevices: [] },
+                terminalRead: false,
                 remainingMilliseconds: null,
                 deadlineNanoseconds: null
             })
@@ -761,7 +765,7 @@ it.each([
             {
                 now: () => now,
                 wait: async (request) => {
-                    expect(request.acceptsInput).toBe(false)
+                    expect(request.wakeSources.terminal).toBe(false)
                     now += request.remainingMilliseconds!
                 }
             }
@@ -793,7 +797,8 @@ it('cancels a full blocking pipe write without consuming bytes or requesting Ter
     await emulator.run(100000)
     expect(emulator.getWaitRequest()).toMatchObject({
         remainingMilliseconds: null,
-        acceptsInput: false
+        wakeSources: { terminal: false, inputDevices: [] },
+        terminalRead: false
     })
     const before = emulator.getInstructionsExecuted()
     const bytes: number[] = []

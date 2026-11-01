@@ -18,6 +18,7 @@
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "blink/fds.h"
 #include "blink/browserpipe.h"
+#include "blink/devices.h"
 
 #include <fcntl.h>
 #include <limits.h>
@@ -67,6 +68,8 @@ struct Fd *ForkFd(struct Fds *fds, struct Fd *fd, int fildes, int oflags) {
       // a copy is the same file: a terminal's stays the terminal
       fd2->cb = fd->cb;
       if (fd->cb == &kFdCbBrowserPipe) BrowserPipeDup(fd->fildes, fildes);
+      // and a device's shares its open file description
+      fd2->device = RetainDeviceFile(fd->device);
       fd2->path = fd->path ? strdup(fd->path) : 0;
       fd2->socktype = fd->socktype;
       fd2->norestart = fd->norestart;
@@ -116,6 +119,7 @@ int CountFds(struct Fds *fds) {
 void FreeFd(struct Fd *fd) {
   if (fd) {
     unassert(!pthread_mutex_destroy(&fd->lock));
+    ReleaseDeviceFile(fd->device);
     free(fd->path);
     free(fd);
   }

@@ -4,6 +4,7 @@ import type { X86Project, X86ProjectFile } from './types'
 export const X86_PROJECT_ROOT = '/__x86_project'
 
 const stagedFiles = new WeakMap<object, Set<string>>()
+const textEncoder = new TextEncoder()
 
 export function validateX86Project(project: X86Project): void {
     if (!isProjectPath(project.entry)) throw new Error(`Invalid x86 Project entry path: ${project.entry}`)
@@ -17,6 +18,14 @@ export function validateX86Project(project: X86Project): void {
         if (!isProjectPath(path)) throw new Error(`Invalid x86 Project file path: ${path}`)
         if (typeof contents !== 'string' && !(contents instanceof Uint8Array)) {
             throw new Error(`Invalid x86 Project file contents: ${path}`)
+        }
+    }
+    if (project.includePaths !== undefined && !Array.isArray(project.includePaths)) {
+        throw new Error('x86 Project include paths must be an array of directories')
+    }
+    for (const path of project.includePaths ?? []) {
+        if (!isProjectPath(path) || Object.hasOwn(project.files, path)) {
+            throw new Error(`Invalid x86 Project include path: ${path}`)
         }
     }
     for (const path of Object.keys(project.startUnits ?? {})) {
@@ -49,12 +58,19 @@ export function stageX86Project(fs: EmscriptenFS, project: X86Project): void {
     const previous = stagedFiles.get(fs) ?? new Set<string>()
     const current = new Set<string>()
 
+    // Every unit of a Project stages it again, in an assembler instance of its own, so each
+    // directory is made once rather than for each File in it (Emscripten finds the existing ones by
+    // throwing), and text is encoded natively rather than by Emscripten's character loop.
+    const directories = new Set<string>()
     fs.mkdirTree(X86_PROJECT_ROOT)
     for (const [path, contents] of Object.entries(project.files)) {
         const absolutePath = `${X86_PROJECT_ROOT}/${path}`
-        const separator = absolutePath.lastIndexOf('/')
-        if (separator > 0) fs.mkdirTree(absolutePath.slice(0, separator))
-        fs.writeFile(absolutePath, contents)
+        const directory = absolutePath.slice(0, absolutePath.lastIndexOf('/'))
+        if (directory !== X86_PROJECT_ROOT && !directories.has(directory)) {
+            fs.mkdirTree(directory)
+            directories.add(directory)
+        }
+        fs.writeFile(absolutePath, typeof contents === 'string' ? textEncoder.encode(contents) : contents)
         current.add(absolutePath)
     }
     for (const path of previous) {
@@ -86,7 +102,8 @@ export function selectX86Source(fs: EmscriptenFS, project: X86Project, path: str
 
 /**
  * Maps a path emitted by NASM or DWARF back to the exact Project path, or library path for a unit
- * of the Project's library.
+ * of the Project's library. A File NASM found through an include path is named by its full staged
+ * path, so it comes back as the Project path it was given at.
  */
 export function x86ProjectSourcePath(
     sourcePath: string | undefined,

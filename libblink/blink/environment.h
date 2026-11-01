@@ -7,13 +7,19 @@ int HostNow(int, struct timespec *);
 struct timespec GuestWaitDeadline(struct timespec);
 void GuestWaitMask(struct Machine *, u64);
 void GuestWaitFinish(struct Machine *);
-_Noreturn void GuestWaitHalt(struct Machine *, struct timespec, bool);
+_Noreturn void GuestWaitHalt(struct Machine *, struct timespec, u32);
+_Noreturn void GuestWaitHaltWake(struct Machine *, struct timespec, u32,
+                                 struct timespec);
+_Noreturn void GuestWaitHaltTerminalRead(struct Machine *, struct timespec);
 bool GuestWaitCancelled(void);
 bool GuestWaitInterrupted(struct Machine *);
 bool GuestWaitInterruptedRestartable(struct Machine *);
 void GuestWaitClock(int);
 void GuestWaitRestoreMask(struct Machine *);
 void GuestTimerReset(void);
+/* Whether ITIMER_REAL is armed: the run loop reads it before every
+ * instruction, and calls GuestTimerCheck() only then. */
+extern bool guest_timer_armed;
 void GuestTimerCheck(struct Machine *);
 int GuestTimerGet(struct itimerval *);
 int GuestTimerSet(const struct itimerval *, struct itimerval *);

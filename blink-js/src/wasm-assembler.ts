@@ -1,6 +1,6 @@
 import createNasm from './wasm/nasm.mjs'
 import { loadDisassembler, type Disassembler } from './disassembler'
-import { selectX86Source, stageX86Project } from './project'
+import { selectX86Source, stageX86Project, X86_PROJECT_ROOT } from './project'
 import { readResourceBytes, ResourceDownloadError } from './resources'
 import { parseDependencyList, x86TranslationUnitCandidates } from './translation-units'
 import type { X86BuildOptions, X86Project } from './types'
@@ -52,9 +52,18 @@ const DEPENDENCIES_PATH = '/unit.d'
  * `-g -F dwarf` is what makes the source map possible: the debugger reads
  * `.debug_line` out of the linked executable to map an address back to the line
  * it was written on. The working directory `selectX86Source` selects is what
- * lets NASM resolve `%include` itself.
+ * lets NASM resolve `%include` itself, and the Project's include paths follow
+ * these, as `-I`, for every unit.
  */
 const NASM_ARGS = ['-g', '-F', 'dwarf', '-felf64']
+
+/**
+ * NASM's `-I` for each of the Project's include paths: the staged directory, with the trailing
+ * slash NASM joins a written path to.
+ */
+function includeArguments(project: X86Project): string[] {
+    return (project.includePaths ?? []).map((path) => `-I${X86_PROJECT_ROOT}/${path}/`)
+}
 
 const NASM_WASM = new URL('./wasm/nasm.wasm', import.meta.url)
 /** What a download of `nasm.wasm` is called in progress and in errors. */
@@ -125,21 +134,39 @@ async function createNasmModule(): Promise<{
         }),
         instantiationFailed
     ])
+    nasmInstances++
     return { module, stdout: () => stdout, stderr: () => stderr }
+}
+
+/** How many NASM instances assemblies have created, which a test reads to see what was cached. */
+let nasmInstances = 0
+export function nasmInstanceCount(): number {
+    return nasmInstances
 }
 
 type LibraryObject = { object: Uint8Array; stdout: string; stderr: string; size: number }
 
 /**
- * Library and start units already assembled, by path and source. A Runtime library is the same
- * hundreds of units on every build and every check, and assembling them was most of the work. A
- * unit is kept only when NASM read nothing but the unit itself, so its object cannot depend on a
- * File of the Project, and only when it does not ask for the date or time, the one other input an
- * assembly has. A Map iterates in insertion order, which makes it least recently used first.
+ * Units already assembled, by path and source: library and start units, which are the same
+ * hundreds of units on every build and every check, and the Project's own, which a Build of an
+ * unchanged Program assembles again (the Generated assembly of a large C program is hundreds of
+ * kilobytes, and took most of a two-second Build). A unit is kept only when NASM read nothing but
+ * the unit itself, so its object cannot depend on another File, and only when it does not ask for
+ * the date or time, the one other input an assembly has. A Map iterates in insertion order, which
+ * makes it least recently used first.
  */
 const libraryObjects = new Map<string, LibraryObject>()
 const LIBRARY_OBJECT_BUDGET = 64 * 1024 * 1024
 let libraryObjectBytes = 0
+
+/**
+ * Units whose `%include` scan found nothing but themselves, by path and source. Such a unit
+ * includes no other File, so what its scan would find cannot change while its text does not, and
+ * a Build of an unchanged Program skips preprocessing it again.
+ */
+const includesNothing = new Set<string>()
+const INCLUDES_NOTHING_BUDGET = 16 * 1024 * 1024
+let includesNothingBytes = 0
 
 /** NASM's `__?DATE?__`, `__?TIME_NUM?__`, `__?UTC_DATE?__`, `__?POSIX_TIME?__`, and their old spellings. */
 const CLOCK_MACRO = /__\??(?:UTC_)?(?:DATE|TIME)|__\??POSIX_TIME/
@@ -196,14 +223,33 @@ async function scanIncludedFiles(
     if (candidates.length < 2) return included
 
     for (const path of candidates) {
+        const text = project.files[path]
+        const key = typeof text === 'string' ? libraryObjectKey(path, text) : undefined
+        if (key !== undefined && includesNothing.has(key)) continue
         const { module, stdout } = await createNasmModule()
         stageX86Project(module.FS, project)
         const source = selectX86Source(module.FS, project, path)
         // `-M` preprocesses and writes the dependency list without assembling, so a fragment that
         // cannot stand on its own costs nothing here; its diagnostics are deliberately discarded.
-        callNasm(module, ['-M', ...NASM_ARGS, source, '-o', OBJECT_PATH])
-        for (const dependency of parseDependencyList(stdout(), project)) {
+        callNasm(module, [
+            '-M',
+            ...NASM_ARGS,
+            ...includeArguments(project),
+            source,
+            '-o',
+            OBJECT_PATH
+        ])
+        const dependencies = parseDependencyList(stdout(), project)
+        for (const dependency of dependencies) {
             if (dependency !== path) included.add(dependency)
+        }
+        if (key !== undefined && dependencies.length === 1 && dependencies[0] === path) {
+            if (includesNothingBytes + key.length > INCLUDES_NOTHING_BUDGET) {
+                includesNothing.clear()
+                includesNothingBytes = 0
+            }
+            includesNothing.add(key)
+            includesNothingBytes += key.length
         }
     }
     return included
@@ -221,7 +267,8 @@ function withLibraryUnit(project: X86Project, path: string): X86Project {
         files: {
             ...project.files,
             [path]: (project.startUnits?.[path] ?? project.library?.[path])!
-        }
+        },
+        ...(project.includePaths ? { includePaths: project.includePaths } : {})
     }
 }
 
@@ -252,8 +299,8 @@ export const nasmWasmAssembler: WasmAssembler = {
             const isLibrary = library.has(path)
             const unitSource = isLibrary
                 ? (project.startUnits?.[path] ?? project.library?.[path])
-                : undefined
-            // Only a unit written as text is kept: a library given as bytes is assembled every time.
+                : project.files[path]
+            // Only a unit written as text is kept: one given as bytes is assembled every time.
             const key =
                 typeof unitSource === 'string' ? libraryObjectKey(path, unitSource) : undefined
             const cached = key === undefined ? undefined : takeLibraryObject(key)
@@ -271,6 +318,7 @@ export const nasmWasmAssembler: WasmAssembler = {
             const dependencies = key === undefined ? [] : ['-MD', DEPENDENCIES_PATH]
             const unitStatus = callNasm(module, [
                 ...NASM_ARGS,
+                ...includeArguments(staged),
                 ...dependencies,
                 source,
                 '-o',

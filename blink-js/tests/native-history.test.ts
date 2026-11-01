@@ -101,13 +101,27 @@ cell: dq 0
         // through the same journal, and have to leave the same trace.
         const batched = await build(source)
         const stepped = await build(source)
+        // Serials count every instruction a Core instance ever recorded, the linker's included, so
+        // the second Build, whose link is the first one's reused, starts from another number: the
+        // two histories are compared from where each program started.
+        const starts = new Map<X86Emulator, bigint>()
+        const history = (emulator: X86Emulator) => {
+            const rows = emulator.getUndoHistory(100)
+            //the first check sees every entry since the program started
+            if (!starts.has(emulator)) {
+                const serials = rows.map((row) => BigInt(row.serial))
+                starts.set(emulator, serials.reduce((least, serial) => (serial < least ? serial : least)))
+            }
+            const start = starts.get(emulator)!
+            return rows.map((row) => ({ ...row, serial: String(BigInt(row.serial) - start) }))
+        }
         const check = () => {
             expect(batched.runtime.getRegisterSnapshot()).toEqual(
                 stepped.runtime.getRegisterSnapshot()
             )
             expect(batched.runtime.getFpuStateRaw()).toEqual(stepped.runtime.getFpuStateRaw())
             expect(batched.getCallStack()).toEqual(stepped.getCallStack())
-            expect(batched.getUndoHistory(100)).toEqual(stepped.getUndoHistory(100))
+            expect(history(batched)).toEqual(history(stepped))
             expect(batched.getFlags()).toEqual(stepped.getFlags())
         }
         try {
@@ -146,18 +160,22 @@ cell: dq 0
     })
 
     it("counts a breakpoint stop after several slices as the whole run's instructions", async () => {
-        // A loop of 60,000 two-instruction passes, then the breakpoint: three slices of 50,000.
+        // A loop of 250,000 two-instruction passes, then the breakpoint: two whole slices of
+        // 200,000 and the breakpoint in a third.
         const source =
             PREFIX +
-            'mov ecx, 60000\nnext:\ndec ecx\njnz next\nnop\nmov eax, 60\nxor edi, edi\nsyscall\n'
+            'mov ecx, 250000\nnext:\ndec ecx\njnz next\nnop\nmov eax, 60\nxor edi, edi\nsyscall\n'
         const emulator = await build(source)
+        const slices = vi.spyOn(emulator.runtime, 'runSlice')
         try {
             expect(await emulator.run(undefined, [source.split('\n').indexOf('nop')])).toBe(
                 EmulatorStatus.Running
             )
+            expect(slices).toHaveBeenCalledTimes(3)
             expect(emulator.stopReason?.kind).toBe('breakpoint')
-            expect(emulator.stopReason?.executedInstructions).toBe(120001n)
+            expect(emulator.stopReason?.executedInstructions).toBe(500001n)
         } finally {
+            vi.restoreAllMocks()
             emulator.dispose()
         }
     })
@@ -174,17 +192,18 @@ cell: dq 0
         const spies = methods.map((method) => vi.spyOn(emulator.runtime, method))
         const slices = vi.spyOn(emulator.runtime, 'runSlice')
         try {
-            await emulator.run(100005)
+            // two whole native slices of 200,000 and a third of 5
+            await emulator.run(400005)
             for (const spy of spies) expect(spy).not.toHaveBeenCalled()
             expect(slices).toHaveBeenCalledTimes(3)
-            expect(emulator.stopReason?.executedInstructions).toBe(100005n)
-            expect(emulator.getRegisterValue('rbx')).toBe(50003n)
+            expect(emulator.stopReason?.executedInstructions).toBe(400005n)
+            expect(emulator.getRegisterValue('rbx')).toBe(200003n)
             expect(emulator.getUndoHistory(10)).toHaveLength(3)
             for (let i = 0; i < 3; i++) emulator.undo()
-            expect(emulator.getRegisterValue('rbx')).toBe(50001n)
+            expect(emulator.getRegisterValue('rbx')).toBe(200001n)
             expect(emulator.canUndo()).toBe(false)
             await emulator.step()
-            expect(emulator.getRegisterValue('rbx')).toBe(50002n)
+            expect(emulator.getRegisterValue('rbx')).toBe(200002n)
         } finally {
             vi.restoreAllMocks()
             emulator.dispose()
@@ -338,7 +357,7 @@ cell: dq 0
         }
     })
 
-    it('finishes a paused read as one irreversible row and checks the next breakpoint', async () => {
+    it('finishes a paused read as one row and checks the next breakpoint', async () => {
         const source =
             PREFIX +
             'xor eax, eax\nxor edi, edi\nlea rsi, [rel buffer]\nmov edx, 8\nsyscall\ninc rbx\njmp _start\nsection .data\nbuffer: dq 0x0102030405060708\n'
@@ -360,23 +379,23 @@ cell: dq 0
             })
             expect(emulator.stopReason?.kind).toBe('breakpoint')
             expect(emulator.getRegisterValue('rbx')).toBe(0n)
-            const after = emulator.runtime.getRegisterSnapshot()
             const row = emulator.getUndoHistory(1)[0]
-            expect(row.undoable).toBe(false)
+            expect(row.undoable).toBe(true)
             expect(row.mutations).toContainEqual({
                 type: 'WriteMemoryBytes',
                 value: { address, old: old.slice(0, 3), new: [97, 98, 10] }
             })
-            expect(() => emulator.undo()).toThrow('cannot be undone')
-            expect(emulator.runtime.getRegisterSnapshot()).toEqual(after)
             expect([...emulator.readMemoryBytes(address, 3n)]).toEqual([97, 98, 10])
             await emulator.step()
             expect(emulator.getRegisterValue('rbx')).toBe(1n)
-            expect(emulator.canUndoSteps(1)).toBe(true)
-            expect(emulator.canUndoSteps(2)).toBe(false)
+            expect(emulator.canUndoSteps(2)).toBe(true)
             emulator.undo()
             expect(emulator.getRegisterValue('rbx')).toBe(0n)
-            expect(emulator.canUndo()).toBe(false)
+            // the read, which asks again: what it waited for is not put back (ADR 0069)
+            emulator.undo()
+            expect([...emulator.readMemoryBytes(address, 8n)]).toEqual(old)
+            await emulator.step()
+            expect(emulator.getStatus()).toBe(EmulatorStatus.WaitingForInput)
         } finally {
             emulator.dispose()
         }
@@ -499,7 +518,7 @@ cell: dq 0
 
     it.each([
         ['no history at all', undefined, 'records no undo history'],
-        ['history of another version', 3, 'records undo history version 3']
+        ['history of another version', 2, 'records undo history version 2']
     ])('refuses a wasm with %s when the emulator is created', async (_, version, message) => {
         const create = BlinkRuntime.create.bind(BlinkRuntime)
         vi.spyOn(BlinkRuntime, 'create').mockImplementationOnce(async (options) => {

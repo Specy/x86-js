@@ -50,6 +50,8 @@ export type EmscriptenFS = {
     mkdir(path: string, mode?: number): void
     mkdirTree(path: string): void
     mkdev(path: string, mode: number, dev: number): void
+    /** Gives the character devices numbered `dev` their stream operations. */
+    registerDevice(dev: number, ops: object): void
     symlink(target: string, path: string): void
     readlink(path: string): string
     readdir(path: string): string[]
@@ -143,13 +145,74 @@ export type BlinkenlibModule = {
     blinkHostNow?: (clock: number) => number
     blinkHostRandom?: (pointer: number, length: number) => void
     blinkHostError?: unknown
+    /** The terminal's mode changed, as `TERMINAL_MODE_*` bits. */
+    blinkTerminalMode?: (mode: number) => void
+    /** A program opened a device node the machine does not cover, named by its path. */
+    blinkUnsupportedDevice?: (path: string) => void
+    /** Sound (sound.c): times in nanoseconds of Program time as their low and high 32 bits. */
+    blinkSoundPcm?: (lo: number, hi: number, rate: number, frames: Float32Array) => void
+    blinkSoundMidi?: (lo: number, hi: number, message: Uint8Array) => void
+    blinkSoundTone?: (lo: number, hi: number, hz: number) => void
+    blinkSoundMixer?: (
+        volumeLeft: number,
+        volumeRight: number,
+        pcmLeft: number,
+        pcmRight: number
+    ) => void
+    /** `device` is 0 for every device, 1 `/dev/dsp`, 2 the MIDI port, 3 the PC speaker. */
+    blinkSoundCut?: (lo: number, hi: number, device: number) => void
+    UTF8ToString(pointer: number): string
+    /** What can end the pending wait, as `WAKE_*` bits: 1 the terminal, 2 the keyboard, 4 the tablet. */
+    _blinkenlib_wait_wake_sources(): number
+    /** Whether the pending wait is a read of the terminal rather than a poll of it. */
+    _blinkenlib_wait_terminal_read(): boolean
+    /** The terminal's mode as `TERMINAL_MODE_*` bits (terminal.h). */
+    _blinkenlib_terminal_mode?(): number
+    _blinkenlib_set_terminal_processing?(input: boolean, output: boolean): void
+    _blinkenlib_send_signal?(signal: number): boolean
+    /** The device table (devices.c): each node's path, number, permissions and kind. */
+    _blinkenlib_device_count?(): number
+    _blinkenlib_device_path?(index: number): number
+    _blinkenlib_device_number?(index: number): number
+    _blinkenlib_device_mode?(index: number): number
+    _blinkenlib_device_kind?(index: number): number
+    _blinkenlib_device_link_count?(): number
+    _blinkenlib_device_link_path?(index: number): number
+    _blinkenlib_device_link_target?(index: number): number
+    _blinkenlib_input_devices_text?(): number
+    /** The program panned, synced or blanked the framebuffer: the line the scanout starts at. */
+    blinkFramebufferPresent?: (yoffset: number) => void
+    /** The next program's display mode; false for a size the machine does not take. */
+    _blinkenlib_set_display_mode?(width: number, height: number): boolean
+    /** The framebuffer's bytes in the heap, 0 until the program opens `/dev/fb0` (fbdev.c). */
+    _blinkenlib_framebuffer_pixels?(): number
+    _blinkenlib_framebuffer_size?(): number
+    _blinkenlib_framebuffer_width?(): number
+    _blinkenlib_framebuffer_height?(): number
+    _blinkenlib_framebuffer_line_length?(): number
+    _blinkenlib_framebuffer_yoffset?(): number
+    _blinkenlib_framebuffer_blanked?(): boolean
+    /** Where `_blinkenlib_input_report` reads a report's events, as int32 type, code and value. */
+    _blinkenlib_input_report_buffer?(): number
+    /** How many events that buffer holds. */
+    _blinkenlib_input_report_capacity?(): number
+    /**
+     * Delivers the report in the buffer to an input device (`INPUT_*`, devices.h) at the Program
+     * time given on the wall and monotonic clocks, in milliseconds: true when a reader got a whole
+     * packet.
+     */
+    _blinkenlib_input_report?(
+        device: number,
+        count: number,
+        realtimeMilliseconds: number,
+        monotonicMilliseconds: number
+    ): boolean
     _blinkenlib_get_brk(): bigint
     _blinkenlib_get_brk_start(): bigint
     _blinkenlib_get_stack_top(): bigint
     _blinkenlib_instructions_executed(): bigint
     _blinkenlib_active_instruction(): bigint
     _blinkenlib_wait_pending(): boolean
-    _blinkenlib_wait_input(): boolean
     _blinkenlib_wait_clock(): number
     _blinkenlib_wait_deadline(): bigint
     _blinkenlib_timer_deadline(): bigint
@@ -184,6 +247,7 @@ export type BlinkenlibModule = {
     _blinkenlib_history_clear?(): void
     _blinkenlib_history_count?(): number
     _blinkenlib_history_entry?(offset: number): number
+    _blinkenlib_history_header?(offset: number): number
     _blinkenlib_history_can_undo?(): boolean
     _blinkenlib_history_mark_irreversible?(): void
     _blinkenlib_history_undo?(): number

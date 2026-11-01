@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createX86Emulator } from '../src/x86-emulator'
 import { END_OF_INPUT } from '../src/types'
+import { EmulatorStatus } from '../src/interface'
 import { probeSource } from './linux-probe'
 
 async function make(body: string[]) {
@@ -52,10 +53,7 @@ describe('unjournaled effect boundaries', () => {
             1
         ],
         ['thread clear-tid pointer', ['sys 218,buf'], 1],
-        ['terminal flags', ['sys 16,0,0x5401,buf', 'sys 16,0,0x5402,buf'], 2],
-        ['termios2 terminal flags', ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542b,buf'], 2],
-        ['termios2 drained flags', ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542c,buf'], 2],
-        ['termios2 flushed flags', ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542d,buf'], 2]
+        ['terminal size', ['sys 16,0,0x5413,buf', 'sys 16,0,0x5414,buf'], 2]
     ] as const)(
         'retains %s as a barrier, with reversible CPU steps and Pokes above it',
         async (_name, body, count) => {
@@ -105,11 +103,28 @@ describe('unjournaled effect boundaries', () => {
         ['failed limit', ['mov qword [buf],256', 'mov qword [buf+8],128', 'sys 160,7,buf']],
         ['no-op dup2', ['sys 33,1,1']],
         ['zero read', ['sys 0,0,buf,0']],
-        ['empty flush', ['sys 16,0,0x540b,0']]
-    ] as const)('keeps %s reversible', async (_name, body) => {
+        ['empty flush', ['sys 16,0,0x540b,0']],
+        // the terminal journals its termios (ADR 0069)
+        ['terminal flags', ['sys 16,0,0x5401,buf', 'sys 16,0,0x5402,buf'], 2 as number],
+        [
+            'termios2 terminal flags',
+            ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542b,buf'],
+            2 as number
+        ],
+        [
+            'termios2 drained flags',
+            ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542c,buf'],
+            2 as number
+        ],
+        [
+            'termios2 flushed flags',
+            ['sys 16,0,0x802c542a,buf', 'sys 16,0,0x402c542d,buf'],
+            2 as number
+        ]
+    ] as const)('keeps %s reversible', async (_name, body, count: number = 1) => {
         const emulator = await make([...body])
         try {
-            await throughSyscall(emulator)
+            await throughSyscall(emulator, count)
             expect(emulator.canUndo()).toBe(true)
             expect(emulator.canUndoSteps(1)).toBe(true)
             emulator.undo()
@@ -119,17 +134,32 @@ describe('unjournaled effect boundaries', () => {
         }
     })
 
+    // Type-ahead a read or a flush took goes back at the front on Undo (ADR 0069): the read run
+    // again takes it without waiting
     it.each(['bytes', 'EOF', 'flush bytes', 'flush EOF'] as const)(
-        'marks actual %s consumption irreversible',
+        'journals the %s it consumes, and Undo puts them back',
         async (kind) => {
             const flush = kind.startsWith('flush')
-            const emulator = await make([flush ? 'sys 16,0,0x540b,0' : 'sys 0,0,buf,8'])
+            const eof = kind.endsWith('EOF')
+            const emulator = await make([
+                ...(flush ? ['sys 16,0,0x540b,0'] : []),
+                'sys 0,0,buf,8',
+                'save'
+            ])
             try {
-                emulator.provideInput(kind.endsWith('EOF') ? END_OF_INPUT : 'abc\n')
+                emulator.provideInput(eof ? END_OF_INPUT : 'abc\n')
                 await throughSyscall(emulator)
-                expect(emulator.canUndo()).toBe(false)
-                expect(emulator.getUndoHistory(1)[0].undoable).toBe(false)
-                expect(() => emulator.undo()).toThrow('cannot be undone')
+                expect(emulator.getUndoHistory(1)[0].undoable).toBe(true)
+                expect(emulator.canUndo()).toBe(true)
+                const result = emulator.getRegisterValue('rax')
+                emulator.undo()
+                expect(emulator.getNextInstruction()?.code.toLowerCase()).toContain('syscall')
+                // past the flush, with a Poke, to the read
+                if (flush) emulator.setRegisterValue('rip', emulator.getPc() + 2n)
+                else expect(result).toBe(eof ? 0n : 4n)
+                await throughSyscall(emulator)
+                expect(emulator.getStatus()).not.toBe(EmulatorStatus.WaitingForInput)
+                expect(emulator.getRegisterValue('rax')).toBe(eof ? 0n : 4n)
             } finally {
                 emulator.dispose()
             }

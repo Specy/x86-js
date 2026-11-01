@@ -129,6 +129,15 @@ static u64 SubtractCx(P, u64 x) {
   return cx;
 }
 
+// Stops a rep string instruction between two iterations, with rcx, rsi and
+// rdi as the iterations so far left them and rip on the instruction, as the
+// trap flag stops it below; the run loop hands the history what it wrote and
+// goes on at once (see blinkenlib.c).
+static _Noreturn void SplitString(struct Machine *m) {
+  if (m->stashaddr) CommitStash(m);
+  HaltMachine(m, kMachineRepSplit);
+}
+
 static void StringOp(P, int op) {
   bool stop;
   unsigned n;
@@ -142,6 +151,11 @@ static void StringOp(P, int op) {
   atomic_thread_fence(memory_order_acquire);
   do {
     if (Rep(rde) && !ReadCx(A)) break;
+    if (Rep(rde) &&
+        (op == STRING_MOVS || op == STRING_STOS || op == STRING_INS) &&
+        ShouldSplitString(m, n)) {
+      SplitString(m);
+    }
     switch (op) {
       case STRING_CMPS:
         kAlu[ALU_SUB][RegLog2(rde)](
@@ -210,21 +224,35 @@ static void StringOp(P, int op) {
   IGNORE_RACES_END();
 }
 
+// How many of `cx` bytes a rep string instruction writes before it stops for
+// the history: all of them, unless they would outgrow the write journal.
+static u64 StringPart(P, u64 cx) {
+  u64 room;
+  if (!m->recordwrites) return cx;
+  room = MACHINE_WRITE_OLD_BYTES_MAX - m->writeoldbytesused;
+  if (!room || m->writeoldcount >= MACHINE_WRITE_RECORD_MAX) {
+    if (m->writeoldcount) SplitString(m);
+    return cx;
+  }
+  return MIN(cx, room);
+}
+
 static void RepMovsbEnhanced(P) {
   u8 *direal, *sireal;
-  u64 diactual, siactual, cx;
+  u64 diactual, siactual, cx, part;
   u16 dilow, silow;
   long diremain, siremain, i, n;
   if ((cx = ReadCx(A))) {
     diactual = AddressDi(A);
     siactual = AddressSi(A);
     if (diactual != siactual) {
+      part = StringPart(A, cx);
       if (!GetFlag(m->flags, FLAGS_DF)) {
-        SetWriteAddr(m, diactual, cx);
-        SetReadAddr(m, siactual, cx);
+        SetWriteAddr(m, diactual, part);
+        SetReadAddr(m, siactual, part);
       } else {
-        SetWriteAddr(m, diactual - cx + 1, cx);
-        SetReadAddr(m, siactual - cx + 1, cx);
+        SetWriteAddr(m, diactual - part + 1, part);
+        SetReadAddr(m, siactual - part + 1, part);
       }
       IGNORE_RACES_START();
       atomic_thread_fence(memory_order_acquire);
@@ -238,7 +266,7 @@ static void RepMovsbEnhanced(P) {
           diremain = MIN(diremain, 65536 - dilow);
           siremain = 4096 - (siactual & 4095);
           siremain = MIN(siremain, 65536 - silow);
-          n = MIN(cx, MIN(diremain, siremain));
+          n = MIN(part, MIN(diremain, siremain));
           if (!IsRomAddress(m, direal)) {
             for (i = 0; i < n; ++i) {
               direal[i] = sireal[i];
@@ -251,7 +279,7 @@ static void RepMovsbEnhanced(P) {
           diremain = MIN(diremain, (long)dilow + 1);
           siremain = (siactual & 4095) + 1;
           siremain = MIN(siremain, (long)silow + 1);
-          n = MIN(cx, MIN(diremain, siremain));
+          n = MIN(part, MIN(diremain, siremain));
           if (!IsRomAddress(m, direal)) {
             for (i = 0; i < n; ++i) {
               direal[-i] = sireal[-i];
@@ -261,39 +289,44 @@ static void RepMovsbEnhanced(P) {
           AddSi(A, -n);
         }
         cx = SubtractCx(A, n);
-        if (cx) {
+        part -= n;
+        if (part) {
           diactual = AddressDi(A);
           siactual = AddressSi(A);
         }
-      } while (cx);
+      } while (part);
       atomic_thread_fence(memory_order_release);
       IGNORE_RACES_END();
+      if (cx) SplitString(m);
     }
   }
 }
 
 static void RepStosbEnhanced(P) {
   u8 *direal;
-  u64 diactual, cx;
+  u64 diactual, cx, part;
   u16 dilow;
   unsigned diremain, n;
   if ((cx = ReadCx(A))) {
     diactual = AddressDi(A);
-    SetWriteAddr(m, diactual, cx);
+    part = StringPart(A, cx);
+    SetWriteAddr(m, diactual, part);
     IGNORE_RACES_START();
     do {
       direal = ResolveAddress(m, diactual);
       dilow = Get16(m->di);
       diremain = 4096 - (diactual & 4095);
       diremain = MIN(diremain, 65536 - dilow);
-      n = MIN(cx, diremain);
+      n = MIN(part, diremain);
       if (!IsRomAddress(m, direal)) memset(direal, m->al, n);
       AddDi(A, n);
       cx = SubtractCx(A, n);
-      if (cx) diactual = AddressDi(A);
-    } while (cx);
+      part -= n;
+      if (part) diactual = AddressDi(A);
+    } while (part);
     atomic_thread_fence(memory_order_release);
     IGNORE_RACES_END();
+    if (cx) SplitString(m);
   }
 }
 

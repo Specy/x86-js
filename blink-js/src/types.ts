@@ -128,6 +128,14 @@ export type X86Project = {
     startUnits?: Readonly<Record<string, X86ProjectFile>>
     /** Support archive, searched after all user units. */
     library?: Readonly<Record<string, X86ProjectFile>>
+    /**
+     * Directories of the Project that NASM searches, in this order, for a `%include` or `incbin`
+     * it does not find in the directory of the File it assembles, as `-I` names them: a host that
+     * offers include files of its own, such as a system's headers, puts them among the Files under
+     * one of these. Diagnostics, instructions and Breakpoints name a File found there by its
+     * Project path, as they name every other. The blink-hosted assemblers do not search them.
+     */
+    includePaths?: readonly string[]
 }
 
 export type X86SourceLocation = {
@@ -170,8 +178,154 @@ export type X86InputRequest = {
     maxBytes: bigint
 }
 
+/**
+ * The termios settings the program set on its terminal that the host's line discipline follows,
+ * the flag each is named after on, or off. Every program starts in canonical mode with all of them
+ * on.
+ */
+export type X86TerminalMode = {
+    /** `ICANON`: a read takes a line; off, the bytes typed so far, as `VMIN` and `VTIME` say. */
+    canonical: boolean
+    /** `ECHO`: what is typed is echoed. */
+    echo: boolean
+    /**
+     * `ECHOCTL`: under `ECHO`, a control character typed is echoed as `^` and a letter (`^C`,
+     * `^[`); off, as itself. The serial line starts with it off, as agetty leaves it.
+     */
+    echoControl: boolean
+    /** `ISIG`: Ctrl+C and Ctrl+\ send `SIGINT` and `SIGQUIT` (see `sendSignal()`). */
+    signals: boolean
+    /** `ICRNL`: a carriage return typed is read as a line feed. */
+    crToNl: boolean
+    /** `OPOST`: output is processed, as the next flag says. */
+    outputProcessing: boolean
+    /** `ONLCR`: under `OPOST`, a line feed leaves as a carriage return and a line feed. */
+    nlToCrNl: boolean
+}
+
+/** The input devices the host delivers events to; the guest's others never receive any. */
+export type X86InputDeviceId = 'keyboard' | 'tablet'
+
+/**
+ * One input event as Linux's `struct input_event` has it, without its time: `EV_KEY` with a
+ * `KEY_*` or `BTN_*` code and 1 down, 2 a repeat, 0 up; `EV_ABS` with `ABS_X` or `ABS_Y` and a
+ * position from 0 to 32767; `EV_REL` with `REL_WHEEL` and the notches turned, positive away from
+ * the user.
+ */
+export type X86InputEvent = { type: number; code: number; value: number }
+
+/** What can end a wait besides its deadline and a signal. */
+export type X86WakeSources = {
+    /** Input given to the terminal (`provideInput()`). */
+    terminal: boolean
+    /** Events reaching these input devices. */
+    inputDevices: X86InputDeviceId[]
+}
+
+/**
+ * The machine's display mode, its `video=`: a width that is a multiple of 8 and a height, both 8
+ * to 1024 pixels. A program takes the mode set when it starts; the default is 320×240.
+ */
+export type X86DisplayMode = { width: number; height: number }
+
+/**
+ * The framebuffer `/dev/fb0` draws on, once the program has opened it: XRGB8888 pixels, one
+ * little-endian `0x00RRGGBB` word each, `lineLength` bytes a line, over twice the mode's height,
+ * of which the scanout shows `height` lines from `yoffset`. Every property is read from the Core
+ * when it is asked for, so one object stays current for the program.
+ */
+export type X86Framebuffer = {
+    /** The mode's width, in pixels. */
+    readonly width: number
+    /** The mode's height, in lines: the scanout shows this many. */
+    readonly height: number
+    /** Bytes from one line to the next: `width × 4`. */
+    readonly lineLength: number
+    /** The first line the scanout shows, 0 to `height`: `height` shows the second page. */
+    readonly yoffset: number
+    /** The program blanked the display (`FBIOBLANK`): show black. */
+    readonly blanked: boolean
+    /**
+     * The page the scanout shows, `height × lineLength` bytes: a view of the wasm heap, not a
+     * copy, which the program's next store changes. It is made again when the heap has grown or
+     * the scanout moved since the last call; empty once the program the framebuffer belonged to
+     * is cleared or another starts.
+     */
+    visible(): Uint8Array
+}
+
+/** The program presented a page: it panned, synced `/dev/fb0` or blanked it, or Undo did. */
+export type X86FramebufferPresent = {
+    /** The first line the scanout shows now. */
+    yoffset: number
+}
+
+/** A sound device a `soundCut` names: `/dev/dsp`, the raw MIDI port or the PC speaker. */
+export type X86SoundDevice = 'dsp' | 'midi' | 'speaker'
+
+/**
+ * Samples `/dev/dsp` gives the card, decoded: stereo, interleaved, at the rate the program set,
+ * the first heard at `start`. Each is a fragment, handed on the moment the card takes it.
+ */
+export type X86PcmEvent = {
+    /** When the first frame plays, in nanoseconds of Program time's monotonic clock. */
+    start: bigint
+    /** Frames a second, as `SNDCTL_DSP_SPEED` set it; the host resamples. */
+    rate: number
+    /** Left and right, -1 to 1, one pair a frame. */
+    frames: Float32Array
+}
+
+/** One complete message the raw MIDI port hands the synthesizer. */
+export type X86MidiEvent = {
+    /** When its last byte leaves the port, in nanoseconds of Program time. */
+    at: bigint
+    /** The whole message, its status included even when the program used running status. */
+    message: Uint8Array
+}
+
+/** The PC speaker's square wave from `at` on, at the frequency the timer makes; 0 is silence. */
+export type X86ToneEvent = { at: bigint; hz: number }
+
+/**
+ * The gains the program's mixer puts on `/dev/dsp`: `VOLUME` and `PCM`, 0 to 100 for the left and
+ * the right. A channel the card has no control for stays at 100, whatever the program wrote to it.
+ */
+export type X86MixerEvent = { volume: [number, number]; pcm: [number, number] }
+
+/**
+ * Drop everything scheduled after `after` (nanoseconds of Program time) for `device`, or for every
+ * sound device without one: Undo, `SNDCTL_DSP_RESET`, the MIDI port's `DROP`, a signal that ends
+ * the program, and the end of the machine (`clearExecution()`, a new start) cut what has not been
+ * heard yet.
+ */
+export type X86SoundCutEvent = { after: bigint; device?: X86SoundDevice }
+
 export type X86EmulatorEventMap = {
     stateChange: { state: BlinkState; oldState: BlinkState }
+    /**
+     * The program panned the framebuffer, synced it or blanked it, or Undo moved the scanout:
+     * show `getFramebuffer().visible()` now.
+     */
+    framebufferPresent: X86FramebufferPresent
+    /** Samples `/dev/dsp` gives the card. */
+    pcm: X86PcmEvent
+    /** A message the raw MIDI port gives the synthesizer. */
+    midi: X86MidiEvent
+    /** The PC speaker's tone changes. */
+    tone: X86ToneEvent
+    /** The mixer's gains on `/dev/dsp`, at each start of a program and at every change. */
+    mixer: X86MixerEvent
+    /** What was scheduled after a time no longer plays. */
+    soundCut: X86SoundCutEvent
+    /** The terminal's mode at each start of a program, and whenever the program changes it. */
+    terminalMode: X86TerminalMode
+    /**
+     * A program opened a device node the machine has but does not cover, such as
+     * `/dev/dri/card0`: the open failed with `ENODEV`. `path` is the node's own path, whatever
+     * link the program opened it through.
+     */
+    unsupportedDevice: { path: string }
     /** The bytes of one write to standard output, or to the terminal opened by another name. */
     stdout: Uint8Array
     /** The bytes of one write to standard error. */
@@ -188,12 +342,24 @@ export type X86EmulatorEventHandler<T extends X86EmulatorEventName> = (
     event: X86EmulatorEventMap[T]
 ) => MaybePromise<void>
 
-/** A pending syscall. Null deadline means an external wake source is required. */
+/**
+ * A pending syscall. A null deadline means only one of its wake sources, or a signal, can end it.
+ * A device that keeps time (a buffer draining, a port sending) folds the moment it is ready into
+ * the deadline.
+ */
 export type X86WaitRequest = {
     clock: number
     deadlineNanoseconds: bigint | null
     remainingMilliseconds: number | null
-    acceptsInput: boolean
+    /** What can end the wait besides its deadline. */
+    wakeSources: X86WakeSources
+    /**
+     * Whether the instruction waiting is a read of the terminal, which takes the input that ends
+     * the wait: a raw read that `VTIME` times. False for `poll`, `select`, a sleep and a device's
+     * wait, which input for the terminal can end without taking it. A read with nothing to time it
+     * is an input request instead (`inputRequest`, `WaitingForInput`), with no wait request.
+     */
+    terminalRead: boolean
     instructionSerial: string
 }
 /** Synchronous sources are selected before initialize/start, including loader AT_RANDOM. */

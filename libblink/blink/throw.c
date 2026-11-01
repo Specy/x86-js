@@ -117,6 +117,7 @@ void HaltMachine(struct Machine *m, int code) {
     case kMachineWaitTrap:
     case kMachineFakeTTYtrap:
     case kMachineExitTrap:
+    case kMachineRepSplit:
       // These are special cases that we don't want to go trough
       // the signal delivery system. They will be simply handled
       // in the main execution loop, in the sigsetjump catch.

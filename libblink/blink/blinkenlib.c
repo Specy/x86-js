@@ -10,6 +10,7 @@
 #include "blink/dis.h"
 #include "blink/debughistory.h"
 #include "blink/endian.h"
+#include "blink/fbdev.h"
 #include "blink/flags.h"
 #include "blink/high.h"
 #include "blink/loader.h"
@@ -19,7 +20,9 @@
 #include "blink/syscall.h"
 #include "blink/terminal.h"
 #include "blink/environment.h"
+#include "blink/evdev.h"
 #include "blink/signal.h"
+#include "blink/sound.h"
 #include "blink/x86.h"
 
 void update_clstruct(struct Machine *m);
@@ -40,14 +43,25 @@ void update_clstruct(struct Machine *m);
  * and anything else is interrupted at least 5 times
  * per second, which is enough to have good renderer
  * updates on low end devices, despite some lag.
+ * It was 100,000 until October 2026, when
+ * RUN_SLICE_MAX, which has to stay below it, grew.
+ * The loop without history grew 1.5 to 1.9 times
+ * faster then, so 250,000 take 1.3 to 1.7 times as
+ * long as 100,000 did: about 10 ms where measured,
+ * so a device ten times slower still gets its event
+ * loop back about ten times a second.
  */
-#define MAX_CYCLES 100000
+#define MAX_CYCLES 250000
 
 /*
  * After this max amount of context switches,
- * the process will terminate with SIGXCPU
+ * the process will terminate with SIGXCPU: a
+ * hundred million instructions, as ever.
  */
-#define MAX_SWITCHES 1000
+#define MAX_SWITCHES 400
+
+/* The most instructions one blinkenlib_run_slice() runs, below MAX_CYCLES. */
+#define RUN_SLICE_MAX 200000
 
 int switches_count = 0;
 
@@ -153,6 +167,12 @@ u64 blinkenlib_next_identity(void) { return ++identity_allocator; }
 static void FinishExecution(void) {
   if (active_identity) { ++instructions_executed; ++run_instruction_count; active_identity = 0; }
 }
+/* A rep string instruction stopped between iterations for the history (see
+ * string.c) and goes on at once: the rest of it is the same instruction, so
+ * nothing a new instruction checks (a signal, the limit, a breakpoint) comes
+ * in between. */
+static bool resuming_split = false;
+
 /* Mirrors Module.blinkHostError, which the runtime keeps in step with an accessor. The run loop
  * reads it after every instruction, and asking JavaScript each time cost a call out of wasm per
  * instruction. */
@@ -166,6 +186,7 @@ void blinkenlib_abandon_execution(void) {
   DebugHistoryCancel();
   active_identity = 0;
   active_step = false;
+  resuming_split = false;
 }
 /* A native exit() inside an instruction (Blink giving up on a condition it
  * cannot recover from) unwinds to JavaScript past everything the instruction
@@ -204,6 +225,8 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
   if (sig != SIGTRAP || code < SIGTRAP_CODE_PREEMPT || code > SIGTRAP_CODE_WAIT) {
     m->system->exited = true;
     m->system->exitcode = 128 + sig;
+    // its release finds the signal: the sound drains no further
+    SoundProgramKilled();
   }
 #ifdef DEBUG
   if (sig != SIGTRAP) {
@@ -341,11 +364,14 @@ static void ClearLastStepInfo(void) {
   active_step = false;
 }
 
-static void BeginRecordedStep(u32 control_flow) {
+static void BeginRecordedStep(void) {
+  u32 control_flow;
   if (!step_recording_enabled || !debugger_enabled || !m) return;
   if (active_step) return;
+  control_flow = GetControlFlowKind();
   ClearStepMemoryWrites();
-  memset(&last_step_info, 0, sizeof(last_step_info));
+  /* FinishRecordedStep() sets every field; until then there is none */
+  last_step_info.valid = false;
   active_pc_before = GetPc(m);
   active_sp_before = Read64(m->sp);
   active_flags_before = m->flags;
@@ -377,6 +403,14 @@ static bool PushRunBreakpoint(u64 address) {
   breakpoint.disable = false;
   breakpoint.oneshot = false;
   return PushBreakpoint(&run_breakpoints, &breakpoint) != -1;
+}
+
+/* Whether a Run breakpoint is at the instruction about to run, by its address
+ * or by its offset into CS, which differ only when CS has a base. */
+static bool AtRunBreakpoint(u64 pc) {
+  if (!run_breakpoints.i) return false;
+  if (IsAtBreakpoint(&run_breakpoints, pc) != -1) return true;
+  return pc != m->ip && IsAtBreakpoint(&run_breakpoints, m->ip) != -1;
 }
 
 static void ApplyPendingRunBreakpoints(void) {
@@ -452,18 +486,22 @@ void update_clstruct(struct Machine *m) {
 
 void runLoop() {
   int interrupt;
-  ssize_t breakpoint;
   m->nofault = false;
 
   // TODO: update global disassember struct with
   // a function call. both the struct and fcall dont
   // exist right now
 
+  for (;;) {
   if (!(interrupt = sigsetjmp(m->onhalt, 1))) {
     m->canhalt = true;
     for (int i = 0; i < MAX_CYCLES; i++) {
+      if (resuming_split) {
+        resuming_split = false;
+        LoadInstruction(m, GetPc(m));
+      } else {
       if (!active_identity) {
-        GuestTimerCheck(m);
+        if (guest_timer_armed) GuestTimerCheck(m);
         if (atomic_load_explicit(&m->attention, memory_order_acquire))
           CheckForSignals(m);
         if (s->exited) { m->canhalt = false; return; }
@@ -474,15 +512,12 @@ void runLoop() {
         PauseForRunControl(BLINKENLIB_STOP_LIMIT, SIGTRAP_CODE_RUN_LIMIT, pc);
         return;
       }
-      LoadInstruction(m, pc);  // not really needed like this
+      LoadInstruction(m, pc);
       pc = GetPc(m);
       if (!single_stepping) {
         if (skip_current_breakpoint && pc == skip_breakpoint_address) {
           skip_current_breakpoint = false;
-        } else if ((breakpoint = IsAtBreakpoint(&run_breakpoints, pc)) != -1 ||
-                   (breakpoint = IsAtBreakpoint(&run_breakpoints, m->ip)) !=
-                       -1) {
-          (void)breakpoint;
+        } else if (AtRunBreakpoint(pc)) {
           skip_current_breakpoint = true;
           skip_breakpoint_address = pc;
           PauseForRunControl(BLINKENLIB_STOP_BREAKPOINT,
@@ -490,11 +525,13 @@ void runLoop() {
           return;
         }
       }
+      }
 
       if (!active_identity) active_identity = blinkenlib_next_identity();
-      BeginRecordedStep(GetControlFlowKind());
+      BeginRecordedStep();
       memory_sp_before = Read64(m->sp);
-      ExecuteInstruction(m);
+      // Both ways into this point decoded the instruction at the program counter.
+      ExecuteDecodedInstruction(m);
       u64 current_sp = Read64(m->sp);
       u64 distance = current_sp > memory_sp_before ? current_sp - memory_sp_before : memory_sp_before - current_sp;
       if (distance > 4096 || current_sp > memory_stack_top) memory_stack_top = current_sp;
@@ -535,6 +572,15 @@ void runLoop() {
     printf("handling machine interrupt: %d \n", interrupt);
     puts("--");
 #endif
+    if (interrupt == kMachineRepSplit) {
+      // the history takes the part's writes and the step goes on recording
+      DebugHistorySplit();
+      m->writeoldcount = 0;
+      m->writeoldbytesused = 0;
+      m->writeoldtruncated = false;
+      resuming_split = true;
+      continue;
+    }
     if (interrupt == kMachineExitTrap || interrupt == kMachineFakeTTYtrap || interrupt == kMachineWaitTrap) {
       /* Exit and a read waiting for input abandon OpSyscall's stack.
        * Release its temporary state as Blink() does after a halt, so undo
@@ -568,6 +614,8 @@ void runLoop() {
       update_clstruct(m);
       TerminateSignal(m, SIGTRAP, SIGTRAP_CODE_FAKE_TTY);
     }
+  }
+  break;
   }
   m->canhalt = false;
 }
@@ -624,9 +672,13 @@ void TearDown(void) {
   // what the last program left open is closed, as its end would have,
   // before the next one opens anything
   if (m) SysCloseAll(m->system);
+  // nothing it scheduled plays any more
+  SoundTearDown();
   FreeMachine(m);
   m = g_machine = 0;
   s = 0;
+  // the framebuffer outlives its mappings until the next program starts
+  ResetFramebuffer();
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -677,6 +729,12 @@ void setupProgram(bool withdebugger) {
   TearDown();
   SetUp();
   OpenTerminalHostFds();
+  // every program starts on a terminal in canonical mode
+  ResetTerminal();
+  // and on input devices with nothing held, lit or moved
+  ResetInputDevices();
+  // and with the sound devices as the guest boots them
+  ResetSound();
   char *bios = 0;
   LoadProgram(m, progname_string, progname_string,
                process_arguments_set ? process_args : args, vars, bios);
@@ -750,7 +808,7 @@ void blinkenlib_run_slice(u32 budget, bool skip_at_pc) {
   if (!budget) budget = 1;
   single_stepping = false;
   native_slice = true;
-  blinkenlib_set_run_instruction_limit(budget < 50000 ? budget : 50000);
+  blinkenlib_set_run_instruction_limit(budget < RUN_SLICE_MAX ? budget : RUN_SLICE_MAX);
   skip_current_breakpoint = skip_at_pc;
   skip_breakpoint_address = GetPc(m);
   runLoop();
@@ -843,10 +901,16 @@ static u32 ArchitecturalFlags(u32 flags) {
 }
 
 /* The architectural RFLAGS (see ArchitecturalFlags()); the register snapshot
- * and the debugger history read the flags through here too. */
+ * reads the flags through here too. */
 EMSCRIPTEN_KEEPALIVE
 u32 blinkenlib_get_flags() {
   return m ? ArchitecturalFlags(m->flags) : 0;
+}
+
+/* The architectural word of a flags word Blink kept, for the debugger
+ * history, which keeps them as Blink does and hands out architectural ones. */
+u32 blinkenlib_architectural_flags(u32 flags) {
+  return ArchitecturalFlags(flags);
 }
 
 /* Fixed little-endian wasm32 layout: register IDs 0..16, PC, flags.
@@ -901,6 +965,32 @@ void blinkenlib_provide_end_of_input() {
 
 void blinkenlib_clear_input() {
   ClearTerminalInput();
+}
+
+/* The terminal's mode, as TERMINAL_MODE_* bits (terminal.h). */
+EMSCRIPTEN_KEEPALIVE
+int blinkenlib_terminal_mode(void) {
+  return GetTerminalMode();
+}
+
+/* Whether the terminal applies ICRNL and its relatives to the input the host
+ * gives it, and OPOST's ONLCR and OCRNL to what the program writes. Both are
+ * off until the host asks, so that output reaches it as the program wrote
+ * it. */
+EMSCRIPTEN_KEEPALIVE
+void blinkenlib_set_terminal_processing(bool input, bool output) {
+  SetTerminalProcessing(input, output);
+}
+
+/* Queues `sig` for the program, as the terminal's line discipline does for
+ * Ctrl+C (SIGINT) and Ctrl+\ (SIGQUIT) under ISIG. It is delivered at the
+ * next instruction, or ends the wait an instruction is in, once the host
+ * resumes it. False when no program is there to take it. */
+EMSCRIPTEN_KEEPALIVE
+bool blinkenlib_send_signal(int sig) {
+  if (!m || !s || s->exited || sig < 1 || sig > 64) return false;
+  SendTerminalSignal(m, sig);
+  return true;
 }
 
 _Static_assert(BLINKENLIB_FPU_STATE_SIZE ==

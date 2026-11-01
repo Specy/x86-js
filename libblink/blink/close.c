@@ -24,6 +24,7 @@
 #include "blink/assert.h"
 #include "blink/atomic.h"
 #include "blink/debug.h"
+#include "blink/devices.h"
 #ifdef __EMSCRIPTEN__
 #include "blink/debughistory.h"
 #endif
@@ -66,6 +67,8 @@ static int FinishClose(struct Machine *m, int rc) {
 
 int SysClose(struct Machine *m, i32 fildes) {
   struct Fd *fd;
+  // a device's release may wait for its queue to play out first
+  DeviceCloseWait(m, fildes);
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {
     dll_remove(&m->system->fds.list, &fd->elem);

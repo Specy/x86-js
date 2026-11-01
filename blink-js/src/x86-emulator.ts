@@ -10,7 +10,12 @@ import {
     type StackFrame
 } from './interface'
 import { locateDiagnosticSpan, type AssemblerId, type AssemblerMode } from './assemblers'
-import { BlinkRuntime, type BlinkRuntimeCallbacks, type BlinkRuntimeOptions } from './blink-runtime'
+import {
+    BlinkRuntime,
+    type BlinkRuntimeCallbacks,
+    type BlinkRuntimeOptions,
+    type ProgramIdentity
+} from './blink-runtime'
 import {
     BlinkState,
     X86_REGISTER_NAMES,
@@ -28,7 +33,12 @@ import {
     type X86ExecutableInfo,
     type X86ExecutableOptions,
     type X86ProcessStart,
-    type X86Progress
+    type X86Progress,
+    type X86TerminalMode,
+    type X86DisplayMode,
+    type X86Framebuffer,
+    type X86InputDeviceId,
+    type X86InputEvent
 } from './types'
 import { x86ProjectText } from './project'
 import type { BlinkenlibModule } from './wasm-types'
@@ -46,6 +56,12 @@ import {
     readLogicalStBits,
     type X86FpuState
 } from './fpu-state'
+
+/**
+ * The most instructions one native slice runs (`RUN_SLICE_MAX` in blinkenlib.c): a run longer
+ * than that yields to the host between slices.
+ */
+const NATIVE_SLICE = 200_000
 
 /** What {@link X86Emulator.run} does with the breakpoint the program counter is on. */
 export type X86RunOptions = {
@@ -81,11 +97,26 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         signal: new Set(),
         inputRequest: new Set(),
         waitRequest: new Set(),
-        unimplementedSyscall: new Set()
+        unimplementedSyscall: new Set(),
+        terminalMode: new Set(),
+        unsupportedDevice: new Set(),
+        framebufferPresent: new Set(),
+        pcm: new Set(),
+        midi: new Set(),
+        tone: new Set(),
+        mixer: new Set(),
+        soundCut: new Set()
     }
 
     private lastCompileResult: X86CompileResult | null = null
     private lastSourceCode = ''
+    /**
+     * What `getCompiledInstructions` decoded, and of which program: it decodes every instruction
+     * the source map names, a few hundred milliseconds for a large program, which a Build asks for
+     * more than once and a Build of an unchanged Program asks for again.
+     */
+    private compiledInstructions: { program: ProgramIdentity; instructions: Instruction[] } | null =
+        null
     /** What `initialize()` was given: how many steps the history keeps, 0 recording none. */
     private undoSize = 0
     /** The undo history and call stack, both recorded inside the wasm. */
@@ -150,6 +181,46 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
                 inputRequest: (event) => {
                     const result = options.callbacks?.inputRequest?.(event)
                     emulator?.emit('inputRequest', event)
+                    return result
+                },
+                terminalMode: (event) => {
+                    const result = options.callbacks?.terminalMode?.(event)
+                    emulator?.emit('terminalMode', event)
+                    return result
+                },
+                unsupportedDevice: (event) => {
+                    const result = options.callbacks?.unsupportedDevice?.(event)
+                    emulator?.emit('unsupportedDevice', event)
+                    return result
+                },
+                framebufferPresent: (event) => {
+                    const result = options.callbacks?.framebufferPresent?.(event)
+                    emulator?.emit('framebufferPresent', event)
+                    return result
+                },
+                pcm: (event) => {
+                    const result = options.callbacks?.pcm?.(event)
+                    emulator?.emit('pcm', event)
+                    return result
+                },
+                midi: (event) => {
+                    const result = options.callbacks?.midi?.(event)
+                    emulator?.emit('midi', event)
+                    return result
+                },
+                tone: (event) => {
+                    const result = options.callbacks?.tone?.(event)
+                    emulator?.emit('tone', event)
+                    return result
+                },
+                mixer: (event) => {
+                    const result = options.callbacks?.mixer?.(event)
+                    emulator?.emit('mixer', event)
+                    return result
+                },
+                soundCut: (event) => {
+                    const result = options.callbacks?.soundCut?.(event)
+                    emulator?.emit('soundCut', event)
                     return result
                 }
             }
@@ -320,6 +391,74 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     setEnvironment(environment: import('./types').X86Environment): void {
         this.runtime.setEnvironment(environment)
     }
+
+    /**
+     * The settings the program set on its terminal, which the host's line discipline follows:
+     * canonical or raw, echo, signals and the carriage return and line feed conversions. Every
+     * program starts in canonical mode; the `terminalMode` event reports each change.
+     */
+    getTerminalMode(): X86TerminalMode {
+        return this.runtime.getTerminalMode()
+    }
+
+    /**
+     * Whether the terminal converts what `provideInput()` gives as `ICRNL`, `INLCR` and `IGNCR`
+     * say, and what the program writes as `OPOST`'s `ONLCR` and `OCRNL` say, as Linux's line
+     * discipline does: with both on, a program's `\n` reaches `stdout` as `\r\n` until it turns
+     * `ONLCR` off. Both are off unless asked for: a Testcase's scripted input, piped
+     * on Linux, has no line discipline to go through.
+     */
+    setTerminalProcessing(processing: { input?: boolean; output?: boolean }): void {
+        this.runtime.setTerminalProcessing(processing)
+    }
+
+    /**
+     * Queues a signal for the program, as the terminal does for Ctrl+C (`SIGINT`, 2) and Ctrl+\
+     * (`SIGQUIT`, 3) under `ISIG` (see `getTerminalMode().signals`). Like the terminal, it
+     * discards the input no read took, unless the program set `NOFLSH`. A running program takes
+     * it at its next instruction, a waiting one at once: its wait ends and the call starts over,
+     * finding the signal. A signal from outside the program cannot be undone, so the instruction
+     * it reached is an Undo barrier. Nothing happens when no program is running.
+     */
+    sendSignal(signal: number): void {
+        const waiting = this.runtime.isWaiting()
+        if (this.runtime.sendSignal(signal) && waiting) this.resumedByInput = true
+    }
+
+    /**
+     * The display mode `/dev/fb0` has from the next program start on, as the guest's `video=`
+     * sets it: a width that is a multiple of 8 and a height, both 8 to 1024; 320×240 until set.
+     * A size the machine does not take throws a RangeError.
+     */
+    setDisplayMode(mode: X86DisplayMode): void {
+        this.runtime.setDisplayMode(mode)
+    }
+
+    /**
+     * The framebuffer, once the program has opened `/dev/fb0`, and null before; it stays, as the
+     * program left it, until the next program starts or the session is cleared. Read its visible
+     * page at the end of each run slice, before each wait, at each `framebufferPresent` event and
+     * after Undo.
+     */
+    getFramebuffer(): X86Framebuffer | null {
+        return this.runtime.getFramebuffer()
+    }
+
+    /**
+     * Delivers what the host's keyboard or pointer did, one host event at a time, to the guest's
+     * AT keyboard (`/dev/input/event0`) or QEMU USB tablet (`event2`), as their hardware and
+     * drivers would: a key as the scan codes QEMU's keyboard sends, which become `MSC_SCAN`, the
+     * key and `SYN_REPORT`, a lock key's LED change waiting in the packet its release closes; the
+     * pointer as one HID report, its five buttons (`BTN_LEFT` to `BTN_EXTRA`) with their usages as
+     * `MSC_SCAN`, `ABS_X` and `ABS_Y` when they move, the wheel with `REL_WHEEL_HI_RES`, and
+     * `SYN_REPORT`. Every reader of the device gets it, or the one holding
+     * `EVIOCGRAB`, stamped with Program time; with no reader the device's state still changes. A
+     * read or `poll` waiting on the device resumes and starts over. Nothing happens when no
+     * program is running. Never call it in a Testcase, where no event ever arrives.
+     */
+    sendInputReport(device: X86InputDeviceId, events: readonly X86InputEvent[]): void {
+        if (this.runtime.sendInputReport(device, events)) this.resumedByInput = true
+    }
     getInstructionsExecuted(): bigint {
         return this.runtime.getInstructionsExecuted()
     }
@@ -360,6 +499,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     dispose(): void {
         ++this.executionGeneration
+        this.compiledInstructions = null
         this.runtime.dispose()
         this.runtime.setStepRecording(false)
         this.clearExecutionTrace()
@@ -370,6 +510,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         this.eventHandlers.signal.clear()
         this.eventHandlers.inputRequest.clear()
         this.eventHandlers.waitRequest.clear()
+        this.eventHandlers.terminalMode.clear()
+        this.eventHandlers.unsupportedDevice.clear()
+        this.eventHandlers.framebufferPresent.clear()
+        this.eventHandlers.pcm.clear()
+        this.eventHandlers.midi.clear()
+        this.eventHandlers.tone.clear()
+        this.eventHandlers.mixer.clear()
+        this.eventHandlers.soundCut.clear()
     }
 
     /** End the debug session before stopping its FileSystem capability; callbacks remain usable. */
@@ -655,10 +803,16 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         // memory until execution starts. Load and pause at its entry before reading instruction
         // bytes; callers commonly request build metadata before their first step.
         if (this.runtime.state === BlinkState.ProgramLoaded) this.runtime.pauseAtEntry()
-        return this.runtime.getSourceMappedAddresses().flatMap((address) => {
+        const kept = this.compiledInstructions
+        if (kept && this.runtime.isProgram(kept.program))
+            return kept.instructions.map((instruction) => ({ ...instruction }))
+        const instructions = this.runtime.getSourceMappedAddresses().flatMap((address) => {
             const instruction = this.getInstructionAt(address)
             return instruction ? [instruction] : []
         })
+        const program = this.runtime.programIdentity()
+        this.compiledInstructions = program ? { program, instructions } : null
+        return instructions.map((instruction) => ({ ...instruction }))
     }
 
     getRegisterValues(): bigint[] {
@@ -828,7 +982,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         let executed = 0
         let skipAtPc = options.skipBreakpointAtPc ?? true
         while (this.runtime.state === BlinkState.ProgramRunning) {
-            const budget = hasLimit ? Math.min(50000, limit - executed) : 50000
+            const budget = hasLimit ? Math.min(NATIVE_SLICE, limit - executed) : NATIVE_SLICE
             executed += this.runtime.runSlice(budget, breakpoints, skipAtPc)
             skipAtPc = false
             if (
