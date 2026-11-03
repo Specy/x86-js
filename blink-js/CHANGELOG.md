@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 8.0.0
 
 For 8.0.0: the wait request, the state block, the history packets and the
 terminal change shape, and programs find Linux's devices. The README's
