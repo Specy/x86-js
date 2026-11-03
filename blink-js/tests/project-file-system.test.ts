@@ -181,10 +181,11 @@ class Session implements X86ProjectFileSystem {
         }
         return [...children].map(([name, kind]) => ({ name, kind }))
     }
+    /** As the editor's session renames: a File already at `to` is replaced, a Directory is EISDIR. */
     rename(from: string, to: string): void {
         const value = this.files.get(from)
         if (!value) throw new GuestError('ENOENT')
-        if (this.stat(to)) throw new GuestError('EEXIST')
+        if (this.stat(to)?.kind === 'directory') throw new GuestError('EISDIR')
         this.effect('rename')
         this.files.delete(from)
         this.files.set(to, value)
@@ -736,7 +737,7 @@ describe('Project FileSystem guest contracts', () => {
             emulator.dispose()
         }
     })
-    it('preserves open identities across rejected rename replacement and unlink/recreate', async () => {
+    it('preserves open identities across rename replacement and unlink/recreate', async () => {
         const initial = new Session()
         initial.files.set('data.txt', new TextEncoder().encode('old'))
         initial.files.set('renamed.txt', new TextEncoder().encode('target'))
@@ -746,12 +747,14 @@ describe('Project FileSystem guest contracts', () => {
                 'mov r12,rax',
                 'sys 2,other,2,0',
                 'mov r13,rax',
+                // data.txt replaces renamed.txt, which r13 keeps open with no path
                 'sys 82,path,other',
                 'save',
                 'sys 17,r13,buf,8,0',
                 'save',
                 'saveq buf',
-                'sys 87,path',
+                // and the moved File, which r12 keeps open, goes too
+                'sys 87,other',
                 'save',
                 'sys 2,path,66,438',
                 'mov r14,rax',
@@ -777,7 +780,7 @@ describe('Project FileSystem guest contracts', () => {
         try {
             await emulator.run(10000)
             expect(quadwords(Uint8Array.from(bytes))).toEqual([
-                -17n,
+                0n,
                 6n,
                 0x746567726174n,
                 0n,
@@ -791,7 +794,8 @@ describe('Project FileSystem guest contracts', () => {
                 0n
             ])
             expect(new TextDecoder().decode(session.files.get('data.txt'))).toBe('abc')
-            expect(new TextDecoder().decode(session.files.get('renamed.txt'))).toBe('tar')
+            // what r12 and r13 wrote and cut went to Files no path names any more
+            expect(session.files.has('renamed.txt')).toBe(false)
         } finally {
             emulator.dispose()
         }
@@ -1178,6 +1182,89 @@ describe('Project FileSystem guest contracts', () => {
         }
     })
 
+    it('replaces a File a rename lands on, which a descriptor open on it keeps, matching Linux', async () => {
+        const body = [
+            'sys 2,path,66,438',
+            'mov r12,rax',
+            'sys 1,r12,payload,3',
+            'sys 2,other,66,438',
+            'mov r13,rax',
+            'sys 1,r13,payload+3,3',
+            'sys 82,path,other',
+            'save',
+            'sys 4,path,buf2',
+            'save',
+            'sys 4,other,buf2',
+            'save',
+            'saveq buf2+48',
+            // the replaced File, open on r13, keeps its bytes, and no path names it
+            'sys 17,r13,buf,8,0',
+            'save',
+            'saveq buf',
+            'sys 5,r13,buf2',
+            'save',
+            'saveq buf2+16',
+            'sys 5,r12,buf2',
+            'save',
+            'saveq buf2+16',
+            'sys 2,other,0,0',
+            'mov r14,rax',
+            'mov qword [buf],0',
+            'sys 0,r14,buf,8',
+            'save',
+            'saveq buf',
+            // onto itself it does nothing; onto a folder or into a missing one it fails
+            'sys 82,other,other',
+            'save',
+            'sys 83,made,511',
+            'sys 82,other,made',
+            'save',
+            'sys 82,made,made',
+            'save',
+            'sys 82,other,nowhere',
+            'save',
+            'sys 84,made',
+            'sys 3,r12',
+            'sys 3,r13',
+            'sys 3,r14',
+            'sys 87,other',
+            'finish',
+            ...PATHS,
+            'section .data',
+            "made: db 'made',0",
+            "nowhere: db 'missing/data.txt',0",
+            'section .text'
+        ]
+        const { emulator, session, bytes, executable } = await mounted(body)
+        try {
+            await emulator.run(10000)
+            expect(emulator.stopReason?.kind).toBe('exit')
+            expect(quadwords(Uint8Array.from(bytes))).toEqual([
+                0n,
+                -2n,
+                0n,
+                3n,
+                3n,
+                0x5a5958n,
+                0n,
+                0n,
+                0n,
+                1n,
+                3n,
+                0x636261n,
+                0n,
+                -21n,
+                0n,
+                -2n
+            ])
+            expect(session.files.size).toBe(0)
+            if (NATIVE)
+                expect(runNatively(executable).results).toEqual(quadwords(Uint8Array.from(bytes)))
+        } finally {
+            emulator.dispose()
+        }
+    })
+
     it('writes sparse bytes and rejects content capacity only when writing beyond it', async () => {
         const { emulator, session, bytes } = await mounted([
             'sys 2,path,66,438',
@@ -1275,7 +1362,7 @@ describe('Project FileSystem guest contracts', () => {
                 'sys 217,r12,buf,4096',
                 'mov r13,rax',
                 'sys 1,2,buf,r13',
-                'sys 83,other,511',
+                'sys 92,path,0,0',
                 'save',
                 'sys 90,path,0',
                 'save',
@@ -1407,6 +1494,74 @@ it('allows reading the Executable and writing other Files, rejecting truncation 
         expect(quadwords(Uint8Array.from(bytes))).toEqual([4n, 0x464c457fn, -26n, -26n, -16n, 3n])
         expect(session.files.get('data.txt')).toEqual(Uint8Array.of(0x7f, 0x45, 0x4c, 0x46))
         expect(session.files.get('renamed.txt')).toEqual(Uint8Array.of(97, 98, 99))
+    } finally {
+        emulator.dispose()
+    }
+})
+
+it('keeps a folder made by mkdir for the run, until a File in it makes it a Directory', async () => {
+    const session = new Session()
+    session.files.set('real/keep.txt', new Uint8Array([97]))
+    const { emulator, bytes } = await mounted(
+        [
+            'sys 83,made,511',
+            'save',
+            'sys 83,made,511',
+            'save',
+            'sys 83,deep,511',
+            'save',
+            'sys 4,made,buf',
+            'save',
+            'saved buf+24',
+            'sys 2,root,65536,0',
+            'mov r12,rax',
+            'sys 217,r12,buf,4096',
+            'save',
+            'sys 3,r12',
+            'sys 2,inside,65,438',
+            'mov r12,rax',
+            'save',
+            'sys 1,r12,payload,3',
+            'save',
+            'sys 3,r12',
+            'sys 84,made,0',
+            'save',
+            'sys 87,inside',
+            'save',
+            'sys 4,made,buf',
+            'save',
+            'sys 84,made,0',
+            'save',
+            'sys 4,made,buf',
+            'save',
+            'sys 84,real,0',
+            'save',
+            'sys 84,missing,0',
+            'save',
+            'finish',
+            'section .data',
+            "made: db 'made',0",
+            "deep: db 'missing/below',0",
+            "inside: db 'made/note.txt',0",
+            "real: db 'real',0",
+            "missing: db 'missing',0",
+            "root: db '.',0",
+            "payload: db 'abc'",
+            'section .text'
+        ],
+        session
+    )
+    try {
+        await emulator.run(10000)
+        const results = quadwords(Uint8Array.from(bytes))
+        expect(results.slice(0, 4)).toEqual([0n, -17n, -2n, 0n])
+        // st_mode: a folder
+        expect(Number(results[4]) & 0o170000).toBe(0o040000)
+        expect(results[5]).toBeGreaterThan(0n)
+        expect(results[6]).toBeGreaterThanOrEqual(0n)
+        // a File in it, then rmdir refused while it is there, and taken once it is not
+        expect(results.slice(7)).toEqual([3n, -39n, 0n, 0n, 0n, -2n, -39n, -2n])
+        expect([...session.files.keys()]).toEqual(['real/keep.txt'])
     } finally {
         emulator.dispose()
     }

@@ -45,8 +45,8 @@ it('assembles and links an unchanged Project once, and a changed File again', as
     })
     const first = await build(project('7'))
     expect(first.exitCode).toBe(7)
-    //both Files scanned for %include and both assembled
-    expect([first.instances, first.links]).toEqual([4, 1])
+    //both Files assembled; neither has a word that reads another File, so neither is scanned
+    expect([first.instances, first.links]).toEqual([2, 1])
     //nothing assembled or linked again, and the same report: the helper is still not linked
     const again = await build(project('7'))
     expect([again.exitCode, again.instances, again.links]).toEqual([7, 0, 0])
@@ -55,9 +55,9 @@ it('assembles and links an unchanged Project once, and a changed File again', as
     expect(again.built.diagnostics.map((item) => [item.file, item.warningClass])).toEqual([
         ['helper.asm', 'not-linked']
     ])
-    //only the File that changed, scanned and assembled, and linked again
+    //only the File that changed assembled, and linked again
     const changed = await build(project('9'))
-    expect([changed.exitCode, changed.instances, changed.links]).toEqual([9, 2, 1])
+    expect([changed.exitCode, changed.instances, changed.links]).toEqual([9, 1, 1])
 })
 
 it('assembles again a File whose included File changed', async () => {

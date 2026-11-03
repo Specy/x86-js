@@ -458,6 +458,82 @@ describe('ITIMER_REAL', () => {
         }
     })
 
+    it('reads the host clock once in many instructions while the timer is armed', async () => {
+        let reads = 0
+        const emulator = await createX86Emulator({
+            environment: {
+                now: () => {
+                    reads++
+                    return 0
+                }
+            }
+        })
+        try {
+            const build = await emulator.compile(
+                probeSource([
+                    'mov qword [buf], 1',
+                    'mov qword [buf+16], 1',
+                    'sys 38, 0, buf, 0',
+                    'mov rcx, 100000',
+                    'spin:',
+                    'dec rcx',
+                    'jnz spin',
+                    'finish'
+                ])
+            )
+            expect(build.ok, build.report).toBe(true)
+            for (let slice = 0; slice < 10 && !emulator.hasTerminated(); slice++)
+                await emulator.run(1_000_000)
+            expect(emulator.hasTerminated()).toBe(true)
+            // 200,000 instructions ran with the timer armed: a read before each was 200,000
+            expect(reads).toBeLessThan(2000)
+        } finally {
+            emulator.dispose()
+        }
+    })
+
+    it('delivers its alarms to a program that never waits', async () => {
+        let now = 0
+        const emulator = await createX86Emulator({
+            environment: { now: () => (now += 1) }
+        })
+        try {
+            const build = await emulator.compile(
+                probeSource([
+                    'mov qword [buf+8], 5000',
+                    'mov qword [buf+24], 5000',
+                    'sys 13, 14, act, 0, 8',
+                    'sys 38, 0, buf, 0',
+                    'spin:',
+                    'cmp qword [buf2], 3',
+                    'jb spin',
+                    'saveq buf2',
+                    'finish',
+                    'handler:',
+                    'inc qword [buf2]',
+                    'ret',
+                    'restorer:',
+                    'mov eax, 15',
+                    'syscall',
+                    'section .data',
+                    'act: dq handler, 0x04000000, restorer, 0',
+                    'section .text'
+                ])
+            )
+            expect(build.ok, build.report).toBe(true)
+            const output: number[] = []
+            emulator.on('stderr', (bytes) => void output.push(...bytes))
+            for (let slice = 0; slice < 10 && !emulator.hasTerminated(); slice++)
+                await emulator.run(1_000_000)
+            expect(emulator.hasTerminated()).toBe(true)
+            // another may come between the loop's last test and the save
+            const [alarms] = quadwords(Uint8Array.from(output))
+            expect(alarms).toBeGreaterThanOrEqual(3n)
+        } finally {
+            emulator.dispose()
+        }
+    })
+
     it('wakes a standard-input read on alarm without taking queued bytes', async () => {
         let now = 0
         const emulator = await createX86Emulator({ environment: { now: () => now } })

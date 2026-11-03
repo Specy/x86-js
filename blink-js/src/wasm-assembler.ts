@@ -168,6 +168,14 @@ const includesNothing = new Set<string>()
 const INCLUDES_NOTHING_BUDGET = 16 * 1024 * 1024
 let includesNothingBytes = 0
 
+/**
+ * The words of NASM's directives that read another File: `%include`, `incbin`, `%depend` and
+ * `%pathsearch`. A unit whose text has none of them, and no `%+` or `%[` that could paste one
+ * together, includes nothing, which a compiler's Generated assembly, tens of thousands of lines,
+ * would otherwise be preprocessed to find out.
+ */
+const READS_FILES = /include|incbin|depend|pathsearch|%\+|%\[/i
+
 /** NASM's `__?DATE?__`, `__?TIME_NUM?__`, `__?UTC_DATE?__`, `__?POSIX_TIME?__`, and their old spellings. */
 const CLOCK_MACRO = /__\??(?:UTC_)?(?:DATE|TIME)|__\??POSIX_TIME/
 
@@ -224,6 +232,7 @@ async function scanIncludedFiles(
 
     for (const path of candidates) {
         const text = project.files[path]
+        if (typeof text === 'string' && !READS_FILES.test(text)) continue
         const key = typeof text === 'string' ? libraryObjectKey(path, text) : undefined
         if (key !== undefined && includesNothing.has(key)) continue
         const { module, stdout } = await createNasmModule()
@@ -272,6 +281,19 @@ function withLibraryUnit(project: X86Project, path: string): X86Project {
     }
 }
 
+/**
+ * The Project as a unit that reads no other File sees it: the unit at its path, and the Entry,
+ * which NASM is given as `/assembly.s`. The Project's other Files, pictures and sounds among them,
+ * are not copied into every assembler instance for nothing.
+ */
+function unitAlone(project: X86Project, path: string, text: string): X86Project {
+    return {
+        entry: project.entry,
+        files: { [project.entry]: project.files[project.entry]!, [path]: text },
+        ...(project.includePaths ? { includePaths: project.includePaths } : {})
+    }
+}
+
 export const nasmWasmAssembler: WasmAssembler = {
     async assemble(
         project: X86Project,
@@ -312,7 +334,12 @@ export const nasmWasmAssembler: WasmAssembler = {
             }
 
             const { module, stdout: readStdout, stderr: readStderr } = await createNasmModule()
-            const staged = isLibrary ? withLibraryUnit(project, path) : project
+            const staged =
+                typeof unitSource === 'string' && !READS_FILES.test(unitSource)
+                    ? unitAlone(project, path, unitSource)
+                    : isLibrary
+                      ? withLibraryUnit(project, path)
+                      : project
             stageX86Project(module.FS, staged)
             const source = selectX86Source(module.FS, staged, path)
             const dependencies = key === undefined ? [] : ['-MD', DEPENDENCIES_PATH]

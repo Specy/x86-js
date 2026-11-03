@@ -63,6 +63,20 @@ void update_clstruct(struct Machine *m);
 /* The most instructions one blinkenlib_run_slice() runs, below MAX_CYCLES. */
 #define RUN_SLICE_MAX 200000
 
+/*
+ * While the guest's ITIMER_REAL is armed, the run loop looks at its deadline
+ * once every TIMER_CHECK_INSTRUCTIONS instructions. A look reads the host's
+ * clock, a call out of the module that costs about as much as nine
+ * instructions do: looking before every instruction, as the loop did until
+ * November 2026, made a program run ten times slower for as long as its
+ * timer was set. At a few million instructions a second, SIGALRM now comes
+ * at most a fraction of a millisecond after its deadline. A slice starts
+ * with a look, and a wait looks at the timer itself whatever the count, so
+ * both still see a deadline that passed before them at once.
+ */
+#define TIMER_CHECK_INSTRUCTIONS 1024
+static int timer_check_countdown = 0;
+
 int switches_count = 0;
 
 /*
@@ -487,6 +501,9 @@ void update_clstruct(struct Machine *m) {
 void runLoop() {
   int interrupt;
   m->nofault = false;
+  // a slice, or a step, starts by looking at the timer: an alarm due since
+  // the last one is delivered before its first instruction runs
+  timer_check_countdown = 0;
 
   // TODO: update global disassember struct with
   // a function call. both the struct and fcall dont
@@ -501,7 +518,10 @@ void runLoop() {
         LoadInstruction(m, GetPc(m));
       } else {
       if (!active_identity) {
-        if (guest_timer_armed) GuestTimerCheck(m);
+        if (guest_timer_armed && --timer_check_countdown <= 0) {
+          timer_check_countdown = TIMER_CHECK_INSTRUCTIONS;
+          GuestTimerCheck(m);
+        }
         if (atomic_load_explicit(&m->attention, memory_order_acquire))
           CheckForSignals(m);
         if (s->exited) { m->canhalt = false; return; }

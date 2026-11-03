@@ -77,13 +77,35 @@ describe('linking a Project', () => {
         expect(emulator.projectLinking).toBe('archive')
     })
 
-    it('rejects a second strong _start even in an unused File', async () => {
-        const result = await emulator.compileProject({ entry: 'main.asm', files: {
+    it('leaves out a File with a second strong `_start` that nothing needs, as `ld` does', async () => {
+        const project = { entry: 'main.asm', files: {
             'main.asm': ['global _start', 'section .text', '_start:', ...exit(42)].join('\n'),
             'other.asm': ['global _start', 'section .text', '_start:', ...exit(7)].join('\n')
-        } })
-        expect(result.ok).toBe(false)
-        expect(result.diagnostics.filter(d => d.error.includes("multiple definition of '_start'")).map(d => d.file)).toEqual(['main.asm', 'other.asm'])
+        } }
+        expect(await emulator.checkProject(project)).toEqual([])
+        const result = await emulator.compileProject(project)
+        expect(result.ok, result.report).toBe(true)
+        expect(result.diagnostics).toEqual([
+            expect.objectContaining({ file: 'other.asm', severity: 'hint', warningClass: 'not-linked' }),
+        ])
+        expect(await exitCode()).toBe(42)
+        expect(linkedFiles()).toEqual(['main.asm'])
+    })
+
+    it('builds each of two programs that both define `main`, the Entry choosing which runs', async () => {
+        const main = (code: number) => ['global main', 'section .text', 'main:', `    mov eax, ${code}`, '    ret'].join('\n')
+        const files = { 'a.c.asm': main(1), 'b.c.asm': main(2) }
+        for (const [entry, code, other] of [['a.c.asm', 1, 'b.c.asm'], ['b.c.asm', 2, 'a.c.asm']] as const) {
+            const project = { entry, files, startUnits: { [START_PATH]: START } }
+            expect(await emulator.checkProject(project)).toEqual([])
+            const result = await emulator.compileProject(project)
+            expect(result.ok, result.report).toBe(true)
+            expect(result.diagnostics).toEqual([
+                expect.objectContaining({ file: other, severity: 'hint', warningClass: 'not-linked' }),
+            ])
+            expect(await exitCode()).toBe(code)
+            expect(linkedFiles()).toEqual([START_PATH, entry])
+        }
     })
 
     it('assembles a File nothing needs, and reports its mistakes, but leaves it out of the program', async () => {
@@ -404,14 +426,108 @@ describe('reviewed link policy', () => {
         }, library: { '@runtime/support.asm': ['global memcpy:weak', 'section .text', 'memcpy:', 'mov eax, 7', 'ret'].join('\n') } })
         expect(await exitCode()).toBe(42)
     })
-    it('reports duplicate strong globals on both Files even when neither would be extracted', async () => {
-        const result = await emulator.compileProject({ entry: 'main.asm', files: {
+    it('accepts a strong global defined twice in Files the link leaves out, as `ld` does', async () => {
+        const project = { entry: 'main.asm', files: {
             'main.asm': ['global _start', 'section .text', '_start:', ...exit(0)].join('\n'),
             'a.asm': 'global duplicate\nsection .text\nduplicate: ret',
             'b.asm': 'global duplicate\nsection .text\nduplicate: ret'
-        } })
+        } }
+        expect(await emulator.checkProject(project)).toEqual([])
+        const result = await emulator.compileProject(project)
+        expect(result.ok, result.report).toBe(true)
+        expect(result.diagnostics.map((d) => [d.file, d.warningClass])).toEqual([
+            ['a.asm', 'not-linked'],
+            ['b.asm', 'not-linked'],
+        ])
+    })
+    it('accepts a File that defines what the Entry defines, until the program needs it for something else', async () => {
+        const entry = ['global _start', 'global shared', 'extern used', 'section .text', '_start:', '    call used', ...exit(0), 'shared:', '    ret'].join('\n')
+        const other = (defines: string) => [`global ${defines}`, 'global shared', 'section .text', `${defines}:`, '    ret', 'shared:', '    ret'].join('\n')
+        const used = 'global used\nsection .text\nused: ret'
+        const apart = { entry: 'main.asm', files: { 'main.asm': entry, 'other.asm': other('spare'), 'used.asm': used } }
+        expect(await emulator.checkProject(apart)).toEqual([])
+        await build(apart)
+
+        // now the program needs `used` from other.asm, whose `shared` comes with it
+        const together = { entry: 'main.asm', files: { 'main.asm': entry, 'other.asm': other('used') } }
+        expect(await emulator.checkProject(together)).toEqual([
+            expect.objectContaining({ file: 'main.asm', severity: 'error', message: "multiple definition of 'shared'; also defined in other.asm" }),
+            expect.objectContaining({ file: 'other.asm', severity: 'error', message: "multiple definition of 'shared'; also defined in main.asm" }),
+        ])
+        const result = await emulator.compileProject(together)
         expect(result.ok).toBe(false)
-        expect(result.diagnostics.filter(d => d.error.includes("multiple definition of 'duplicate'")).map(d => d.file)).toEqual(['a.asm', 'b.asm'])
+        if (result.ok) return
+        // `ld` places each at the instruction its label stands on, the `ret` below it
+        expect(result.errors).toEqual([
+            expect.objectContaining({
+                file: 'other.asm',
+                line: lineOf(other('used'), 'shared:') + 2,
+                error: `multiple definition of \`shared'; first defined in main.asm, line ${lineOf(entry, 'shared:') + 2}`,
+            }),
+        ])
+    })
+    it('reports a strong global two Files define once the link takes both, naming both Files', async () => {
+        const project = { entry: 'main.asm', files: {
+            'main.asm': ['global _start', 'extern first', 'extern second', 'section .text', '_start:', '    call first', '    call second', ...exit(0)].join('\n'),
+            'a.asm': 'global first\nglobal duplicate\nsection .text\nfirst: ret\nduplicate: ret',
+            'b.asm': 'global second\nglobal duplicate\nsection .text\nsecond: ret\nduplicate: ret'
+        } }
+        expect(await emulator.checkProject(project)).toEqual([
+            expect.objectContaining({ file: 'a.asm', severity: 'error', message: "multiple definition of 'duplicate'; also defined in b.asm" }),
+            expect.objectContaining({ file: 'b.asm', severity: 'error', message: "multiple definition of 'duplicate'; also defined in a.asm" }),
+        ])
+        const result = await emulator.compileProject(project)
+        expect(result.ok).toBe(false)
+        if (result.ok) return
+        expect(result.errors).toEqual([
+            expect.objectContaining({ file: 'b.asm', line: 5, error: "multiple definition of `duplicate'; first defined in a.asm, line 5" }),
+        ])
+    })
+    it('takes a member as `ld` reads its archive, so a check leaves out what the link leaves out', async () => {
+        // `ld` reads the index in order: a.asm's `x` is not yet needed when it passes it, b.asm is
+        // taken for `y` and needs `x`, which c.asm, further on, gives. a.asm, whose `z` the Entry
+        // defines too, is never taken, so neither the check nor the link has two `z`.
+        const value = (name: string, code: number) => [`global ${name}`, 'section .text', `${name}:`, `    mov eax, ${code}`, '    ret']
+        const project = { entry: 'main.asm', files: {
+            'main.asm': ['global _start', 'global z', 'extern y', 'section .text', '_start:', '    call y', '    mov edi, eax', '    mov eax, 60', '    syscall', 'z:', '    ret'].join('\n'),
+            'a.asm': [...value('x', 1), ...value('z', 9)].join('\n'),
+            'b.asm': ['global y', 'extern x', 'section .text', 'y:', '    jmp x'].join('\n'),
+            'c.asm': value('x', 3).join('\n'),
+        } }
+        expect(await emulator.checkProject(project)).toEqual([])
+        await build(project)
+        expect(await exitCode()).toBe(3)
+        expect(linkedFiles()).toEqual(['b.asm', 'c.asm', 'main.asm'])
+    })
+    it('counts as `ld` does a common symbol, which a real definition in a member answers, and an absolute one', async () => {
+        const start = (...lines: string[]) => ['global _start', ...lines, 'section .text', '_start:', ...exit(0)].join('\n')
+        // `shared` is only common in the Entry, so `ld` takes the member that really defines it,
+        // and the `twin` that comes with it is a second definition
+        const common = { entry: 'main.asm', files: {
+            'main.asm': start('common shared 8', 'global twin', 'section .text', 'twin:', '    ret'),
+            'b.asm': ['global shared', 'global twin', 'section .data', 'shared: dq 5', 'section .text', 'twin:', '    ret'].join('\n'),
+        } }
+        expect(await emulator.checkProject(common)).toEqual([
+            expect.objectContaining({ file: 'main.asm', message: "multiple definition of 'twin'; also defined in b.asm" }),
+            expect.objectContaining({ file: 'b.asm', message: "multiple definition of 'twin'; also defined in main.asm" }),
+        ])
+        const built = await emulator.compileProject(common)
+        expect(built.ok).toBe(false)
+        if (built.ok) return
+        expect(built.errors).toEqual([expect.objectContaining({ file: 'b.asm', error: expect.stringContaining("multiple definition of `twin'") })])
+
+        // several common symbols of one name are one variable, and the same absolute value twice is harmless
+        const harmless = (limit: number) => ({ entry: 'main.asm', files: {
+            'main.asm': start('common counter 8', 'global LIMIT', 'LIMIT equ 10', 'extern used', 'section .text', '    call used'),
+            'a.asm': ['common counter 8', 'global LIMIT', `LIMIT equ ${limit}`, 'global used', 'section .text', 'used:', '    ret'].join('\n'),
+        } })
+        expect(await emulator.checkProject(harmless(10))).toEqual([])
+        await build(harmless(10))
+        expect(await emulator.checkProject(harmless(11))).toEqual([
+            expect.objectContaining({ file: 'main.asm', message: "multiple definition of 'LIMIT'; also defined in a.asm" }),
+            expect.objectContaining({ file: 'a.asm', message: "multiple definition of 'LIMIT'; also defined in main.asm" }),
+        ])
+        expect((await emulator.compileProject(harmless(11))).ok).toBe(false)
     })
     it('allows a weak definition beside a strong definition and hints at an unused File', async () => {
         const result = await emulator.compileProject({ entry: 'main.asm', files: {

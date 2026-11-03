@@ -6,6 +6,40 @@ For 8.0.0: the wait request, the state block, the history packets and the
 terminal change shape, and programs find Linux's devices. The README's
 "Migrating to 8.0.0" lists what a host has to change.
 
+- A strong global that two units define is an error only when the link takes
+  both units, as `ld` reports it. Every user unit used to be checked against
+  every other, so a Project with two programs that each define `main`, or a
+  File defining what the program already had, did not build even though `ld`
+  would have left that unit out. A build now reports `ld`'s own message, on
+  the second definition and naming the File of the first; `checkProject`
+  works out which units the link would take, reading the archives as `ld`
+  reads them, and reports the duplicate on each File that defines it, naming
+  the others. Duplicates between a File and a start or library unit the link
+  takes are reported by the check too. Common symbols and an absolute symbol
+  given the same value twice are no longer counted as duplicates.
+- Renaming a File under `/project` onto another File replaces it, as Linux's
+  rename(2) does, where it returned EEXIST. A descriptor open on the replaced
+  File keeps it, with a link count of zero. The capability's `rename` is now
+  asked to replace a File at `to`, and must refuse a Directory there
+  (EISDIR); the editor's FileSystem session does both.
+- A program runs as fast with its `ITIMER_REAL` armed as without it. The run
+  loop used to read the host's clock before every instruction while the timer
+  was set, which made such a program four to ten times slower; it now reads it
+  at the start of each slice and once every 1,024 instructions, so `SIGALRM`
+  comes at most that many instructions after its deadline. A wait still checks
+  the deadline itself.
+- A Build skips the `%include` scan of a unit whose text has none of the words
+  that read another File (`include`, `incbin`, `depend`, `pathsearch`, nor a
+  `%+` or `%[` that could paste one), and gives such a unit's assembler only the
+  unit and the Entry instead of every Project File. A compiler's Generated
+  assembly used to be preprocessed twice; a two-unit C program of 69,000 lines
+  builds in about 9 s instead of 12 s, and an unchanged rebuild in about 1 s
+  instead of 2 s.
+- `mkdir` under `/project` makes a Directory the mount keeps for the run, in
+  which Files can be created; the first File makes it a Directory of the
+  Project, and one left empty is gone after the run. `rmdir` removes it while
+  it is empty and answers ENOTEMPTY for a Directory that holds anything. Both
+  used to return EOPNOTSUPP.
 - The machine has the QEMU guest's devices (`docs/design/x86-devices-plan.md`,
   M1 to M4). Its device nodes, `/dev/fb0`, `/dev/tty0`, `/dev/input/event0`
   to `event4`, `/dev/dsp`, `/dev/mixer`, `/dev/midi1` and `/dev/snd/midiC1D0`
