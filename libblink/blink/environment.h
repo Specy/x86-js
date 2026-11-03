@@ -18,7 +18,8 @@ void GuestWaitClock(int);
 void GuestWaitRestoreMask(struct Machine *);
 void GuestTimerReset(void);
 /* Whether ITIMER_REAL is armed: the run loop reads it before every
- * instruction, and calls GuestTimerCheck() only then. */
+ * instruction, and only then calls GuestTimerCheck(), once every
+ * TIMER_CHECK_INSTRUCTIONS of them (blinkenlib.c). */
 extern bool guest_timer_armed;
 void GuestTimerCheck(struct Machine *);
 int GuestTimerGet(struct itimerval *);

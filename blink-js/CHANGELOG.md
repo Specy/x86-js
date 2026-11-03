@@ -6,6 +6,12 @@ For 8.0.0: the wait request, the state block, the history packets and the
 terminal change shape, and programs find Linux's devices. The README's
 "Migrating to 8.0.0" lists what a host has to change.
 
+- A program runs as fast with its `ITIMER_REAL` armed as without it. The run
+  loop used to read the host's clock before every instruction while the timer
+  was set, which made such a program four to ten times slower; it now reads it
+  at the start of each slice and once every 1,024 instructions, so `SIGALRM`
+  comes at most that many instructions after its deadline. A wait still checks
+  the deadline itself.
 - A Build skips the `%include` scan of a unit whose text has none of the words
   that read another File (`include`, `incbin`, `depend`, `pathsearch`, nor a
   `%+` or `%[` that could paste one), and gives such a unit's assembler only the
