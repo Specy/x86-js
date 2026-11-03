@@ -16,6 +16,8 @@ export type EmscriptenFS = {
     FSNode: new (parent: unknown, name: string, mode: number, rdev: number) => EmscriptenFSNode
     createNode(parent: unknown, name: string, mode: number, rdev: number): EmscriptenFSNode
     destroyNode(node: EmscriptenFSNode): void
+    /** The child of `parent` named `name`, from the name table, or as the file system looks it up. */
+    lookupNode(parent: EmscriptenFSNode, name: string): EmscriptenFSNode
     closeStream(fd: number): void
     mount(
         type: { mount(mount: unknown): EmscriptenFSNode },

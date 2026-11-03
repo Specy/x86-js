@@ -342,7 +342,20 @@ export class ProjectFileSystemMount {
             const path = this.path(target, name)
             this.protect(node.projectPath, 'EBUSY')
             this.protect(path, 'EBUSY')
+            // A File already at the new path is replaced in the same step, as Linux replaces it.
+            // Emscripten looked it up before asking, and has already refused a Directory there
+            // (EISDIR), and a rename onto the File itself, which does nothing. Once replaced it
+            // has no path: like an unlinked File, it lives on only for a descriptor still open on
+            // it, through the capability's handle.
+            const replaced =
+                this.find(path)?.kind === 'file'
+                    ? (this.module.FS.lookupNode(target, name) as ProjectNode)
+                    : undefined
             this.effect(() => this.capability.rename(node.projectPath, path))
+            if (replaced && replaced !== node) {
+                replaced.unlinked = true
+                this.module.FS.destroyNode(replaced)
+            }
             node.projectPath = path
             node.name = name
             this.invalidateMissingAncestors(node.parent as ProjectNode)

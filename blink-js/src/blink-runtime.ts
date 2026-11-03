@@ -10,6 +10,7 @@ import {
     type AssemblerMode
 } from './assemblers'
 import { writeArchive } from './archive'
+import { selectLinkedUnits, strongDuplicates, type LinkUnit } from './link-selection'
 import { readResourceBytes, type ResourceSource } from './resources'
 import { analyze } from './elf'
 import { loadDisassembler, type Disassembler } from './disassembler'
@@ -29,12 +30,7 @@ import {
     X86_PROJECT_ROOT,
     x86ProjectSourcePath
 } from './project'
-import {
-    DEFAULT_ENTRY_SYMBOL,
-    findNearestSymbol,
-    readDefinedGlobalSymbols,
-    readElfSymbolTable
-} from './elf-symbols'
+import { DEFAULT_ENTRY_SYMBOL, findNearestSymbol, readDefinedGlobalSymbols } from './elf-symbols'
 import {
     captureFileSystemSkeleton,
     resetFileSystem,
@@ -452,7 +448,7 @@ export class BlinkRuntime {
         const report = assembled.stdout + assembled.stderr
         const diagnostics = [
             ...this.parseAssemblerDiagnostics(report, sourceProject),
-            ...duplicateUserDefinitions(assembled.units, sourceProject),
+            ...duplicateLinkedDefinitions(assembled.units, sourceProject),
             ...this.entryPointDiagnostics(
                 assembled.units.map((unit) => unit.object),
                 sourceProject
@@ -766,12 +762,12 @@ export class BlinkRuntime {
             return
         }
 
-        const [entry, ...others] = assembled.units
-        this.unitDiagnostics = duplicateUserDefinitions(assembled.units, sourceProject)
-        if (this.unitDiagnostics.length) {
-            this.setState(BlinkState.Ready)
-            return
-        }
+        // A symbol two units define is the link's to report, as `ld` reports it, and only where
+        // the link takes both: a unit it leaves out may define what the program has already.
+        const { entry, starts, members, user: userMembers, support } = planLink(
+            assembled.units,
+            sourceProject
+        )
         // Only now: a program that does not assemble has nothing to link.
         await this.downloadTool(this.mode.binaries.linker, 'the linker', replacement)
         // what the link reads, which a build running the same link again compares (`reuseLink`)
@@ -780,25 +776,15 @@ export class BlinkRuntime {
             this.writeExecutableSync(path, bytes)
             linkInputs.push({ path, bytes })
         }
-        writeInput(ENTRY_OBJECT, entry!.object)
+        writeInput(ENTRY_OBJECT, entry.object)
         const inputs = [ENTRY_OBJECT]
-        const starts = others.filter((unit) =>
-            Object.hasOwn(sourceProject.startUnits ?? {}, unit.path)
-        )
         for (const [i, unit] of starts.entries()) {
             const object = `/start${i}.o`
             writeInput(object, unit.object)
             this.startObjectSources.set(object, `${X86_PROJECT_ROOT}/${unit.path}`)
             inputs.push(object)
         }
-        const members = others.filter(
-            (unit) => !Object.hasOwn(sourceProject.startUnits ?? {}, unit.path)
-        )
         this.archiveMembers = members.map((unit) => unit.path)
-        const userMembers = members.filter((unit) => Object.hasOwn(sourceProject.files, unit.path))
-        const support = members.filter((unit) =>
-            Object.hasOwn(sourceProject.library ?? {}, unit.path)
-        )
         for (const [archivePath, units] of [
             [UNIT_ARCHIVE, userMembers],
             ['/support.a', support]
@@ -2384,28 +2370,53 @@ function hostRandom(length: number): Uint8Array {
     return bytes
 }
 
-function duplicateUserDefinitions(
-    units: readonly { path: string; object: Uint8Array }[],
+/**
+ * How a build links its units (ADR 0039): the Entry's and the start units' objects, which the link
+ * takes whole, and the archives it takes the other units from by need, the Project's Files before
+ * the library's support units, in that order on the command line.
+ */
+function planLink<Unit extends LinkUnit>(
+    units: readonly Unit[],
+    project: X86Project
+): { entry: Unit; starts: Unit[]; members: Unit[]; user: Unit[]; support: Unit[] } {
+    const [entry, ...others] = units
+    const isStart = (unit: Unit) => Object.hasOwn(project.startUnits ?? {}, unit.path)
+    const members = others.filter((unit) => !isStart(unit))
+    return {
+        entry: entry!,
+        starts: others.filter(isStart),
+        members,
+        user: members.filter((unit) => Object.hasOwn(project.files, unit.path)),
+        support: members.filter((unit) => Object.hasOwn(project.library ?? {}, unit.path))
+    }
+}
+
+/**
+ * The multiple definitions a check reports, which links nothing: a strong global that two of the
+ * units the link would take define, as `ld` reports one only among the units it takes
+ * (`selectLinkedUnits`). A File the program does not need may define what another unit defines.
+ * Each File defining the name has the error, which names the other units; a Build reports `ld`'s
+ * own words instead.
+ */
+function duplicateLinkedDefinitions(
+    units: readonly LinkUnit[],
     project: X86Project
 ): X86CompilationDiagnostic[] {
-    const definitions = new Map<string, string[]>()
-    for (const unit of units) {
-        if (!Object.hasOwn(project.files, unit.path)) continue
-        for (const symbol of readElfSymbolTable(unit.object).symbols) {
-            if (symbol.binding !== 'global' || symbol.sectionIndex === 0 || !symbol.name) continue
-            const paths = definitions.get(symbol.name) ?? []
-            paths.push(unit.path)
-            definitions.set(symbol.name, paths)
-        }
-    }
-    return [...definitions].flatMap(([name, files]) =>
-        files.length < 2
-            ? []
-            : files.map((file) => ({
-                  file,
-                  line: 1,
-                  severity: 'error' as const,
-                  error: `multiple definition of '${name}'`
-              }))
+    if (!units.length) return []
+    const plan = planLink(units, project)
+    const linked = selectLinkedUnits([plan.entry, ...plan.starts], [plan.user, plan.support])
+    return [...strongDuplicates(units.filter((unit) => linked.has(unit)))].flatMap(
+        ([name, defining]) =>
+            defining
+                .filter((unit) => Object.hasOwn(project.files, unit.path))
+                .map((unit) => ({
+                    file: unit.path,
+                    line: 1,
+                    severity: 'error' as const,
+                    error: `multiple definition of '${name}'; also defined in ${defining
+                        .filter((other) => other !== unit)
+                        .map((other) => other.path)
+                        .join(', ')}`
+                }))
     )
 }

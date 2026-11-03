@@ -181,10 +181,11 @@ class Session implements X86ProjectFileSystem {
         }
         return [...children].map(([name, kind]) => ({ name, kind }))
     }
+    /** As the editor's session renames: a File already at `to` is replaced, a Directory is EISDIR. */
     rename(from: string, to: string): void {
         const value = this.files.get(from)
         if (!value) throw new GuestError('ENOENT')
-        if (this.stat(to)) throw new GuestError('EEXIST')
+        if (this.stat(to)?.kind === 'directory') throw new GuestError('EISDIR')
         this.effect('rename')
         this.files.delete(from)
         this.files.set(to, value)
@@ -736,7 +737,7 @@ describe('Project FileSystem guest contracts', () => {
             emulator.dispose()
         }
     })
-    it('preserves open identities across rejected rename replacement and unlink/recreate', async () => {
+    it('preserves open identities across rename replacement and unlink/recreate', async () => {
         const initial = new Session()
         initial.files.set('data.txt', new TextEncoder().encode('old'))
         initial.files.set('renamed.txt', new TextEncoder().encode('target'))
@@ -746,12 +747,14 @@ describe('Project FileSystem guest contracts', () => {
                 'mov r12,rax',
                 'sys 2,other,2,0',
                 'mov r13,rax',
+                // data.txt replaces renamed.txt, which r13 keeps open with no path
                 'sys 82,path,other',
                 'save',
                 'sys 17,r13,buf,8,0',
                 'save',
                 'saveq buf',
-                'sys 87,path',
+                // and the moved File, which r12 keeps open, goes too
+                'sys 87,other',
                 'save',
                 'sys 2,path,66,438',
                 'mov r14,rax',
@@ -777,7 +780,7 @@ describe('Project FileSystem guest contracts', () => {
         try {
             await emulator.run(10000)
             expect(quadwords(Uint8Array.from(bytes))).toEqual([
-                -17n,
+                0n,
                 6n,
                 0x746567726174n,
                 0n,
@@ -791,7 +794,8 @@ describe('Project FileSystem guest contracts', () => {
                 0n
             ])
             expect(new TextDecoder().decode(session.files.get('data.txt'))).toBe('abc')
-            expect(new TextDecoder().decode(session.files.get('renamed.txt'))).toBe('tar')
+            // what r12 and r13 wrote and cut went to Files no path names any more
+            expect(session.files.has('renamed.txt')).toBe(false)
         } finally {
             emulator.dispose()
         }
@@ -1171,6 +1175,89 @@ describe('Project FileSystem guest contracts', () => {
                 0x5861n,
                 0n
             ])
+            if (NATIVE)
+                expect(runNatively(executable).results).toEqual(quadwords(Uint8Array.from(bytes)))
+        } finally {
+            emulator.dispose()
+        }
+    })
+
+    it('replaces a File a rename lands on, which a descriptor open on it keeps, matching Linux', async () => {
+        const body = [
+            'sys 2,path,66,438',
+            'mov r12,rax',
+            'sys 1,r12,payload,3',
+            'sys 2,other,66,438',
+            'mov r13,rax',
+            'sys 1,r13,payload+3,3',
+            'sys 82,path,other',
+            'save',
+            'sys 4,path,buf2',
+            'save',
+            'sys 4,other,buf2',
+            'save',
+            'saveq buf2+48',
+            // the replaced File, open on r13, keeps its bytes, and no path names it
+            'sys 17,r13,buf,8,0',
+            'save',
+            'saveq buf',
+            'sys 5,r13,buf2',
+            'save',
+            'saveq buf2+16',
+            'sys 5,r12,buf2',
+            'save',
+            'saveq buf2+16',
+            'sys 2,other,0,0',
+            'mov r14,rax',
+            'mov qword [buf],0',
+            'sys 0,r14,buf,8',
+            'save',
+            'saveq buf',
+            // onto itself it does nothing; onto a folder or into a missing one it fails
+            'sys 82,other,other',
+            'save',
+            'sys 83,made,511',
+            'sys 82,other,made',
+            'save',
+            'sys 82,made,made',
+            'save',
+            'sys 82,other,nowhere',
+            'save',
+            'sys 84,made',
+            'sys 3,r12',
+            'sys 3,r13',
+            'sys 3,r14',
+            'sys 87,other',
+            'finish',
+            ...PATHS,
+            'section .data',
+            "made: db 'made',0",
+            "nowhere: db 'missing/data.txt',0",
+            'section .text'
+        ]
+        const { emulator, session, bytes, executable } = await mounted(body)
+        try {
+            await emulator.run(10000)
+            expect(emulator.stopReason?.kind).toBe('exit')
+            expect(quadwords(Uint8Array.from(bytes))).toEqual([
+                0n,
+                -2n,
+                0n,
+                3n,
+                3n,
+                0x5a5958n,
+                0n,
+                0n,
+                0n,
+                1n,
+                3n,
+                0x636261n,
+                0n,
+                -21n,
+                0n,
+                -2n
+            ])
+            expect(session.files.size).toBe(0)
             if (NATIVE)
                 expect(runNatively(executable).results).toEqual(quadwords(Uint8Array.from(bytes)))
         } finally {
