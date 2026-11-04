@@ -1609,7 +1609,7 @@ describe('symbols', () => {
         ])
     })
 
-    it('makes an undefined .weak an `extern :weak` and an undefined .globl an `extern`, even in a debug section (note 9)', () => {
+    it('makes an undefined .weak an `extern :weak` and an undefined .globl an `extern`, or `required` when nothing uses it, even in a debug section (note 9)', () => {
         const input = unit(
             'main:',
             '\tcall\t__divti3',
@@ -1629,13 +1629,39 @@ describe('symbols', () => {
             'extern __divti3',
             'extern __cxa_pure_virtual:weak',
             'extern unused:weak',
-            'extern __modti3',
+            // GNU as keeps a .globl nothing uses as an undefined global, which ld takes a member
+            // for; NASM drops an `extern` nothing uses, and keeps a `required` one
+            'required __modti3',
         ])
         expect(result.lines.filter((line) => line.text.includes('global'))).toEqual([])
         expect(result.symbols.external).toEqual([
             { name: '__divti3', nasmName: '__divti3', weak: false },
             { name: '__cxa_pure_virtual', nasmName: '__cxa_pure_virtual', weak: true },
+            { name: '__modti3', nasmName: '__modti3', weak: false },
         ])
+    })
+
+    it("keeps a file-scope asm's .globl of a name the unit never uses, as <sim.h>'s SIM_LINK writes it, so the link takes the unit defining it", async () => {
+        const input = unit(
+            '#APP',
+            '\t.globl\tsim_wanted',
+            '#NO_APP',
+            '\t.globl\tmain',
+            'main:',
+            '\tmov\teax, 42',
+            '\tret',
+        )
+        expect(header(input)).toEqual(['default rel', 'required sim_wanted'])
+        const { nasmWasmAssembler } = await import('../../src/wasm-assembler')
+        const assembled = await nasmWasmAssembler.assemble({
+            entry: 'main.c.asm',
+            files: {
+                'main.c.asm': translated(input).text,
+                'wanted.asm': 'global sim_wanted\nsection .text\nsim_wanted: ret',
+                'other.asm': 'global other\nsection .text\nother: ret',
+            },
+        })
+        expect(assembled.members).toEqual({ needed: ['wanted.asm'], leftOut: ['other.asm'] })
     })
 
     it('rejects a .globl of an assembler-local label and of a label only a dropped section defines', () => {

@@ -20,6 +20,17 @@ export function validateX86Project(project: X86Project): void {
             throw new Error(`Invalid x86 Project file contents: ${path}`)
         }
     }
+    if (project.units !== undefined) {
+        if (!Array.isArray(project.units)) throw new Error('x86 Project units must be an array of paths')
+        const seen = new Set<string>()
+        for (const path of project.units) {
+            if (typeof path !== 'string' || !isProjectPath(path)) throw new Error(`Invalid x86 Project unit path: ${path}`)
+            if (path === project.entry) throw new Error(`The Entry is no other unit: ${path}`)
+            if (typeof project.files[path] !== 'string') throw new Error(`x86 Project unit is not a text File of the Project: ${path}`)
+            if (seen.has(path)) throw new Error(`Duplicate x86 Project unit: ${path}`)
+            seen.add(path)
+        }
+    }
     if (project.includePaths !== undefined && !Array.isArray(project.includePaths)) {
         throw new Error('x86 Project include paths must be an array of directories')
     }

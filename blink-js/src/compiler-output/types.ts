@@ -73,9 +73,11 @@ export type SymbolSummary = {
     /** Common symbols, `.comm` without `.local`. */
     readonly common: readonly TranslatedSymbol[]
     /**
-     * Undefined symbols the output references, in the order of the header's `extern` lines.
-     * NASM writes no symbol for an `extern` nothing references, so a `.globl` or `.weak` of a
-     * symbol the unit never uses has a header line but no entry here.
+     * Undefined symbols the output's object holds, in the order of the header's `extern` and
+     * `required` lines: those it references, and those a `.globl` names that the unit neither
+     * defines nor uses, which it keeps with `required` as GNU as keeps them. NASM writes no symbol
+     * for an `extern` nothing references, so a `.weak` of a symbol the unit never uses has a header
+     * line but no entry here.
      */
     readonly external: readonly (TranslatedSymbol & { readonly weak: boolean })[]
     /** `.init_array` entries, in order. */

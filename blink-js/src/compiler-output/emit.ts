@@ -331,8 +331,16 @@ export function emit(analysis: Analysis, resolution: Resolution): { lines: Trans
     // generated `unsupported-instruction` check over it.
     header.push('default rel')
     if (names.escapes) header.push('[dollarhex off]')
+    // GNU as keeps a `.globl` of a name the unit neither defines nor uses as an undefined global,
+    // which ld takes an archive member for, as `ld -u` would: C asks for a unit it never calls this
+    // way, with <sim.h>'s SIM_LINK. NASM writes no symbol for an `extern` nothing references, so
+    // such a name is `required`, NASM's `extern` that stays in the object.
     resolution.externs.forEach((extern, index) =>
-        header.push(`extern ${externNames[index]}${extern.weak ? ':weak' : ''}`),
+        header.push(
+            extern.referenced || extern.weak
+                ? `extern ${externNames[index]}${extern.weak ? ':weak' : ''}`
+                : `required ${externNames[index]}`,
+        ),
     )
 
     for (const [original, spelling] of names.entries()) {
@@ -356,7 +364,7 @@ export function emit(analysis: Analysis, resolution: Resolution): { lines: Trans
             .filter((common) => resolution.globalCommons.has(common.name))
             .map((common) => symbol(common.name)),
         external: resolution.externs
-            .filter((extern) => extern.referenced)
+            .filter((extern) => extern.referenced || !extern.weak)
             .map((extern) => ({ ...symbol(extern.name), weak: extern.weak })),
         constructors: analysis.constructors.map((constructor) => symbol(constructor.name)),
     }

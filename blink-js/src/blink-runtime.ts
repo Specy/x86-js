@@ -11,6 +11,7 @@ import {
 } from './assemblers'
 import { writeArchive } from './archive'
 import { selectLinkedUnits, strongDuplicates, type LinkUnit } from './link-selection'
+import type { WasmAssemblyResult } from './wasm-assembler'
 import { readResourceBytes, type ResourceSource } from './resources'
 import { analyze } from './elf'
 import { loadDisassembler, type Disassembler } from './disassembler'
@@ -444,7 +445,9 @@ export class BlinkRuntime {
     private async checkProjectWithWasmAssembler(project: X86Project): Promise<X86CompileResult> {
         validateX86Project(project)
         const sourceProject = copyX86Project(project)
+        this.projectUnits = null
         const assembled = await this.mode.wasmAssembler!.assemble(sourceProject)
+        this.projectUnits = assembled.members
         const report = assembled.stdout + assembled.stderr
         const diagnostics = [
             ...this.parseAssemblerDiagnostics(report, sourceProject),
@@ -452,10 +455,25 @@ export class BlinkRuntime {
             ...this.entryPointDiagnostics(
                 assembled.units.map((unit) => unit.object),
                 sourceProject
-            )
+            ),
+            ...leftOutHints(assembled)
         ]
         return toCompileResult(diagnostics, report)
     }
+
+    /**
+     * The last check's or Build's account of the Project's other units (`X86Project.units`, or every
+     * source File but the Entry), Files another unit includes apart: `needed` the ones the program
+     * needs, which were assembled, and `leftOut` the ones it does not, which were neither assembled
+     * nor checked. Null before either, when need could not be found, because the Entry's unit or a
+     * library unit did not assemble, and for an assembler that builds the Entry alone.
+     */
+    getProjectUnits(): { needed: string[]; leftOut: string[] } | null {
+        return this.projectUnits
+            ? { needed: [...this.projectUnits.needed], leftOut: [...this.projectUnits.leftOut] }
+            : null
+    }
+    private projectUnits: { needed: string[]; leftOut: string[] } | null = null
 
     private async buildProject(
         project: X86Project,
@@ -495,6 +513,7 @@ export class BlinkRuntime {
         this.archiveMembers = []
         this.startObjectSources.clear()
         this.unitDiagnostics = []
+        this.projectUnits = null
         this.linkerLogs = null
         this.sourceMap = null
         this.assembleOnly = !options.link
@@ -748,6 +767,8 @@ export class BlinkRuntime {
 
         // What the assembler said goes into the report, as a blink-hosted tool's does.
         this.assemblerLogs += assembled.stdout + assembled.stderr
+        this.projectUnits = assembled.members
+        this.unitDiagnostics.push(...leftOutHints(assembled))
 
         this.collectAssemblerDiagnostics()
         if (!assembled.units.length) {
@@ -841,7 +862,7 @@ export class BlinkRuntime {
                         line: 1,
                         severity: 'hint',
                         warningClass: 'not-linked',
-                        error: 'nothing refers to a symbol this File defines, so it is not part of the program'
+                        error: NOT_LINKED
                     })
             }
         }
@@ -2335,6 +2356,7 @@ function copyX86Project(project: X86Project): X86Project {
         files: copy(project.files),
         ...(project.library ? { library: copy(project.library) } : {}),
         ...(project.startUnits ? { startUnits: copy(project.startUnits) } : {}),
+        ...(project.units ? { units: [...project.units] } : {}),
         ...(project.includePaths ? { includePaths: [...project.includePaths] } : {})
     }
 }
@@ -2368,6 +2390,25 @@ function hostRandom(length: number): Uint8Array {
     for (let i = 0; i < length; i += 65536)
         crypto.getRandomValues(bytes.subarray(i, Math.min(length, i + 65536)))
     return bytes
+}
+
+/** What says a File the program does not need is no part of it (`WasmAssemblyResult.members`). */
+const NOT_LINKED = 'This File is not part of the program: the program uses nothing it defines.'
+
+/**
+ * A Hint on each of the Project's other units the program does not need, which was neither
+ * assembled nor checked, once everything it does need assembled: before that, a unit left out may
+ * yet be needed by one that did not assemble.
+ */
+function leftOutHints(assembled: WasmAssemblyResult): X86CompilationDiagnostic[] {
+    if (assembled.status !== 0 || !assembled.members) return []
+    return assembled.members.leftOut.map((file) => ({
+        file,
+        line: 1,
+        severity: 'hint' as const,
+        warningClass: 'not-linked',
+        error: NOT_LINKED
+    }))
 }
 
 /**

@@ -279,12 +279,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
 
     /**
      * Assembles a Project and links it into the program to run. With the default NASM assembler,
-     * the Entry and every `.asm`, `.s` or `.nasm` File no other File `%include`s are assembled as
-     * units of their own, with `project.library`'s units beside them, and linked as a C toolchain
-     * links objects and a static library: the Entry's unit as an object, and every other unit,
-     * the library's ahead of the rest, as a member of an archive from which `ld` takes a member
-     * only for a symbol still undefined (see {@link X86Emulator.projectLinking}). A unit nothing
-     * needs is assembled, and its mistakes reported, but left out of the program. Throws for a
+     * the Entry and the other units (`project.units`, or every `.asm`, `.s` or `.nasm` File) no
+     * other File `%include`s are units of their own, with `project.library`'s units beside them,
+     * and linked as a C toolchain links objects and a static library: the Entry's unit as an
+     * object, and every other unit as a member of an archive from which `ld` takes a member only
+     * for a symbol still undefined (see {@link X86Emulator.projectLinking}). Which names a unit
+     * defines is read from its declarations first, and a Project's unit is assembled only once the
+     * program needs one: a unit nothing needs is neither assembled nor checked, and has a Hint
+     * saying it is not part of the program (see {@link X86Emulator.getProjectUnits}). Throws for a
      * Project it cannot take, such as one whose library path is also a File's, and with a
      * `ResourceDownloadError` when the assembler or the linker could not be downloaded.
      * `options.onProgress` hears of each phase as it starts (see {@link X86Progress}).
@@ -299,6 +301,15 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.lastCompileResult
     }
 
+    /**
+     * Which of the Project's other units the last check or Build took: `needed`, the ones the
+     * program needs, which were assembled, and `leftOut`, the ones it does not, which were neither
+     * assembled nor checked. Null when need could not be found, because the Entry's unit or a
+     * library unit did not assemble, and for the assemblers that build the Entry alone.
+     */
+    getProjectUnits(): { needed: string[]; leftOut: string[] } | null {
+        return this.runtime.getProjectUnits()
+    }
     resolveMemoryLabel(name: string) {
         return this.runtime.resolveMemoryLabel(name)
     }
@@ -544,7 +555,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
      * Diagnostics only: this assembles but does not link, and for an assembler
      * that runs as its own wasm module it does not touch blink at all, so a
      * loaded or paused program survives a check. The library is assembled too,
-     * so a `_start` only it defines satisfies the check as it satisfies a build.
+     * so a `_start` only it defines satisfies the check as it satisfies a build,
+     * and a Project's unit only when the program needs it, as a Build does.
      */
     async checkProject(project: X86Project): Promise<MonacoError[]> {
         // Warnings included: a program that assembles is where they matter, and

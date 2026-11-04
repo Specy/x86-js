@@ -1,6 +1,7 @@
 // How a Project of several units becomes one program: the Entry's unit linked as an object, and
 // every other unit, the library's first, as a member of an archive that `ld` takes a member from
-// only for a symbol the program still needs.
+// only for a symbol the program still needs, which is found from what each unit declares before
+// it is assembled, so a unit nothing needs is never assembled.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { readElfSymbolTable } from '../src/elf-symbols'
 import { BlinkState, type X86Project } from '../src/types'
@@ -82,7 +83,10 @@ describe('linking a Project', () => {
             'main.asm': ['global _start', 'section .text', '_start:', ...exit(42)].join('\n'),
             'other.asm': ['global _start', 'section .text', '_start:', ...exit(7)].join('\n')
         } }
-        expect(await emulator.checkProject(project)).toEqual([])
+        expect(await emulator.checkProject(project)).toEqual([
+            expect.objectContaining({ file: 'other.asm', severity: 'hint', code: 'not-linked' }),
+        ])
+        expect(emulator.getProjectUnits()).toEqual({ needed: [], leftOut: ['other.asm'] })
         const result = await emulator.compileProject(project)
         expect(result.ok, result.report).toBe(true)
         expect(result.diagnostics).toEqual([
@@ -97,7 +101,9 @@ describe('linking a Project', () => {
         const files = { 'a.c.asm': main(1), 'b.c.asm': main(2) }
         for (const [entry, code, other] of [['a.c.asm', 1, 'b.c.asm'], ['b.c.asm', 2, 'a.c.asm']] as const) {
             const project = { entry, files, startUnits: { [START_PATH]: START } }
-            expect(await emulator.checkProject(project)).toEqual([])
+            expect(await emulator.checkProject(project)).toEqual([
+                expect.objectContaining({ file: other, severity: 'hint', code: 'not-linked' }),
+            ])
             const result = await emulator.compileProject(project)
             expect(result.ok, result.report).toBe(true)
             expect(result.diagnostics).toEqual([
@@ -108,7 +114,7 @@ describe('linking a Project', () => {
         }
     })
 
-    it('assembles a File nothing needs, and reports its mistakes, but leaves it out of the program', async () => {
+    it('neither assembles nor checks a File nothing needs, and leaves it out of the program', async () => {
         const unused = [
             'global unused_function',
             'global unused_data',
@@ -134,17 +140,206 @@ describe('linking a Project', () => {
         await emulator.run(undefined, [{ path: 'unused.asm', line: lineOf(unused, 'ret') }])
         expect(emulator.stopReason?.kind).toBe('exit')
 
-        const broken = await emulator.compileProject({
+        // A mistake in it, or a whole File in another assembler's syntax, fails nothing, though it
+        // declares a global: the program does not need it.
+        const broken = {
             entry: 'main.asm',
             files: {
                 'main.asm': ['global _start', 'section .text', '_start:', ...exit(0)].join('\n'),
-                'unused.asm': ['section .text', 'unused_function:', '    mov rax, rbx, rcx'].join('\n'),
+                'unused.asm': ['global unused_function', 'section .text', 'unused_function:', '    mov rax, rbx, rcx'].join('\n'),
+                'gas.s': ['.globl helper', '.text', 'helper:', '    movq %rax, %rbx', '    ret'].join('\n'),
+                'mips.asm': ['.globl main', 'main:', '    li $v0, 10', '    syscall'].join('\n'),
+                // the preprocessor gives up on it, so it is read as it is written
+                'stops.asm': ['%error not finished', 'global stopping', 'stopping:', '    ret'].join('\n'),
             },
-        })
-        expect(broken.ok).toBe(false)
-        if (broken.ok) return
-        expect(broken.errors.length).toBeGreaterThan(0)
-        expect(broken.errors.every((error) => error.file === 'unused.asm' && error.line === 3)).toBe(true)
+        }
+        expect(await emulator.checkProject(broken)).toEqual(
+            ['gas.s', 'mips.asm', 'stops.asm', 'unused.asm'].map((file) => expect.objectContaining({ file, severity: 'hint', code: 'not-linked' })),
+        )
+        await build(broken)
+        expect(await exitCode()).toBe(0)
+
+        // Once the program needs it, it is assembled, and its mistake fails the Build.
+        const needed = {
+            entry: 'main.asm',
+            files: {
+                ...broken.files,
+                'main.asm': ['global _start', 'extern unused_function', 'section .text', '_start:', '    call unused_function', ...exit(0)].join('\n'),
+            },
+        }
+        for (const result of [await emulator.compileProject(needed), await emulator.compileProject(needed)]) {
+            expect(result.ok).toBe(false)
+            if (result.ok) return
+            expect(result.errors.length).toBeGreaterThan(0)
+            expect(result.errors.every((error) => error.file === 'unused.asm' && error.line === 4)).toBe(true)
+            expect(result.diagnostics.some((diagnostic) => diagnostic.warningClass === 'not-linked')).toBe(false)
+        }
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['unused.asm'], leftOut: ['gas.s', 'mips.asm', 'stops.asm'] })
+    })
+
+    it('finds a global an include or a macro declares, in the preprocessed text', async () => {
+        const project = {
+            entry: 'main.asm',
+            files: {
+                'main.asm': ['global _start', 'extern from_macro', 'extern from_include', 'section .text', '_start:',
+                    '    call from_macro', '    mov ebx, eax', '    call from_include', '    lea edi, [rbx + rax]', '    mov eax, 60', '    syscall'].join('\n'),
+                'macro.asm': ['%macro VALUE 2', '    global %1', '%1:', '    mov eax, %2', '    ret', '%endmacro', 'section .text', 'VALUE from_macro, 40'].join('\n'),
+                'include.asm': ['%include "values.inc"'].join('\n'),
+                'values.inc': ['global from_include', 'section .text', 'from_include:', '    mov eax, 2', '    ret'].join('\n'),
+                // declares a global only inside a block the preprocessor leaves out
+                'skipped.asm': ['%if 0', 'global from_macro', 'from_macro:', '%endif', '    bogus'].join('\n'),
+            },
+        }
+        expect(await emulator.checkProject(project)).toEqual([
+            expect.objectContaining({ file: 'skipped.asm', code: 'not-linked' }),
+        ])
+        await build(project)
+        expect(await exitCode()).toBe(42)
+        // include.asm's instructions are the ones values.inc wrote
+        expect(linkedFiles()).toEqual(['macro.asm', 'main.asm', 'values.inc'])
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['include.asm', 'macro.asm'], leftOut: ['skipped.asm'] })
+    })
+
+    it('never takes a File another one includes on its own, the Entry or a unit', async () => {
+        // defs.asm is part of the Entry, and frag.asm part of lib.asm, whose definition it needs
+        const project = {
+            entry: 'main.asm',
+            files: {
+                'main.asm': ['%include "defs.asm"', 'global _start', 'extern helper', 'section .text', '_start:', '    call helper', '    add eax, [rel base]', '    mov edi, eax', '    mov eax, 60', '    syscall'].join('\n'),
+                'defs.asm': ['global base', 'section .data', 'base: dd 2'].join('\n'),
+                'a_frag.asm': ['global helper', 'section .text', 'helper:', '    mov eax, VALUE', '    ret'].join('\n'),
+                'b_lib.asm': ['%define VALUE 40', '%include "a_frag.asm"'].join('\n'),
+            },
+        }
+        expect(await emulator.checkProject(project)).toEqual([])
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['b_lib.asm'], leftOut: [] })
+        await build(project)
+        expect(await exitCode()).toBe(42)
+    })
+
+    it('takes a File for a name only declared global where another defines it, and not the declaring one', async () => {
+        const project = {
+            entry: 'main.asm',
+            files: {
+                'main.asm': ['global _start', 'extern helper', 'section .text', '_start:', '    call helper', '    mov edi, eax', '    mov eax, 60', '    syscall'].join('\n'),
+                // declares helper global but defines no such label: no member for it
+                'a_decoy.asm': ['global helper', 'section .text', 'other:', '    ret'].join('\n'),
+                'b_real.asm': ['global helper', 'section .text', 'helper:', '    mov eax, 9', '    ret'].join('\n'),
+                // only a common symbol the Entry also has: never taken for it, so its mistake fails nothing
+                'c_common.asm': ['common shared 8', 'section .text', '    mov rax, rbx, rcx'].join('\n'),
+            },
+        }
+        const withCommon = { ...project, files: { ...project.files, 'main.asm': project.files['main.asm'].replace('extern helper', 'extern helper\ncommon shared 8') } }
+        expect((await emulator.checkProject(withCommon)).map((diagnostic) => [diagnostic.file, diagnostic.code])).toEqual([
+            ['a_decoy.asm', 'not-linked'],
+            ['c_common.asm', 'not-linked'],
+        ])
+        await build(withCommon)
+        expect(await exitCode()).toBe(9)
+    })
+
+    it("takes a File a library unit needs, though the program's own units do not", async () => {
+        const project = {
+            entry: 'main.asm',
+            files: {
+                'main.asm': ['global _start', 'extern library_function', 'section .text', '_start:', '    call library_function', '    mov edi, eax', '    mov eax, 60', '    syscall'].join('\n'),
+                'hook.asm': ['global user_hook', 'section .text', 'user_hook:', '    mov eax, 5', '    ret'].join('\n'),
+            },
+            library: { '@runtime/library.asm': ['global library_function', 'extern user_hook', 'section .text', 'library_function:', '    call user_hook', '    add eax, 1', '    ret'].join('\n') },
+        }
+        expect(await emulator.checkProject(project)).toEqual([])
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['hook.asm'], leftOut: [] })
+        await build(project)
+        expect(await exitCode()).toBe(6)
+    })
+
+    it('takes only the units a Project names, in their order, when it names them', async () => {
+        const main = ['global _start', 'extern value', 'section .text', '_start:', '    call value', '    mov edi, eax', '    mov eax, 60', '    syscall'].join('\n')
+        const value = (code: number) => ['global value', 'section .text', 'value:', `    mov eax, ${code}`, '    ret'].join('\n')
+        const files = { 'main.asm': main, 'a.asm': value(1), 'b.asm': value(2), 'other.mips': '.globl value\nvalue: jr $ra', 'c.s': value(3) }
+        // the first of the named units that defines it, which needs no `.asm` name
+        await build({ entry: 'main.asm', files: { ...files, 'c.txt': value(4) }, units: ['c.txt', 'b.asm'] })
+        expect(await exitCode()).toBe(4)
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['c.txt'], leftOut: ['b.asm'] })
+        await build({ entry: 'main.asm', files, units: ['b.asm', 'a.asm'] })
+        expect(await exitCode()).toBe(2)
+        // a File it does not name is not looked at, so a program it does not name cannot link
+        const unnamed = await emulator.compileProject({ entry: 'main.asm', files, units: [] })
+        expect(unnamed.ok).toBe(false)
+        expect(emulator.getProjectUnits()).toEqual({ needed: [], leftOut: [] })
+        // what a Project cannot name
+        for (const units of [['main.asm'], ['missing.asm'], ['a.asm', 'a.asm'], ['/a.asm']])
+            await expect(emulator.compileProject({ entry: 'main.asm', files, units })).rejects.toThrow()
+        await expect(emulator.compileProject({ entry: 'main.asm', files: { ...files, 'bytes.asm': new Uint8Array([1]) }, units: ['bytes.asm'] })).rejects.toThrow(/text File/)
+    })
+
+    it('reports a needed File that does not assemble without knowing what else it needs, and no Hint until it does', async () => {
+        const project = {
+            entry: 'main.asm',
+            files: {
+                'main.asm': ['global _start', 'extern first', 'section .text', '_start:', '    call first', ...exit(0)].join('\n'),
+                'first.asm': ['global first', 'extern second', 'section .text', 'first:', '    call second', '    mov rax, rbx, rcx', '    ret'].join('\n'),
+                'second.asm': ['global second', 'section .text', 'second:', '    ret'].join('\n'),
+            },
+        }
+        const checked = await emulator.checkProject(project)
+        expect(checked.map((diagnostic) => [diagnostic.file, diagnostic.severity])).toEqual([['first.asm', 'error']])
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['first.asm'], leftOut: ['second.asm'] })
+        // a File that does not assemble still counts as defining what it declares, so another
+        // that defines `first` too is not taken in its place
+        const twice = { ...project, files: { ...project.files, 'z_first.asm': 'global first\nsection .text\nfirst: ret' } }
+        expect((await emulator.checkProject(twice)).map((diagnostic) => diagnostic.file)).toEqual(['first.asm'])
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['first.asm'], leftOut: ['second.asm', 'z_first.asm'] })
+        // an Entry that does not assemble cannot say for certain what it needs, but the Files its
+        // `extern` lines name are still assembled, so their mistakes are reported beside its own
+        const entryBroken = { ...project, files: { ...project.files, 'main.asm': project.files['main.asm'] + '\n    mov rax, rbx, rcx' } }
+        expect((await emulator.checkProject(entryBroken)).map((diagnostic) => diagnostic.file)).toEqual(['main.asm', 'first.asm'])
+        expect(emulator.getProjectUnits()).toBeNull()
+        // and a File it does not name is not
+        const fixed = { ...entryBroken, files: { ...entryBroken.files, 'first.asm': project.files['second.asm'].replaceAll('second', 'first') } }
+        const unrelated = { ...fixed, files: { ...fixed.files, 'other.asm': 'global other\nsection .text\nother:\n    mov rax, rbx, rcx' } }
+        expect((await emulator.checkProject(unrelated)).map((diagnostic) => diagnostic.file)).toEqual(['main.asm'])
+    })
+
+    it('finds a global a scan of the text alone has to piece together: a local label, a continued line, a struc', async () => {
+        const main = ['global _start', 'extern helper.inner, second, point_size, point.y', 'section .text', '_start:',
+            '    call helper.inner', '    mov ebx, eax', '    call second', '    add ebx, eax',
+            '    add ebx, point_size', '    add ebx, point.y', '    mov edi, ebx', '    mov eax, 60', '    syscall'].join('\n')
+        const project = {
+            entry: 'main.asm',
+            files: {
+                'main.asm': main,
+                // NASM's helper.inner, a local label of helper
+                'local.asm': ['global helper.inner', 'section .text', 'helper:', '    nop', '.inner:', '    mov eax, 30', '    ret'].join('\n'),
+                // a global list a backslash continues onto the next line
+                'continued.asm': ['global first, \\', '    second', 'section .text', 'first:', '    ret', 'second:', '    mov eax, 4', '    ret'].join('\n'),
+                // a structure's size and field, written plainly and through the preprocessor
+                'shape.asm': ['struc point', '.x: resd 1', '.y: resd 1', 'endstruc', 'global point_size, point.y'].join('\n'),
+            },
+        }
+        expect(await emulator.checkProject(project)).toEqual([])
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['continued.asm', 'local.asm', 'shape.asm'], leftOut: [] })
+        await build(project)
+        expect(await exitCode()).toBe(30 + 4 + 8 + 4)
+        const preprocessed = { ...project, files: { ...project.files, 'shape.asm': '%define FIELD resd 1\n' + project.files['shape.asm'].replaceAll('resd 1', 'FIELD') } }
+        await build(preprocessed)
+        expect(await exitCode()).toBe(46)
+        // a local label after an `equ` is still the last label's, as NASM has it
+        const afterEqu = { ...project, files: { ...project.files, 'local.asm': project.files['local.asm'].replace('    nop', 'size equ 4') } }
+        await build(afterEqu)
+        expect(await exitCode()).toBe(46)
+    })
+
+    it("reads a File's declarations again once it is no longer the Entry", async () => {
+        // checked as the Entry, which reads only its includes, then needed as a unit: what its
+        // scan as the Entry found is not what it declares
+        const lib = ['%define VALUE 7', 'global seven', 'section .text', 'seven:', '    mov eax, VALUE', '    ret'].join('\n')
+        const main = ['global _start', 'extern seven', 'section .text', '_start:', '    call seven', '    mov edi, eax', '    mov eax, 60', '    syscall'].join('\n')
+        const files = { 'lib.asm': lib, 'main.asm': main }
+        await emulator.checkProject({ entry: 'lib.asm', files })
+        await build({ entry: 'main.asm', files })
+        expect(emulator.getProjectUnits()).toEqual({ needed: ['lib.asm'], leftOut: [] })
+        expect(await exitCode()).toBe(7)
     })
 
     it('takes every member a reference needs, whichever way the references run', async () => {
@@ -432,7 +627,10 @@ describe('reviewed link policy', () => {
             'a.asm': 'global duplicate\nsection .text\nduplicate: ret',
             'b.asm': 'global duplicate\nsection .text\nduplicate: ret'
         } }
-        expect(await emulator.checkProject(project)).toEqual([])
+        expect((await emulator.checkProject(project)).map((d) => [d.file, d.code])).toEqual([
+            ['a.asm', 'not-linked'],
+            ['b.asm', 'not-linked'],
+        ])
         const result = await emulator.compileProject(project)
         expect(result.ok, result.report).toBe(true)
         expect(result.diagnostics.map((d) => [d.file, d.warningClass])).toEqual([
@@ -445,7 +643,7 @@ describe('reviewed link policy', () => {
         const other = (defines: string) => [`global ${defines}`, 'global shared', 'section .text', `${defines}:`, '    ret', 'shared:', '    ret'].join('\n')
         const used = 'global used\nsection .text\nused: ret'
         const apart = { entry: 'main.asm', files: { 'main.asm': entry, 'other.asm': other('spare'), 'used.asm': used } }
-        expect(await emulator.checkProject(apart)).toEqual([])
+        expect(await emulator.checkProject(apart)).toEqual([expect.objectContaining({ file: 'other.asm', code: 'not-linked' })])
         await build(apart)
 
         // now the program needs `used` from other.asm, whose `shared` comes with it
@@ -494,7 +692,7 @@ describe('reviewed link policy', () => {
             'b.asm': ['global y', 'extern x', 'section .text', 'y:', '    jmp x'].join('\n'),
             'c.asm': value('x', 3).join('\n'),
         } }
-        expect(await emulator.checkProject(project)).toEqual([])
+        expect(await emulator.checkProject(project)).toEqual([expect.objectContaining({ file: 'a.asm', code: 'not-linked' })])
         await build(project)
         expect(await exitCode()).toBe(3)
         expect(linkedFiles()).toEqual(['b.asm', 'c.asm', 'main.asm'])

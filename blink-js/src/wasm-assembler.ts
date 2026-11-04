@@ -1,5 +1,7 @@
 import createNasm from './wasm/nasm.mjs'
+import { declaredNames, externNames, type DeclaredName } from './declarations'
 import { loadDisassembler, type Disassembler } from './disassembler'
+import { pullDeclaredUnits } from './link-selection'
 import { selectX86Source, stageX86Project, X86_PROJECT_ROOT } from './project'
 import { readResourceBytes, ResourceDownloadError } from './resources'
 import { parseDependencyList, x86TranslationUnitCandidates } from './translation-units'
@@ -35,18 +37,27 @@ export type WasmAssemblyResult = {
     stderr: string
     /**
      * The objects to link: the Entry's, then the library's units and then the
-     * Project's other units, each group by path, which is the order the archive
-     * holds them in. Empty when any translation unit failed: a partial link would
-     * report missing symbols that are only missing because the File defining them
-     * is the one that did not assemble.
+     * Project's other units the program needs, each group by path, which is the
+     * order the archive holds them in. Empty when any translation unit failed: a
+     * partial link would report missing symbols that are only missing because the
+     * File defining them is the one that did not assemble.
      */
     units: WasmAssemblyUnit[]
     /** The Entry's object, or null when the assembly failed. */
     object: Uint8Array | null
+    /**
+     * The Project's other units, Files another unit includes apart, by path: `needed` the ones the
+     * program needs, which were assembled, and `leftOut` the ones it does not, which were neither
+     * assembled nor checked. Null when need could not be found, because the Entry's unit or a
+     * library unit did not assemble.
+     */
+    members: { needed: string[]; leftOut: string[] } | null
 }
 
 const OBJECT_PATH = '/program.o'
 const DEPENDENCIES_PATH = '/unit.d'
+/** Where a scan writes a unit's preprocessed text. */
+const PREPROCESSED_PATH = '/unit.i'
 
 /**
  * `-g -F dwarf` is what makes the source map possible: the debugger reads
@@ -160,13 +171,22 @@ const LIBRARY_OBJECT_BUDGET = 64 * 1024 * 1024
 let libraryObjectBytes = 0
 
 /**
- * Units whose `%include` scan found nothing but themselves, by path and source. Such a unit
- * includes no other File, so what its scan would find cannot change while its text does not, and
- * a Build of an unchanged Program skips preprocessing it again.
+ * What the scan of a unit that reads no other File found (`scanUnits`), by path and source: what it
+ * declares, which cannot change while its text does not, so a Build of an unchanged Program neither
+ * preprocesses nor reads such a unit again.
  */
-const includesNothing = new Set<string>()
-const INCLUDES_NOTHING_BUDGET = 16 * 1024 * 1024
-let includesNothingBytes = 0
+const unitScans = new Map<string, DeclaredName[]>()
+const UNIT_SCANS_BUDGET = 16 * 1024 * 1024
+let unitScansBytes = 0
+
+function keepUnitScan(key: string, names: DeclaredName[]): void {
+    if (unitScansBytes + key.length > UNIT_SCANS_BUDGET) {
+        unitScans.clear()
+        unitScansBytes = 0
+    }
+    unitScans.set(key, names)
+    unitScansBytes += key.length
+}
 
 /**
  * The words of NASM's directives that read another File: `%include`, `incbin`, `%depend` and
@@ -175,6 +195,11 @@ let includesNothingBytes = 0
  * would otherwise be preprocessed to find out.
  */
 const READS_FILES = /include|incbin|depend|pathsearch|%\+|%\[/i
+/**
+ * A line of a preprocessor directive, `%macro` or `%define`, or what could expand to one: a unit
+ * with none, which reads no File either, declares what its text says, and is scanned as it is.
+ */
+const PREPROCESSES = /^\s*%/m
 
 /** NASM's `__?DATE?__`, `__?TIME_NUM?__`, `__?UTC_DATE?__`, `__?POSIX_TIME?__`, and their old spellings. */
 const CLOCK_MACRO = /__\??(?:UTC_)?(?:DATE|TIME)|__\??POSIX_TIME/
@@ -218,50 +243,96 @@ function callNasm(module: NasmModule, args: string[]): number {
 }
 
 /**
- * Which Files the Project's candidate translation units `%include`, so that a fragment is
- * assembled as part of whatever includes it and never a second time on its own. Every candidate
- * is scanned before any of them is treated as a unit, because a fragment can be included by a
- * File that sorts after it.
+ * What the Project's candidate translation units declare and which Files they `%include`, before
+ * any of them is assembled: a fragment is assembled as part of whatever includes it and never a
+ * second time on its own, and a unit is assembled only once the program needs a name it declares
+ * (`pullDeclaredUnits`). Every candidate is scanned before any of them is treated as a unit,
+ * because a fragment can be included by a File that sorts after it.
+ *
+ * A unit that uses the preprocessor is preprocessed (`nasm -E`), which writes the Files it read
+ * too, and its declarations are read in what that expands to, so a `global` an included File or a
+ * macro writes is found; one that does not is read as it is. Neither is assembled, and whatever
+ * the preprocessor says of a unit is discarded: a unit the program does not need cannot fail it.
+ * One the preprocessor gives up on is read as it is, and its includes come from `nasm -M`, as
+ * before. The Entry's declarations are not needed, only what it includes, which `nasm -M` says
+ * when its text can include anything at all; nothing of the Entry's scan is kept, since the same
+ * File may be another Program's unit, whose declarations its next scan must read.
  */
-async function scanIncludedFiles(
+async function scanUnits(
     project: X86Project,
     candidates: readonly string[]
-): Promise<Set<string>> {
+): Promise<{ included: Set<string>; declarations: Map<string, DeclaredName[]> }> {
     const included = new Set<string>()
-    if (candidates.length < 2) return included
+    const declarations = new Map<string, DeclaredName[]>()
+    if (candidates.length < 2) return { included, declarations }
 
     for (const path of candidates) {
         const text = project.files[path]
-        if (typeof text === 'string' && !READS_FILES.test(text)) continue
-        const key = typeof text === 'string' ? libraryObjectKey(path, text) : undefined
-        if (key !== undefined && includesNothing.has(key)) continue
-        const { module, stdout } = await createNasmModule()
-        stageX86Project(module.FS, project)
-        const source = selectX86Source(module.FS, project, path)
-        // `-M` preprocesses and writes the dependency list without assembling, so a fragment that
-        // cannot stand on its own costs nothing here; its diagnostics are deliberately discarded.
-        callNasm(module, [
-            '-M',
-            ...NASM_ARGS,
-            ...includeArguments(project),
-            source,
-            '-o',
-            OBJECT_PATH
-        ])
-        const dependencies = parseDependencyList(stdout(), project)
-        for (const dependency of dependencies) {
-            if (dependency !== path) included.add(dependency)
+        if (typeof text !== 'string') continue
+        if (path === project.entry) {
+            declarations.set(path, [])
+            if (!READS_FILES.test(text)) continue
+            const read = parseDependencyList((await preprocessUnit(project, path, ['-M'])).stdout, project)
+            for (const dependency of read) if (dependency !== path) included.add(dependency)
+            continue
         }
-        if (key !== undefined && dependencies.length === 1 && dependencies[0] === path) {
-            if (includesNothingBytes + key.length > INCLUDES_NOTHING_BUDGET) {
-                includesNothing.clear()
-                includesNothingBytes = 0
-            }
-            includesNothing.add(key)
-            includesNothingBytes += key.length
+        const key = libraryObjectKey(path, text)
+        const kept = unitScans.get(key)
+        if (kept) {
+            declarations.set(path, kept)
+            continue
         }
+        const preprocesses = PREPROCESSES.test(text) || READS_FILES.test(text)
+        if (!preprocesses) {
+            const names = declaredNames(text)
+            declarations.set(path, names)
+            keepUnitScan(key, names)
+            continue
+        }
+        const expanded = await preprocessUnit(project, path, ['-E', '-MD', DEPENDENCIES_PATH])
+        const preprocessed = expanded.status === 0 ? expanded : null
+        const dependencies =
+            preprocessed?.dependencies ?? (await preprocessUnit(project, path, ['-M'])).stdout
+        const read = parseDependencyList(dependencies, project)
+        for (const dependency of read) if (dependency !== path) included.add(dependency)
+        const names = declaredNames(preprocessed?.output ?? text)
+        declarations.set(path, names)
+        if (preprocessed && read.length === 1 && read[0] === path) keepUnitScan(key, names)
     }
-    return included
+    return { included, declarations }
+}
+
+/**
+ * Runs NASM's preprocessor over one unit with `flags`, `-E` or `-M`, and returns its status and
+ * what it wrote: the expanded text, the dependency list and its standard output. Its messages are
+ * discarded.
+ */
+async function preprocessUnit(
+    project: X86Project,
+    path: string,
+    flags: readonly string[]
+): Promise<{ status: number; output: string; dependencies: string | undefined; stdout: string }> {
+    const { module, stdout } = await createNasmModule()
+    stageX86Project(module.FS, project)
+    const source = selectX86Source(module.FS, project, path)
+    const status = callNasm(module, [
+        ...flags,
+        ...NASM_ARGS,
+        ...includeArguments(project),
+        source,
+        '-o',
+        PREPROCESSED_PATH
+    ])
+    const read = (file: string) =>
+        module.FS.analyzePath(file).exists
+            ? (module.FS.readFile(file, { encoding: 'utf8' }) as string)
+            : undefined
+    return {
+        status,
+        output: read(PREPROCESSED_PATH) ?? '',
+        dependencies: read(DEPENDENCIES_PATH),
+        stdout: stdout()
+    }
 }
 
 /**
@@ -305,19 +376,20 @@ export const nasmWasmAssembler: WasmAssembler = {
         }
         options.onProgress?.({ phase: 'assemble' })
         const candidates = x86TranslationUnitCandidates(project)
-        const included = await scanIncludedFiles(project, candidates)
+        const { included, declarations } = await scanUnits(project, candidates)
         const [entry, ...others] = candidates.filter(
             (path) => path === project.entry || !included.has(path)
         )
         const library = new Set(Object.keys({ ...project.startUnits, ...project.library }))
-        const units = [entry!, ...[...library].sort(), ...others]
+        const always = [entry!, ...[...library].sort()]
 
         let stdout = ''
         let stderr = ''
         let status = 0
-        const assembled: WasmAssemblyUnit[] = []
+        const assembled = new Map<string, Uint8Array>()
 
-        for (const path of units) {
+        /** Assembles one unit, or takes its object from the cache; null when it does not assemble. */
+        const assembleUnit = async (path: string): Promise<Uint8Array | null> => {
             const isLibrary = library.has(path)
             const unitSource = isLibrary
                 ? (project.startUnits?.[path] ?? project.library?.[path])
@@ -329,8 +401,8 @@ export const nasmWasmAssembler: WasmAssembler = {
             if (cached) {
                 stdout += cached.stdout
                 stderr += cached.stderr
-                assembled.push({ path, object: cached.object.slice() })
-                continue
+                assembled.set(path, cached.object.slice())
+                return assembled.get(path)!
             }
 
             const { module, stdout: readStdout, stderr: readStderr } = await createNasmModule()
@@ -361,10 +433,10 @@ export const nasmWasmAssembler: WasmAssembler = {
             const wroteObject = unitStatus === 0 && module.FS.analyzePath(OBJECT_PATH).exists
             if (!wroteObject) {
                 if (status === 0) status = unitStatus === 0 ? 1 : unitStatus
-                continue
+                return null
             }
             const object = module.FS.readFile(OBJECT_PATH) as Uint8Array
-            assembled.push({ path, object })
+            assembled.set(path, object)
             if (
                 key !== undefined &&
                 !CLOCK_MACRO.test(unitSource as string) &&
@@ -381,15 +453,58 @@ export const nasmWasmAssembler: WasmAssembler = {
                         stderr: unitStderr
                     })
             }
+            return object
         }
 
-        const ok = status === 0 && assembled.length === units.length
+        // The Entry's unit and the library's are always assembled: the link takes the Entry's and
+        // the start units whole, and the library's, which are the same every time, are cached.
+        for (const path of always) await assembleUnit(path)
+        // The Project's other units only once the program needs a name one declares, as `ld`
+        // takes members from the archive they are put in (`planLink`): one nothing needs is never
+        // assembled, so its mistakes cannot fail the program.
+        let members: WasmAssemblyResult['members'] = null
+        const isStart = (path: string) => Object.hasOwn(project.startUnits ?? {}, path)
+        const object = (path: string) => ({ path, object: assembled.get(path)! })
+        const declared = others.map((path) => ({ path, defines: declarations.get(path) ?? [] }))
+        if (status === 0) {
+            const needed = await pullDeclaredUnits(
+                [object(entry!), ...always.filter(isStart).map(object)],
+                declared,
+                always.slice(1).filter((path) => !isStart(path)).map(object),
+                (unit) => assembleUnit(unit.path)
+            )
+            const taken = new Set(needed.map((unit) => unit.path))
+            members = {
+                needed: [...taken],
+                leftOut: others.filter((path) => !taken.has(path))
+            }
+        } else {
+            // Without the Entry's object, or a library unit's, what the program needs is not
+            // known for certain, and nothing links. The units it would need are still assembled,
+            // so that a check reports their mistakes beside the Entry's: those the objects that
+            // did assemble need, and, for an Entry that did not, those its text names in `extern`
+            // and does not define itself. `members` stays unknown.
+            const failedEntry = assembled.has(entry!) ? undefined : project.files[entry!]
+            const text = typeof failedEntry === 'string' ? failedEntry : ''
+            await pullDeclaredUnits(
+                [entry!, ...always.filter(isStart)].filter((path) => assembled.has(path)).map(object),
+                declared,
+                always.slice(1).filter((path) => !isStart(path) && assembled.has(path)).map(object),
+                (unit) => assembleUnit(unit.path),
+                undefined,
+                { defines: declaredNames(text).map(({ name }) => name), needs: externNames(text) }
+            )
+        }
+
+        const units = [...always, ...(members?.needed ?? [])]
+        const ok = status === 0 && units.every((path) => assembled.has(path))
         return {
             status,
             stdout,
             stderr,
-            units: ok ? assembled : [],
-            object: ok ? (assembled[0]?.object ?? null) : null
+            units: ok ? units.map((path) => ({ path, object: assembled.get(path)! })) : [],
+            object: ok ? (assembled.get(entry!) ?? null) : null,
+            members
         }
     }
 }

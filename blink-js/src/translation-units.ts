@@ -15,13 +15,14 @@ export function isX86Source(path: string): boolean {
 }
 
 /**
- * Every File that could be its own translation unit: assembled separately and linked into the
- * program when it defines something the program needs, which is what makes `global` in one File
+ * Every File that could be its own translation unit: linked into the program, and only then
+ * assembled, when it defines something the program needs, which is what makes `global` in one File
  * and `extern` in another resolve to each other. The Entry comes first, since its unit is the one
- * the link always takes, and the rest follow in a stable order so two builds of the same Project
- * lay out identically.
+ * the link always takes, and the rest follow: the Project's `units` in their order, or else every
+ * other source File in a stable order, so two builds of the same Project lay out identically.
  */
 export function x86TranslationUnitCandidates(project: X86Project): string[] {
+    if (project.units) return [project.entry, ...project.units]
     const others = Object.keys(project.files)
         .filter((path) => path !== project.entry)
         .filter((path) => typeof project.files[path] === 'string' && isX86Source(path))

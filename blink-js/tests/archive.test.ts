@@ -61,10 +61,15 @@ function readIndex(index: Uint8Array): { name: string; offset: number }[] {
     }))
 }
 
+/** Each File's object, in order, each assembled as an Entry of its own: a unit beside an Entry is assembled only once it is needed. */
 async function assemble(files: Record<string, string>): Promise<Uint8Array[]> {
-    const result = await nasmWasmAssembler.assemble({ entry: 'entry.asm', files: { 'entry.asm': '', ...files } })
-    expect(result.stderr).toBe('')
-    return result.units.slice(1).map((unit) => unit.object)
+    const objects: Uint8Array[] = []
+    for (const [path, text] of Object.entries(files)) {
+        const result = await nasmWasmAssembler.assemble({ entry: path, files: { [path]: text } })
+        expect(result.stderr).toBe('')
+        objects.push(result.object!)
+    }
+    return objects
 }
 
 describe('the archive writer', () => {

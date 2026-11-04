@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+- A Project's other unit is assembled only once the program needs a name it
+  defines, as `ld` takes a member from a library, so a unit nothing needs is
+  neither assembled nor checked: its mistakes, or a File in another assembler's
+  syntax, no longer fail the Build or `checkProject`, which used to assemble
+  every unit. Which names a unit defines is read from its `global` and `common`
+  declarations before anything assembles it, in its preprocessed text
+  (`nasm -E`) when it uses the preprocessor, so a `global` a macro or an
+  included File writes counts. The scan joins lines a backslash continues, and
+  knows a local label's full name (`global helper.inner`) and what a `struc`
+  defines (`point.x`, `point_size`). As for `ld`, a name NASM keeps out of the
+  object, an `extern` nothing uses, needs nothing; `required name` keeps it and
+  takes the unit defining it. A unit left out has the `not-linked` Hint, "This
+  File is not part of the program: the program uses nothing it defines.", in a
+  check as in a Build, once everything the program needs assembled.
+- The compiler-output translator writes `required name`, not `extern name`,
+  for a `.globl` of a name the unit neither defines nor uses, as a file-scope
+  `__asm__(".globl name")` writes it (`<sim.h>`'s `SIM_LINK`). GNU as keeps
+  such a name as an undefined global, which `ld` takes an archive member for;
+  NASM wrote no symbol for the `extern`, so the unit defining it was left out.
+  GCC writes no such line itself: no output of the corpus changes.
+- When the Entry, or a library unit, does not assemble, nothing links and
+  `getProjectUnits()` is null, but a check still assembles the units the
+  objects that did assemble need and, for a failed Entry, the units its text's
+  `extern` lines name, so their mistakes are reported beside the Entry's, as
+  when every unit was assembled. A unit only another Program would need is not
+  checked then.
+- `X86Project.units` names the Files the link may take besides the Entry, in
+  archive order; absent, every `.asm`, `.s` or `.nasm` File, as before.
+  `X86Emulator.getProjectUnits()` says which of them the last check or Build
+  took (`needed`, assembled) and which it left out (`leftOut`).
+
 ## 8.0.0
 
 For 8.0.0: the wait request, the state block, the history packets and the

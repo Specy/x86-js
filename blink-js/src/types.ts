@@ -105,17 +105,26 @@ export type X86ProjectFile = string | Uint8Array
 /**
  * The Files of a program, by path, and the Entry, the File it is built from.
  *
- * The default NASM assembler assembles the Entry and every `.asm`, `.s` or `.nasm` File that no
- * other File `%include`s, each as a unit of its own, and links them the way a C toolchain links
- * objects and a static library: the Entry's unit as an object, and every other unit as a member
- * of an archive that `ld` takes a member from only for a symbol still undefined, `_start`
- * included. A unit nothing needs is assembled, and its mistakes reported, but it is not part of
- * the program, so a Project can hold Files that would otherwise clash, such as a second `_start`.
- * The blink-hosted assemblers, GNU as and fasm, assemble the Entry alone.
+ * The default NASM assembler takes the Entry and every other unit, the `units` or else every
+ * `.asm`, `.s` or `.nasm` File, that no other File `%include`s, each as a unit of its own, and
+ * links them the way a C toolchain links objects and a static library: the Entry's unit as an
+ * object, and every other unit as a member of an archive that `ld` takes a member from only for a
+ * symbol still undefined, `_start` included. Which names a unit defines is read from its `global`
+ * and `common` declarations before anything assembles it, from its preprocessed text when it uses
+ * the preprocessor, and a unit is assembled only once the program needs one of them: a unit
+ * nothing needs is neither assembled nor checked, and is not part of the program, so a Project can
+ * hold Files that would otherwise clash, such as a second `_start`, or that do not assemble. The
+ * blink-hosted assemblers, GNU as and fasm, assemble the Entry alone.
  */
 export type X86Project = {
     entry: string
     files: Readonly<Record<string, X86ProjectFile>>
+    /**
+     * The Files besides the Entry the link may take, in archive order: text Files of `files`,
+     * none of them the Entry. Absent, every `.asm`, `.s` or `.nasm` File other than the Entry. A
+     * File another unit `%include`s is part of that unit, and no unit of its own.
+     */
+    units?: readonly string[]
     /**
      * Units built alongside the Project's own, such as start code that defines `_start` and calls
      * `main`: each is assembled like a Project File, under its own path, which instructions,

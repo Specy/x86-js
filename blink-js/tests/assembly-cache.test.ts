@@ -45,8 +45,9 @@ it('assembles and links an unchanged Project once, and a changed File again', as
     })
     const first = await build(project('7'))
     expect(first.exitCode).toBe(7)
-    //both Files assembled; neither has a word that reads another File, so neither is scanned
-    expect([first.instances, first.links]).toEqual([2, 1])
+    //the Entry assembled, and not the helper, which nothing needs; neither has a word that reads
+    //another File or uses the preprocessor, so neither is preprocessed
+    expect([first.instances, first.links]).toEqual([1, 1])
     //nothing assembled or linked again, and the same report: the helper is still not linked
     const again = await build(project('7'))
     expect([again.exitCode, again.instances, again.links]).toEqual([7, 0, 0])
