@@ -84,7 +84,12 @@ describe('linking a Project', () => {
             'other.asm': ['global _start', 'section .text', '_start:', ...exit(7)].join('\n')
         } }
         expect(await emulator.checkProject(project)).toEqual([
-            expect.objectContaining({ file: 'other.asm', severity: 'hint', code: 'not-linked' }),
+            expect.objectContaining({
+                file: 'other.asm',
+                severity: 'hint',
+                code: 'not-linked',
+                message: "The program doesn't use this File, so it is left out."
+            }),
         ])
         expect(emulator.getProjectUnits()).toEqual({ needed: [], leftOut: ['other.asm'] })
         const result = await emulator.compileProject(project)

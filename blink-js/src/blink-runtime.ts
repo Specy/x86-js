@@ -2393,7 +2393,7 @@ function hostRandom(length: number): Uint8Array {
 }
 
 /** What says a File the program does not need is no part of it (`WasmAssemblyResult.members`). */
-const NOT_LINKED = 'This File is not part of the program: the program uses nothing it defines.'
+const NOT_LINKED = "The program doesn't use this File, so it is left out."
 
 /**
  * A Hint on each of the Project's other units the program does not need, which was neither

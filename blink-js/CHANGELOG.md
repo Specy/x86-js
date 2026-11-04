@@ -13,9 +13,9 @@
   knows a local label's full name (`global helper.inner`) and what a `struc`
   defines (`point.x`, `point_size`). As for `ld`, a name NASM keeps out of the
   object, an `extern` nothing uses, needs nothing; `required name` keeps it and
-  takes the unit defining it. A unit left out has the `not-linked` Hint, "This
-  File is not part of the program: the program uses nothing it defines.", in a
-  check as in a Build, once everything the program needs assembled.
+  takes the unit defining it. A unit left out has the `not-linked` Hint, "The
+  program doesn't use this File, so it is left out.", in a check as in a Build,
+  once everything the program needs assembled.
 - The compiler-output translator writes `required name`, not `extern name`,
   for a `.globl` of a name the unit neither defines nor uses, as a file-scope
   `__asm__(".globl name")` writes it (`<sim.h>`'s `SIM_LINK`). GNU as keeps
