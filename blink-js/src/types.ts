@@ -451,8 +451,13 @@ export type X86Progress =
     | { phase: 'load' }
 
 export type X86BuildOptions = {
-    /** Told each phase of this build or load as it starts; never after a later one supersedes it. */
-    onProgress?: (progress: X86Progress) => void
+    /**
+     * Told each phase of this build or load as it starts; never after a later one supersedes it.
+     * The Core waits for the promise it returns before it carries on: assembling, linking and
+     * loading each hold the thread for their whole run, so a page that shows the phase returns a
+     * wait for its next paint, and the phase is on screen while it lasts.
+     */
+    onProgress?: (progress: X86Progress) => unknown
 }
 
 export type X86ExecutableOptions = X86BuildOptions & {

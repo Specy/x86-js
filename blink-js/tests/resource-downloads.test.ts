@@ -250,6 +250,53 @@ describe("a build's tools", () => {
         }
     })
 
+    it("wait for what onProgress returns before each phase's work", async () => {
+        await withFailingDownloads(new Set())
+        const { createX86Emulator } = await import('../src/x86-emulator')
+        const nasm = await createX86Emulator()
+        const gnu = await createX86Emulator({ mode: 'GNU_trunk' })
+        const loader = await createX86Emulator()
+        /** Builds with `run`, holding each phase it says until nothing more has happened for a while. */
+        const holding = async (run: (onProgress: (event: X86Progress) => unknown) => Promise<unknown>) => {
+            const said: string[] = []
+            let release = () => {}
+            const done = observe(
+                run((event) => {
+                    said.push(event.phase === 'download' ? event.resource : event.phase)
+                    return new Promise<void>((resolve) => (release = resolve))
+                })
+            )
+            for (let held = 0; ; held = said.length) {
+                await vi.waitFor(() => expect(said.length > held || done.settled).toBe(true))
+                if (done.settled) break
+                const phases = said.length
+                await new Promise((resolve) => setTimeout(resolve, 50))
+                expect(said).toHaveLength(phases)
+                expect(done.settled).toBe(false)
+                release()
+            }
+            if (done.error) throw done.error
+            return said
+        }
+        try {
+            expect(await holding((onProgress) => nasm.compileProject(nasmProject, { onProgress })))
+                .toEqual(['the assembler', 'assemble', 'the linker', 'link'])
+            expect(nasm.getExecutable()).not.toBeNull()
+            //a blink-hosted assembler starts the link as it exits
+            expect(await holding((onProgress) => gnu.compileProject(gnuProject, { onProgress })))
+                .toEqual(['the assembler', 'assemble', 'link'])
+            expect(gnu.getExecutable()).not.toBeNull()
+            const program = nasm.getExecutable()!
+            expect(
+                await holding((onProgress) => loader.loadExecutable(program, { onProgress }))
+            ).toEqual(['load'])
+        } finally {
+            nasm.dispose()
+            gnu.dispose()
+            loader.dispose()
+        }
+    })
+
     it('keep their mode while a build waits on one', async () => {
         const waiting = await withHeldDownloads(new Set(['the assembler']))
         const { createX86Emulator } = await import('../src/x86-emulator')

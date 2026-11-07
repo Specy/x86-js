@@ -65,7 +65,7 @@ function libraryBytes(library: Library): Uint8Array | Promise<Uint8Array> {
 export async function resolveLinuxLibraries(
     needed: string[],
     interpreter?: string,
-    onProgress?: (progress: X86Progress) => void
+    onProgress?: (progress: X86Progress) => unknown
 ) {
     const files = new Map<string, Uint8Array>()
     const missing = new Set<string>()
@@ -86,10 +86,11 @@ export async function resolveLinuxLibraries(
             continue
         }
         let bytes = libraryBytes(library)
-        if (bytes instanceof Promise) {
-            onProgress?.({ phase: 'download', resource: soname })
-            bytes = await bytes
-        }
+        if (bytes instanceof Promise)
+            [, bytes] = await Promise.all([
+                onProgress?.({ phase: 'download', resource: soname }),
+                bytes
+            ])
         files.set(library.path, bytes)
         queue.push(...analyze(bytes).needed)
     }

@@ -260,7 +260,7 @@ export class BlinkRuntime {
     /** What the linker said, kept apart from the assembler's log so `ld`'s own parser reads it. */
     private linkerLogs: string | null = null
     /** The build in progress's `onProgress`, which hears nothing once another has superseded it. */
-    private buildProgress: ((progress: X86Progress) => void) | undefined
+    private buildProgress: ((progress: X86Progress) => unknown) | undefined
 
     private readonly defaultArgc = '/program'
     private readonly defaultArgv = ''
@@ -489,9 +489,8 @@ export class BlinkRuntime {
         const onProgress = options.onProgress
         this.buildProgress =
             onProgress &&
-            ((progress) => {
-                if (replacement === this.programReplacements) onProgress(progress)
-            })
+            ((progress) =>
+                replacement === this.programReplacements ? onProgress(progress) : undefined)
         this.detachProjectFileSystem()
         const sourceProject = copyX86Project(project)
         this.layoutUnits = []
@@ -731,7 +730,7 @@ export class BlinkRuntime {
         if (!this.assembleOnly)
             await this.downloadTool(this.mode.binaries.linker, 'the linker', replacement)
         stageX86Project(this.module.FS, sourceProject)
-        this.buildProgress?.({ phase: 'assemble' })
+        await this.buildProgress?.({ phase: 'assemble' })
         await defer()
         this.throwIfSuperseded(replacement)
         this.runTool('/assembler', this.mode.binaries.assembler!.commands)
@@ -831,7 +830,7 @@ export class BlinkRuntime {
                 ?.link(inputs)
                 .replace(inputs.join(' '), `--start-group ${inputs.join(' ')} --end-group`) +
             (mapped ? ' -Map /program.map' : '')
-        this.beginLinking()
+        await this.beginLinking()
         await defer()
         this.throwIfSuperseded(replacement)
         if (!this.reuseLink(command, linkInputs)) {
@@ -877,8 +876,8 @@ export class BlinkRuntime {
         if (!binary) return
         const bytes = toolBytes(binary.file, resource)
         if (!(bytes instanceof Promise)) return
-        this.buildProgress?.({ phase: 'download', resource })
-        await bytes
+        // the download is under way already, and a failure while the host paints is not lost
+        await Promise.all([this.buildProgress?.({ phase: 'download', resource }), bytes])
         this.throwIfSuperseded(replacement)
     }
 
@@ -928,10 +927,11 @@ export class BlinkRuntime {
      * `ld`'s diagnostics and `ld`'s cannot read the assembler's, so what each of them said has to
      * stay separable even though both reach the caller as one report.
      */
-    private beginLinking(): void {
+    /** Starts the link's log and state, and answers the host's wait for saying so. */
+    private beginLinking(): Promise<unknown> {
         this.linkerLogs = ''
         this.setState(BlinkState.Linking)
-        this.buildProgress?.({ phase: 'link' })
+        return Promise.resolve(this.buildProgress?.({ phase: 'link' }))
     }
 
     private collectAssemblerDiagnostics(): void {
@@ -972,15 +972,18 @@ export class BlinkRuntime {
         const libraries = await resolveLinuxLibraries(
             info.needed,
             info.interpreter,
-            (progress) => {
-                if (replacement === this.programReplacements) options.onProgress?.(progress)
-            }
+            (progress) =>
+                replacement === this.programReplacements ? options.onProgress?.(progress) : undefined
         )
         if (replacement !== this.programReplacements)
             throw new Error(
                 'This load was superseded: another program was loaded or built while its libraries were fetched'
             )
-        options.onProgress?.({ phase: 'load' })
+        await options.onProgress?.({ phase: 'load' })
+        if (replacement !== this.programReplacements)
+            throw new Error(
+                'This load was superseded: another program was loaded or built before it started'
+            )
         this.loadElf(bytes)
         this.systemFiles = libraries.files
         if (options.argv0 !== undefined || options.arguments !== undefined)
@@ -2076,13 +2079,14 @@ export class BlinkRuntime {
             return
         }
 
-        this.beginLinking()
         // Not once a load or build has replaced the program while the link waited to start.
         const replacement = this.programReplacements
-        this.scheduler(() => {
-            if (replacement === this.programReplacements)
-                this.runTool('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '')
-        })
+        void this.beginLinking().then(() =>
+            this.scheduler(() => {
+                if (replacement === this.programReplacements)
+                    this.runTool('/linker', this.mode.binaries.linker?.link(['/program.o']) ?? '')
+            })
+        )
     }
 
     private handleLinkerExit(code: number): void {

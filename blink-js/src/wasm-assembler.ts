@@ -370,11 +370,12 @@ export const nasmWasmAssembler: WasmAssembler = {
         project: X86Project,
         options: X86BuildOptions = {}
     ): Promise<WasmAssemblyResult> {
-        if (!nasmReady) {
-            options.onProgress?.({ phase: 'download', resource: NASM_RESOURCE })
-            await compiledNasmModule()
-        }
-        options.onProgress?.({ phase: 'assemble' })
+        if (!nasmReady)
+            await Promise.all([
+                compiledNasmModule(),
+                options.onProgress?.({ phase: 'download', resource: NASM_RESOURCE })
+            ])
+        await options.onProgress?.({ phase: 'assemble' })
         const candidates = x86TranslationUnitCandidates(project)
         const { included, declarations } = await scanUnits(project, candidates)
         const [entry, ...others] = candidates.filter(

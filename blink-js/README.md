@@ -741,7 +741,10 @@ resource it lacks (a library by its soname, an assembler as `the assembler`, GNU
 ld as `the linker`), then `load` once a load has its libraries, or `assemble`
 and `link` for a build. With NASM the linker's download comes between `assemble`
 and `link`; a blink-hosted assembler's build downloads both before `assemble`.
-It hears nothing once a later load or build has superseded its own.
+It hears nothing once a later load or build has superseded its own. The Core
+waits for a promise `onProgress` returns before it carries on, and assembling,
+linking and loading each hold the thread until they finish, so a page that shows
+the phase returns a wait for its next paint to have it on screen meanwhile.
 
 ```ts
 await emulator.loadExecutable(bytes, {
