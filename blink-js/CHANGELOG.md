@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- The call stack is kept for every instruction, whether or not the undo
+  history records it: with `initialize(0)`, `getCallStack()` used to be
+  empty. Undo puts it back as before. `initialize()` no longer empties it in
+  the middle of a program; a new start does.
+- A signal delivered to a handler has a frame of its own, of kind `'signal'`.
+  It lasts through the handler's `ret` and the restorer, and is gone once rsp
+  is back where the signal found it, at `rt_sigreturn` or a `longjmp` out of
+  the handler. `int3`, `int n` and `into` no longer push a call frame, and
+  their history entries no longer report a `PushCallStack`.
+- `StackFrame` has `kind`, `'call'` or `'signal'`.
+- `getCallDepth()` says how many frames the call stack holds, in constant
+  time, and `getCallStack(max)` lists only the newest `max`, still outermost
+  first.
+- `run()` takes `untilCallDepth`: the run stops before an instruction
+  whenever the call stack is that deep or less, with the stop reason
+  `callDepth`. The test comes before the breakpoints and the limit, and a
+  program that ends stops for its end. This is what Step over and Step out
+  are built on.
+- `step()` answers `handlerEntry: true` when the step began by delivering a
+  signal to its handler, so that the instruction the program counter was on
+  has not run yet.
+- A program runs a little slower with the history off, since its frames are
+  now kept: measured at about 7% for a loop that calls on every fourth
+  instruction, 2 to 5% for a recursive `fib` and for a loop that calls
+  nothing.
+- A fault or `int3` the program has a handler for no longer ends `run()`'s
+  native slice with no stop reason: the run goes on into the handler, and
+  stops at a Breakpoint, the limit or `untilCallDepth` as anywhere else. A run
+  whose first instruction faulted used to come back having run nothing.
+
 - A Project's other unit is assembled only once the program needs a name it
   defines, as `ld` takes a member from a library, so a unit nothing needs is
   neither assembled nor checked: its mistakes, or a File in another assembler's

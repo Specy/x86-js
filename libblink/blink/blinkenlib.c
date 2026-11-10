@@ -82,7 +82,7 @@ int switches_count = 0;
 /*
  * This blink wrapper communicates its own events to the javascript side as
  * SIGTRAP with the codes below. Linux never sends SIGTRAP with a code from
- * 40 to 44 (its si_codes are 1 to 6, SI_KERNEL and the negative SI_*), so
+ * 40 to 46 (its si_codes are 1 to 6, SI_KERNEL and the negative SI_*), so
  * a SIGTRAP with any other code is the signal itself, which ends the
  * program, as Linux's default action does, when no handler takes it.
  */
@@ -93,6 +93,8 @@ int switches_count = 0;
 #define SIGTRAP_CODE_BREAKPOINT 43
 #define SIGTRAP_CODE_RUN_LIMIT 44
 #define SIGTRAP_CODE_WAIT 45
+#define SIGTRAP_CODE_CALL_DEPTH 46
+#define SIGTRAP_CODE_LAST SIGTRAP_CODE_CALL_DEPTH
 
 /*
  * These variables are defined by javascript;
@@ -164,6 +166,14 @@ static u64 pending_run_breakpoints[RUN_BREAKPOINT_MAX];
 static u32 pending_run_breakpoint_count = 0;
 static u64 run_instruction_limit = 0;
 static u64 run_instruction_count = 0;
+/* A run stops before an instruction while call_stack_depth is below this:
+ * the untilCallDepth it was given plus one, or 0, which no depth is below,
+ * when it was given none. */
+static u64 call_depth_bound = 0;
+/* Whether the step, as it began, delivered a signal to a handler, before
+ * running an instruction: then the instruction it ran is the handler's first,
+ * and the one the program counter was on has not run yet. */
+static bool step_handler_entry = false;
 static u32 last_stop_kind = BLINKENLIB_STOP_NONE;
 static u64 last_stop_address = 0;
 static bool skip_current_breakpoint = false;
@@ -236,7 +246,7 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
   /* Default signal actions stop after this instruction as well as on a
    * fault's longjmp. In particular, HandleSigpipe must not run the next
    * instruction and replace this stop with its later exit. */
-  if (sig != SIGTRAP || code < SIGTRAP_CODE_PREEMPT || code > SIGTRAP_CODE_WAIT) {
+  if (sig != SIGTRAP || code < SIGTRAP_CODE_PREEMPT || code > SIGTRAP_CODE_LAST) {
     m->system->exited = true;
     m->system->exitcode = 128 + sig;
     // its release finds the signal: the sound drains no further
@@ -329,11 +339,12 @@ static void ClearRunStop(void) {
   SetRunStop(BLINKENLIB_STOP_NONE, 0);
 }
 
+/* `call`, direct or through a register or memory, for the history's control
+ * flow (the call stack's frames are pushed by OpCall() itself). `int3`,
+ * `int n` and `into` push no return address and are not calls: a handler
+ * they enter has a frame of its own (see DeliverSignal()). */
 static bool IsCall(void) {
   switch (Mopcode(m->xedd->op.rde)) {
-    case 0x0CC:
-    case 0x0CD:
-    case 0x0CE:
     case 0x0E8:
       return true;
     case 0x0FF:
@@ -522,9 +533,23 @@ void runLoop() {
           timer_check_countdown = TIMER_CHECK_INSTRUCTIONS;
           GuestTimerCheck(m);
         }
-        if (atomic_load_explicit(&m->attention, memory_order_acquire))
+        if (atomic_load_explicit(&m->attention, memory_order_acquire)) {
+          // a signal delivered to a handler is the only thing here that
+          // pushes a frame
+          u32 depth = call_stack_depth;
           CheckForSignals(m);
+          if (call_stack_depth != depth) step_handler_entry = true;
+        }
         if (s->exited) { m->canhalt = false; return; }
+        // untilCallDepth, before the limit and the breakpoints, so that a run
+        // that ends on its budget or at a breakpoint just as the routine has
+        // returned reports the depth reached. Tested when the run begins and
+        // after every instruction, never inside one that a wait resumes.
+        if (call_stack_depth < call_depth_bound) {
+          PauseForRunControl(BLINKENLIB_STOP_CALL_DEPTH,
+                             SIGTRAP_CODE_CALL_DEPTH, GetPc(m));
+          return;
+        }
       }
       u64 pc = GetPc(m);
       if (run_instruction_limit &&
@@ -556,6 +581,12 @@ void runLoop() {
       u64 distance = current_sp > memory_sp_before ? current_sp - memory_sp_before : memory_sp_before - current_sp;
       if (distance > 4096 || current_sp > memory_stack_top) memory_stack_top = current_sp;
       FinishRecordedStep(s->exited);
+      // The call stack, whether or not the history recorded the instruction
+      // (whose entry keeps the frames as they were before it): a `call`
+      // pushed its frame as it ran (see OpCall()), and a signal delivered
+      // its handler's (see DeliverSignal()). Testing for a call here, on
+      // every instruction, made the loop a third slower.
+      if (current_sp >= call_stack_until) CallStackUnwind(current_sp);
       FinishExecution();
       // Host callbacks return EIO through the syscall stack. Stop only after its cleanup and
       // history packet finish, before another guest instruction can observe a partial effect.
@@ -633,6 +664,13 @@ void runLoop() {
     } else if (interrupt == kMachineFakeTTYtrap) {
       update_clstruct(m);
       TerminateSignal(m, SIGTRAP, SIGTRAP_CODE_FAKE_TTY);
+    } else if (native_slice && !single_stepping && !s->exited) {
+      // A fault or int3 the program has a handler for: the handler's first
+      // instruction is next, and the slice goes on to it, Breakpoints, the
+      // limit and the call depth tested as for any other. Ending the slice
+      // here, with no stop, read as a slice that had spent its budget, and
+      // as the end of the run when the fault was its first instruction.
+      continue;
     }
   }
   break;
@@ -687,6 +725,8 @@ void TearDown(void) {
   GuestTimerReset();
   active_identity = 0;
   DebugHistoryClear();
+  // the next program starts with no frames, and so does no program at all
+  CallStackClear();
   // TODO: make sure free is ok when not allocated
   DisFree(dis);
   // what the last program left open is closed, as its end would have,
@@ -709,6 +749,8 @@ void blinkenlib_clear_execution(void) {
   ClearLastStepInfo();
   run_instruction_count = 0;
   run_instruction_limit = 0;
+  call_depth_bound = 0;
+  step_handler_entry = false;
   native_slice = false;
 }
 
@@ -732,6 +774,8 @@ void stringToArgsArray(char *argsString, char **argsArray, int maxArgs) {
  */
 void setupProgram(bool withdebugger) {
   debugger_enabled = withdebugger;
+  // a tool Blink runs for a build has nobody to show its frames to
+  call_stack_calls = withdebugger;
   native_slice = false;
 
   // get **argc
@@ -778,6 +822,7 @@ void blinkenlib_run_fast() {
   setupProgram(false);
   single_stepping = false;
   blinkenlib_set_run_instruction_limit(0);
+  blinkenlib_set_run_call_depth(-1);
   blinkenlib_clear_run_breakpoints();
   runLoop();
 }
@@ -806,6 +851,7 @@ void blinkenlib_start() {
 
 EMSCRIPTEN_KEEPALIVE
 void blinkenlib_stepi() {
+  step_handler_entry = false;
   if (s->exited) {
     if (exit_callback) exit_callback(s->exitcode);
     return;
@@ -814,6 +860,7 @@ void blinkenlib_stepi() {
   single_stepping = true;
   native_slice = false;
   blinkenlib_set_run_instruction_limit(0);
+  blinkenlib_set_run_call_depth(-1);
   runLoop();
 }
 
@@ -863,9 +910,11 @@ void blinkenlib_faketty_resume() {
   }
   if (native_slice) {
     // Feeding input completes only the blocked instruction. The caller owns
-    // resuming the following batch, including checking its first breakpoint.
+    // resuming the following batch, including checking its first breakpoint
+    // and the call depth it runs until.
     single_stepping = true;
     blinkenlib_set_run_instruction_limit(0);
+    blinkenlib_set_run_call_depth(-1);
   }
   runLoop();
 }
@@ -1142,6 +1191,18 @@ void blinkenlib_set_run_instruction_limit(u64 limit) {
   run_instruction_count = 0;
   ClearRunStop();
 }
+
+/* The call depth a run stops at, before executing, whenever the call stack is
+ * that deep or less; a negative one, none. A double, so that JavaScript passes
+ * a plain number: any depth from 2^32 - 1 up stops at once. */
+void blinkenlib_set_run_call_depth(double depth) {
+  call_depth_bound = !(depth >= 0) ? 0
+                     : depth >= 4294967295.0 ? UINT64_MAX
+                                             : (u64)depth + 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+bool blinkenlib_step_handler_entry(void) { return step_handler_entry; }
 
 void blinkenlib_clear_run_breakpoints() {
   pending_run_breakpoint_count = 0;

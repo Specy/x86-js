@@ -63,7 +63,10 @@ import {
  */
 const NATIVE_SLICE = 200_000
 
-/** What {@link X86Emulator.run} does with the breakpoint the program counter is on. */
+/**
+ * What {@link X86Emulator.run} does with the breakpoint the program counter is on, and the call
+ * depth it runs until.
+ */
 export type X86RunOptions = {
     /**
      * `true` (the default) runs the instruction the program counter is on even
@@ -71,6 +74,15 @@ export type X86RunOptions = {
      * needs; `false` stops before it, having run nothing.
      */
     skipBreakpointAtPc?: boolean
+    /**
+     * Stops the run before an instruction executes whenever {@link X86Emulator.getCallDepth} is
+     * this or less, with the stop reason `callDepth`: a Step over runs a routine with the depth
+     * it was called from, a Step out with one less. The test is made as the run begins and after
+     * every instruction, before the breakpoints and the limit, so a run that returns from the
+     * routine on its last instruction, or onto a breakpoint, stops for the depth. A program that
+     * ends stops for its end. A non-negative integer; absent, the run goes on whatever the depth.
+     */
+    untilCallDepth?: number
 }
 
 export type X86EmulatorOptions = Omit<BlinkRuntimeOptions, 'callbacks' | 'mode'> & {
@@ -602,8 +614,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     /**
      * Turns undo off and back on, so that what runs in between can never be undone: start-up code
      * run on the program's behalf before it is handed over, for instance. What runs while undo is
-     * off is still recorded, which keeps the call stack - a frame entered then still shows in
-     * `getCallStack()` - but until undo is back on `canUndo()` answers false, `getUndoDepth()` 0
+     * off is still recorded, and a frame entered then still shows in `getCallStack()`, as it does
+     * whatever the history keeps, but until undo is back on `canUndo()` answers false, `getUndoDepth()` 0
      * and `getUndoHistory()` nothing, and from then on they cover only what ran since. Nothing
      * recorded before that point can be undone either, since undo goes newest first, and a Poke
      * made while undo is off applies but is never undone. Entries recorded while it was off still
@@ -706,7 +718,14 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         return this.pokeOpen
     }
 
-    async step(): Promise<{ terminated: boolean }> {
+    /**
+     * Runs one instruction. `handlerEntry: true`, there only then, says the step began by
+     * delivering a signal to its handler, an alarm or a signal typed at the terminal, say: the
+     * instruction it ran is the handler's first, and the one the program counter was on has not
+     * run yet. A signal an instruction raises itself, as `int3` or a fault does, is delivered
+     * inside it, and does not count.
+     */
+    async step(): Promise<{ terminated: boolean; handlerEntry?: true }> {
         this.assertNoOpenPoke('step')
         const wasExecuting = this.executing
         this.executing = true
@@ -717,7 +736,8 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         } finally {
             this.executing = wasExecuting
         }
-        return { terminated: this.hasTerminated() }
+        const terminated = this.hasTerminated()
+        return this.runtime.stepEnteredHandler() ? { terminated, handlerEntry: true } : { terminated }
     }
 
     getStatus(): EmulatorStatus {
@@ -786,8 +806,39 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         }))
     }
 
-    getCallStack(): StackFrame[] {
-        return this.history.callStack()
+    /**
+     * The call stack, outermost frame first: one frame for each `call` whose return address is
+     * still on the stack, and one for each signal delivered to a handler that has not returned
+     * through `rt_sigreturn` (see {@link StackFrame}). It is kept for every instruction, whether
+     * or not the undo history records, and Undo puts it back as it was. With `max`, only the
+     * newest `max` frames, still outermost first, each with the colour it has in the whole stack.
+     */
+    getCallStack(max?: number): StackFrame[] {
+        if (!this.hasStartedProgram()) return []
+        if (max === undefined) return this.history.callStack()
+        return this.history.callStack(Number.isNaN(max) ? 0 : Math.max(0, Math.floor(max)))
+    }
+
+    /** How many frames {@link getCallStack} returns, in constant time. */
+    getCallDepth(): number {
+        return this.hasStartedProgram() ? this.history.callDepth() : 0
+    }
+
+    /**
+     * Whether a program has started and not been replaced: a build or a load leaves the last
+     * machine in place, with its frames, until the new program starts.
+     */
+    private hasStartedProgram(): boolean {
+        switch (this.runtime.state) {
+            case BlinkState.ProgramRunning:
+            case BlinkState.ProgramPaused:
+            case BlinkState.ProgramReadlinePause:
+            case BlinkState.ProgramWaitPause:
+            case BlinkState.ProgramStopped:
+                return true
+            default:
+                return false
+        }
     }
 
     /**
@@ -905,6 +956,7 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
     ): Promise<EmulatorStatus> {
         this.assertNoOpenPoke('run')
         this.validateRunLimit(limit)
+        this.validateCallDepth(options.untilCallDepth)
         const breakpointAddresses = this.resolveBreakpointAddresses(breakpoints)
         const wasExecuting = this.executing
         this.executing = true
@@ -926,6 +978,13 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         if (limit === undefined) return
         if (!Number.isSafeInteger(limit) || limit < 0) {
             throw new Error(`Invalid run instruction limit: ${limit}`)
+        }
+    }
+
+    private validateCallDepth(depth: number | undefined): void {
+        if (depth === undefined) return
+        if (!Number.isSafeInteger(depth) || depth < 0) {
+            throw new Error(`Invalid call depth to run until: ${depth}`)
         }
     }
 
@@ -995,7 +1054,13 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
         let skipAtPc = options.skipBreakpointAtPc ?? true
         while (this.runtime.state === BlinkState.ProgramRunning) {
             const budget = hasLimit ? Math.min(NATIVE_SLICE, limit - executed) : NATIVE_SLICE
-            executed += this.runtime.runSlice(budget, breakpoints, skipAtPc)
+            // every slice is given the depth: the wasm holds no run's options between calls
+            executed += this.runtime.runSlice(
+                budget,
+                breakpoints,
+                skipAtPc,
+                options.untilCallDepth
+            )
             skipAtPc = false
             if (
                 (this.runtime.state as BlinkState) !== BlinkState.ProgramPaused ||
@@ -1010,10 +1075,13 @@ export class X86Emulator extends BaseEmulator<BlinkRuntime, X86RegisterName, X86
             if (generation !== this.executionGeneration) break
             this.runtime.resumeAfterStateMutation()
         }
-        // The wasm counts a breakpoint stop within its own slice, so a run longer than one
-        // slice is given the whole run's count, as a limit stop already is.
+        // The wasm counts a breakpoint or call depth stop within its own slice, so a run longer
+        // than one slice is given the whole run's count, as a limit stop already is.
         const stop = this.runtime.stopReason
-        if (stop?.kind === 'breakpoint' && stop.executedInstructions !== undefined) {
+        if (
+            (stop?.kind === 'breakpoint' || stop?.kind === 'callDepth') &&
+            stop.executedInstructions !== undefined
+        ) {
             this.runtime.stopReason = { ...stop, executedInstructions: BigInt(executed) }
         }
         return this.getStatus()

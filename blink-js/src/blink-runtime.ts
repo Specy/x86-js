@@ -152,7 +152,8 @@ const SIGTRAP_CODES = {
     BLINK_FAKE_TTY: 42,
     BLINK_BREAKPOINT: 43,
     BLINK_RUN_LIMIT: 44,
-    BLINK_WAIT: 45
+    BLINK_WAIT: 45,
+    BLINK_CALL_DEPTH: 46
 } as const
 
 const BLINK_EVENT_CODES: ReadonlySet<number> = new Set(Object.values(SIGTRAP_CODES))
@@ -201,6 +202,8 @@ export type BlinkRuntimeOptions = {
 export type BlinkRunOptions = {
     limit?: number
     breakpointAddresses?: bigint[]
+    /** Stop before an instruction whenever the call stack is this deep or less. */
+    untilCallDepth?: number
 }
 
 type StateWaiter = {
@@ -1074,6 +1077,20 @@ export class BlinkRuntime {
         this.callNative(() => this.module._blinkenlib_stepi())
     }
 
+    /**
+     * Whether the last `step()` delivered a signal to a handler before it ran an instruction: the
+     * instruction it ran was the handler's first, and the one the program counter was on has not
+     * run yet.
+     */
+    stepEnteredHandler(): boolean {
+        return Boolean(this.module._blinkenlib_step_handler_entry!())
+    }
+
+    /** How many frames the call stack holds; 0 when no program has started. */
+    getCallDepth(): number {
+        return this.module._blinkenlib_call_depth!()
+    }
+
     continue(): void {
         if (this.state === BlinkState.ProgramPaused) this.setState(BlinkState.ProgramRunning)
         if (this.state !== BlinkState.ProgramRunning) {
@@ -1109,9 +1126,17 @@ export class BlinkRuntime {
         return this.state
     }
 
-    /** Synchronous bounded execution; input and exit callbacks may stop it early. */
-    runSlice(budget: number, breakpoints: bigint[], skipAtPc: boolean): number {
-        this.configureRunControls({ breakpointAddresses: breakpoints })
+    /**
+     * Synchronous bounded execution; input and exit callbacks may stop it early, and so does the
+     * call stack reaching `untilCallDepth`.
+     */
+    runSlice(
+        budget: number,
+        breakpoints: bigint[],
+        skipAtPc: boolean,
+        untilCallDepth?: number
+    ): number {
+        this.configureRunControls({ breakpointAddresses: breakpoints, untilCallDepth })
         this.resumeAfterStateMutation()
         this.callNative(() => this.module._blinkenlib_run_slice!(budget, skipAtPc))
         return Number(this.module.blinkenlibGetRunStop().executedInstructions)
@@ -1865,7 +1890,8 @@ export class BlinkRuntime {
         const limit = options.limit ?? 0
         this.module.blinkenlibSetRunControls(
             BigInt(limit),
-            (options.breakpointAddresses ?? []).map((address) => address.toString())
+            (options.breakpointAddresses ?? []).map((address) => address.toString()),
+            options.untilCallDepth ?? -1
         )
     }
 
@@ -2015,17 +2041,25 @@ export class BlinkRuntime {
             )
         }
 
-        if (code === SIGTRAP_CODES.BLINK_BREAKPOINT || code === SIGTRAP_CODES.BLINK_RUN_LIMIT) {
+        if (
+            code === SIGTRAP_CODES.BLINK_BREAKPOINT ||
+            code === SIGTRAP_CODES.BLINK_RUN_LIMIT ||
+            code === SIGTRAP_CODES.BLINK_CALL_DEPTH
+        ) {
             const stop = this.module.blinkenlibGetRunStop()
             const location = this.getSourceLocationForAddress(stop.address)
+            const kind =
+                stop.kind === 'limit' || stop.kind === 'callDepth' ? stop.kind : 'breakpoint'
             this.stopReason = {
                 loadFail: false,
                 exitCode: 0,
-                kind: stop.kind === 'limit' ? 'limit' : 'breakpoint',
+                kind,
                 details:
-                    stop.kind === 'limit'
+                    kind === 'limit'
                         ? `execution paused after ${stop.executedInstructions.toString()} instructions`
-                        : `execution paused at breakpoint 0x${stop.address.toString(16)}`,
+                        : kind === 'callDepth'
+                          ? `execution paused at call depth ${this.getCallDepth()}`
+                          : `execution paused at breakpoint 0x${stop.address.toString(16)}`,
                 address: stop.address,
                 lineNumber: location?.line,
                 file: location?.path,

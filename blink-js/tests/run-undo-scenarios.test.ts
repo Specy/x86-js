@@ -73,7 +73,7 @@ type Expected = {
     registers?: Partial<Record<X86RegisterName, bigint>>
     /** Instructions a history would hold: all executed, less those undone. */
     recorded: number
-    /** The frames a recording history tracks; there are none without one. */
+    /** The frames of the call stack, which is kept whether or not the history records. */
     frames: string[]
 }
 
@@ -90,7 +90,7 @@ function expectAt(emulator: X86Emulator, undoSize: number, expected: Expected): 
     const recorded = Math.min(expected.recorded, undoSize)
     expect(emulator.getUndoHistory(100)).toHaveLength(recorded)
     expect(emulator.canUndo()).toBe(recorded > 0)
-    expect(emulator.getCallStack().map((frame) => frame.name)).toEqual(undoSize ? expected.frames : [])
+    expect(emulator.getCallStack().map((frame) => frame.name)).toEqual(expected.frames)
 }
 
 type Drive = { emulator: X86Emulator; undoSize: number }
@@ -165,7 +165,7 @@ const SCENARIOS: Array<[string, (drive: Drive) => Promise<void>]> = [
                 line: drive.undoSize ? RET : DEC,
                 registers: { rbx: 1n },
                 recorded: 4,
-                frames: ['bump'],
+                frames: drive.undoSize ? ['bump'] : [],
             })
             await runToExit(drive)
         },

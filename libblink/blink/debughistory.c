@@ -45,10 +45,15 @@
 extern struct Machine *m;
 extern u64 memory_stack_top;
 
+/* A frame of the call stack: a list shared by the entries that started from
+ * it, the newest frame first. `sp` is rsp on entry, which points at the
+ * return address (the restorer's, for a signal), and the frame is gone once
+ * rsp is at or above `until`: above its return address for a call, back where
+ * the signal found it for a signal. */
 struct Frame {
   struct Frame *previous;
-  u32 references, depth;
-  u64 target, destination, sp;
+  u32 references, depth, kind;
+  u64 target, destination, sp, until;
 };
 /* The CPU state a step changes, as Blink keeps it: the register file in
  * encoding order, RIP, the program counter and Blink's flags word with its
@@ -127,12 +132,80 @@ static struct Frame *Retain(struct Frame *f) {
   if (f) ++f->references;
   return f;
 }
+/* Frames released keep their memory for the next calls, up to a bound: a
+ * program calls and returns all the time, and a malloc() and a free() each
+ * cost more than the rest of keeping its frame. */
+#define SPARE_FRAMES 1024
+static struct Frame *spare_frames;
+static u32 spare_count;
 static void Release(struct Frame *f) {
   while (f && !--f->references) {
     struct Frame *previous = f->previous;
-    free(f);
+    if (spare_count < SPARE_FRAMES) {
+      f->previous = spare_frames;
+      spare_frames = f;
+      ++spare_count;
+    } else {
+      free(f);
+    }
     f = previous;
   }
+}
+/* The call stack the program is at, and what the run loop reads of it. */
+u32 call_stack_depth;
+u64 call_stack_until = UINT64_MAX;
+bool call_stack_calls;
+/* Makes `f`, whose reference the caller hands over, the call stack. */
+static void SetCallStack(struct Frame *f) {
+  Release(stack);
+  stack = f;
+  call_stack_depth = f ? f->depth : 0;
+  call_stack_until = f ? f->until : UINT64_MAX;
+}
+void CallStackClear(void) { SetCallStack(0); }
+static void PushFrame(u32 kind, u64 target, u64 destination, u64 sp, u64 until) {
+  struct Frame *f = spare_frames;
+  if (f) {
+    spare_frames = f->previous;
+    --spare_count;
+  } else if (!(f = malloc(sizeof(*f)))) {
+    abort();
+  }
+  f->previous = stack; /* the new frame takes over the list's reference */
+  f->references = 1;
+  f->depth = stack ? stack->depth + 1 : 1;
+  f->kind = kind;
+  f->target = target;
+  f->destination = destination;
+  f->sp = sp;
+  f->until = until;
+  stack = f;
+  call_stack_depth = f->depth;
+  call_stack_until = until;
+}
+void CallStackCall(u64 target, u64 destination, u64 sp) {
+  PushFrame(CALL_STACK_CALL, target, destination, sp, sp + 1);
+}
+void CallStackSignal(u64 handler, u64 resume, u64 sp, u64 interrupted_sp) {
+  PushFrame(CALL_STACK_SIGNAL, handler, resume, sp, interrupted_sp);
+}
+void CallStackRedirectSignal(u64 resume) {
+  /* Only the delivery that just pushed it holds the frame, so it can change
+   * in place: no entry started from it yet. */
+  if (stack && stack->kind == CALL_STACK_SIGNAL && stack->references == 1)
+    stack->destination = resume;
+}
+/* A frame lasts while its return address is on the stack. A `ret` takes it
+ * off, and so does anything else that moves rsp above it, such as C++
+ * exception unwinding or longjmp landing in an outer function, which leave
+ * many frames at once without a `ret` each. A `ret` that returns through an
+ * address no `call` pushed leaves the frames it is below. A signal's frame
+ * lasts through the handler's `ret` and the restorer, until rt_sigreturn (or
+ * a longjmp out of the handler) puts rsp back where the signal found it. */
+void CallStackUnwind(u64 sp) {
+  struct Frame *f = stack;
+  while (f && f->until <= sp) f = f->previous;
+  SetCallStack(Retain(f));
 }
 /* Where Blink's register file, in encoding order, keeps each register by its
  * blinkenlib id, RAX to R15. */
@@ -250,11 +323,24 @@ static void ForgetStep(void) {
   split_count = split_used = 0;
   split_truncated = false;
 }
+/* The call stack as the step or Poke being recorded began, which its entry
+ * keeps: a signal the instruction raises itself, as int3 or a fault does,
+ * pushes the handler's frame before the entry is made. */
+static struct Frame *stack_before_step;
+static void HoldStackBefore(void) {
+  Release(stack_before_step);
+  stack_before_step = Retain(stack);
+}
+static void DropStackBefore(void) {
+  Release(stack_before_step);
+  stack_before_step = 0;
+}
 void DebugHistoryCancel(void) {
   pending = poke = false;
   pending_irreversible = false;
   poke_count = 0;
   ForgetStep();
+  DropStackBefore();
 }
 /* B5 can replace this boundary with a journal for signal process state.
  * Until then the signal frame, mask and pending queue cannot be undone. */
@@ -425,8 +511,7 @@ void DebugHistoryClear(void) {
   packet_allocated = 0;
   held = 0;
   hollow = 0;
-  Release(stack);
-  stack = 0;
+  /* the call stack is the program's, not the history's: it stays */
   count = start = 0;
   DebugHistoryCancel();
 }
@@ -546,6 +631,7 @@ void DebugHistoryBegin(u32 flow, u32 size) {
   before.stack_top = memory_stack_top;
   before.flow = flow;
   before.size = size;
+  HoldStackBefore();
   pending_irreversible = false;
   pending = true;
   ForgetStep();
@@ -639,7 +725,8 @@ static struct Entry *NewEntry(u32 tail_bytes) {
   while (hollow < count && held + REGISTERS_CHARGE + room > budget) HollowOldest();
   if (room != e->allocated) Reallocate(e, room);
   held += REGISTERS_CHARGE + room;
-  e->stack_before = Retain(stack);
+  e->stack_before = stack_before_step; /* the entry takes its reference over */
+  stack_before_step = 0;
   e->stack_top_before = before.stack_top;
   ++count;
   return e;
@@ -666,7 +753,10 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
     if (w->truncated || w->oldsize != w->size) reversible = false;
   }
   tail_bytes += journal_bytes;
-  if (!capacity) return;
+  if (!capacity) {
+    DropStackBefore();
+    return;
+  }
   struct Entry *e = NewEntry(tail_bytes);
   ++serial;
   TakeRegisters(&e->after);
@@ -687,7 +777,7 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
   e->hollow = false;
   e->flow = before.flow;
   e->size = before.size;
-  e->depth = stack ? stack->depth : 0;
+  e->depth = e->stack_before ? e->stack_before->depth : 0;
   e->write_count = write_count;
   e->fpu_changed = fpu_changed;
   e->journal_count = is_poke ? 0 : journal_count;
@@ -720,29 +810,8 @@ static void Finish(bool is_poke, struct MachineWriteRecord *writes, u32 write_co
   if (journal_bytes) memcpy(p, journal, journal_bytes);
   e->tail_bytes = tail_bytes;
   e->reversible = reversible;
-  u64 sp = RegisterValue(&e->after, BLINKENLIB_REG_RSP);
-  if (!is_poke && before.flow == BLINKENLIB_CONTROL_FLOW_CALL) {
-    struct Frame *f = calloc(1, sizeof(*f));
-    if (!f) abort();
-    f->previous = stack; /* transfer current-stack ownership to the new frame */
-    f->references = 1;
-    f->depth = stack ? stack->depth + 1 : 1;
-    f->target = e->after.pc;
-    f->destination = before.pc + before.size;
-    f->sp = sp;
-    stack = f;
-  } else if (!is_poke) {
-    /* A frame lasts while its return address is on the stack. A `ret` takes
-     * it off, and so does anything else that moves rsp above it, such as C++
-     * exception unwinding or longjmp landing in an outer function, which
-     * leave many frames at once without a `ret` each. A `ret` that returns
-     * through an address no `call` pushed leaves the frames it is below. */
-    while (stack && stack->sp < sp) {
-      struct Frame *previous = Retain(stack->previous);
-      Release(stack);
-      stack = previous;
-    }
-  }
+  /* The run loop changes the call stack after this, for every instruction,
+   * recorded or not; the entry keeps it as the instruction began. */
 }
 void DebugHistoryFinish(bool exited) {
   if (!pending || poke || !m) return;
@@ -826,8 +895,7 @@ int blinkenlib_history_undo(void) {
     m->system->exitcode = 0;
   }
   memory_stack_top = e->stack_top_before;
-  Release(stack);
-  stack = Retain(e->stack_before);
+  SetCallStack(Retain(e->stack_before));
   blinkenlib_restore_instruction_count(e->instructions_before);
   held -= REGISTERS_CHARGE + e->allocated; /* not hollow: it was reversible */
   Empty(e);
@@ -835,17 +903,30 @@ int blinkenlib_history_undo(void) {
   DebugHistoryCancel();
   return 1;
 }
+/* How many frames the call stack holds. */
 EMSCRIPTEN_KEEPALIVE
-u32 blinkenlib_history_stack_depth(void) { return stack ? stack->depth : 0; }
+u32 blinkenlib_call_depth(void) { return call_stack_depth; }
+/* The newest `max` frames, or as many as there are, newest first, in a
+ * buffer the next call reuses: four u64 each, where the call went, where it
+ * returns, rsp on entry and the kind (CALL_STACK_CALL or CALL_STACK_SIGNAL).
+ * One walk down the list, however deep it is. */
 EMSCRIPTEN_KEEPALIVE
-const u64 *blinkenlib_history_frame(u32 index) {
-  static u64 values[3];
-  struct Frame *f = stack;
-  if (!f || index >= f->depth) return 0;
-  while (f->depth - 1 > index) f = f->previous;
-  values[0] = f->target;
-  values[1] = f->destination;
-  values[2] = f->sp;
+const u64 *blinkenlib_call_stack(u32 max) {
+  static u64 *values;
+  static u32 allocated;
+  u32 n = max < call_stack_depth ? max : call_stack_depth, i = 0;
+  if (n > allocated) {
+    u64 *grown = realloc(values, (u64)n * 4 * sizeof(*values));
+    if (!grown) abort();
+    values = grown;
+    allocated = n;
+  }
+  for (struct Frame *f = stack; f && i < n; f = f->previous, ++i) {
+    values[i * 4] = f->target;
+    values[i * 4 + 1] = f->destination;
+    values[i * 4 + 2] = f->sp;
+    values[i * 4 + 3] = f->kind;
+  }
   return values;
 }
 EMSCRIPTEN_KEEPALIVE
@@ -857,6 +938,7 @@ bool blinkenlib_history_begin_poke(void) {
   if (!before.moved) TakeRegisters(&before.registers);
   before.stack_top = memory_stack_top;
   before.flow = before.size = 0;
+  HoldStackBefore();
   poke = true;
   poke_count = 0;
   return true;
@@ -915,6 +997,7 @@ int blinkenlib_history_end_poke(void) {
   bool changed = write_count || ChangedRegisters(&before.registers, &now) ||
                  !SameFpu(before.fpu, after_fpu);
   if (changed) Finish(true, writes, write_count, old_bytes, false, false);
+  DropStackBefore(); /* an entry made took it over */
   free(writes);
   free(old_bytes);
   poke_count = 0;

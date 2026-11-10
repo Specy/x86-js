@@ -28,6 +28,9 @@
 #include "blink/rde.h"
 #include "blink/tsan.h"
 #include "blink/x86.h"
+#ifdef __EMSCRIPTEN__
+#include "blink/debughistory.h"
+#endif
 
 static const u8 kStackOsz[2][3] = {{4, 4, 8}, {2, 2, 2}};
 static const u8 kCallOsz[2][3] = {{4, 4, 8}, {2, 2, 8}};
@@ -178,8 +181,16 @@ void OpPopZvq(P) {
 }
 
 static void OpCall(P, u64 func) {
+#ifdef __EMSCRIPTEN__
+  u64 back = GetPc(m); /* the ip is past the call already */
+#endif
   PushN(A, m->ip, Mode(rde), kCallOsz[Osz(rde)][Mode(rde)]);
   m->ip = func;
+#ifdef __EMSCRIPTEN__
+  // the debugger's call stack (see debughistory.c), once the return address
+  // is on the stack: a push that faults leaves no frame
+  if (call_stack_calls) CallStackCall(GetPc(m), back, Read64(m->sp));
+#endif
 }
 
 void OpCallJvds(P) {

@@ -48,6 +48,21 @@ await emulator.runUntilBlocked()
 
 `run(limit, breakpoints)` accepts an optional maximum instruction count and an array of 0-based source-line breakpoint indices. Breakpoints are resolved to native instruction addresses using the DWARF line information emitted by the assembler.
 
+`run()` takes options as its third argument:
+
+- `skipBreakpointAtPc`, `true` by default, runs the instruction the program counter is on even when a breakpoint names it, which continuing from a breakpoint needs. `false` stops before it, having run nothing.
+- `untilCallDepth: n` stops the run before an instruction executes whenever `getCallDepth()` is `n` or less, with `stopReason.kind` `'callDepth'`. A Step over gives it the depth the call was made at, and a Step out one less. The test is made when the run begins and after every instruction, before the breakpoints and the limit. So a run whose last instruction, within its limit, returns from the routine stops for the depth, and so does one that returns onto a breakpoint. A program that ends during the run stops for its end. `executedInstructions` counts the whole run, as for a breakpoint or a limit. Without the option, the run goes on whatever the depth.
+
+```ts
+// Step over a call: run the routine it entered back to the depth it was called from
+const depth = emulator.getCallDepth()
+await emulator.step()
+if (emulator.getCallDepth() > depth)
+    await emulator.run(undefined, breakpoints, { untilCallDepth: depth, skipBreakpointAtPc: false })
+```
+
+`step()` returns `{ terminated }`, and `handlerEntry: true` beside it when the step began by delivering a signal to its handler, such as an alarm or a signal typed at the terminal. The instruction that step ran is the handler's first, and the one the program counter was on has not run yet. A signal an instruction raises itself, as `int3` or a fault does, is delivered inside that instruction and does not count.
+
 ### Check code without running
 
 ```ts
@@ -141,7 +156,7 @@ for (const step of emulator.getUndoHistory(10)) {
 }
 ```
 
-The call stack is tracked while history recording is enabled. Calls push frames and returns pop them; undo restores the previous call-stack snapshot along with registers, flags, PC, SP, and captured memory bytes.
+The call stack is kept for every instruction a program runs, whether or not the history records it, so it is there with `initialize(0)` too. Undo puts it back as it was, along with registers, flags, PC, SP, and captured memory bytes.
 
 ```ts
 emulator.initialize(64)
@@ -151,7 +166,15 @@ const frames = emulator.getCallStack()
 console.log(frames.map((frame) => frame.name))
 ```
 
-A frame names the symbol its call went into (`name`, starting at `address`), where the call went (`target`, which differs from `address` when no symbol starts there, such as a PLT stub) and where it returns (`destination`).
+`getCallStack()` lists the frames outermost first. `getCallStack(max)` lists only the newest `max`, still outermost first, each with the colour it has in the whole stack. `getCallDepth()` says how many frames there are, without listing them. Before the program starts there are none.
+
+A frame names the symbol its call went into (`name`, starting at `address`), where the call went (`target`, which differs from `address` when no symbol starts there, such as a PLT stub), where it returns (`destination`) and `sp`, rsp on entry, which points at the return address. Its `kind` is `'call'` or `'signal'`:
+
+- A `call` pushes a frame of kind `'call'`. The frame is gone once rsp is above the return address it pushed. A `ret` does that, and so does anything else that moves rsp past it: a `pop` of the return address, a `ret n`, a `longjmp` or C++ exception unwinding to an outer routine, which leave several frames at once. A `ret` to an address the program pushed itself leaves the frames below it. A jump to another routine keeps the frame until that routine returns.
+- A signal delivered to a handler pushes a frame of kind `'signal'`, whether the signal arrived between instructions, as an alarm does, or an instruction raised it, as `int3` or a fault does. Its `target` is the handler, its `destination` the instruction the program goes on at afterwards, and its `sp` points at the address of the restorer. The frame lasts through the handler's `ret` and the restorer, and is gone once rsp is back where the signal found it: at the restorer's `rt_sigreturn`, or at a `longjmp` out of the handler.
+- `int3`, `int n` and `into` push no frame of their own.
+
+A program that moves rsp to another stack, a task switch or a handler on a `sigaltstack` above the main stack, can make frames look gone that are not.
 
 When history is enabled, every instruction `run()` or `step()` executes is recorded inside the wasm. CPU instructions and queries can be undone; an instruction with unjournaled input, File, descriptor, pipe, mapping or process-state effects forms an irreversible boundary. If history is disabled with `initialize(0)` or by never calling `initialize`, nothing is recorded and `canUndo()` returns `false`.
 

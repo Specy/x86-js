@@ -33,6 +33,11 @@ export type MonacoError = {
 export type StackFrame = {
     /** The symbol the call went into, '' when no symbol covers it. */
     name: string
+    /**
+     * `call` for a frame a `call` pushed; `signal` for a signal delivered to a handler, whose
+     * frame lasts through the handler's `ret` and the restorer until `rt_sigreturn`.
+     */
+    kind: 'call' | 'signal'
     /** Where that symbol starts, or {@link target} when no symbol covers it. */
     address: bigint
     /**
@@ -40,8 +45,15 @@ export type StackFrame = {
      * it went to: a PLT stub, whose nearest symbol is `_init`, or a stripped function.
      */
     target: bigint
-    /** The return address: the instruction after the call, in the caller. */
+    /**
+     * The return address: the instruction after the call, in the caller. For a signal, the
+     * instruction the program goes on at when the handler is over.
+     */
     destination: bigint
+    /**
+     * rsp on entry, which points at the return address; for a signal, at the restorer's address
+     * the handler's `ret` goes to.
+     */
     sp: bigint
     line: number
     file?: string
@@ -272,7 +284,7 @@ export abstract class BaseEmulator<
 
     abstract getFlags(): { name: string; value: number; prev?: number }[]
 
-    abstract getCallStack(): StackFrame[]
+    abstract getCallStack(max?: number): StackFrame[]
 
     abstract getInstructionAt(address: bigint): Instruction | null
 
@@ -289,6 +301,6 @@ export abstract class BaseEmulator<
     abstract run(
         limit?: number,
         breakpoints?: Array<number | { path: string; line: number }>,
-        options?: { skipBreakpointAtPc?: boolean }
+        options?: { skipBreakpointAtPc?: boolean; untilCallDepth?: number }
     ): Promise<EmulatorStatus>
 }

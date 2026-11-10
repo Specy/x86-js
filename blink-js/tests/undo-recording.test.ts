@@ -280,16 +280,16 @@ describe('turning undo off and back on', () => {
         }
     })
 
-    it('records nothing after initialize(0), and keeps no call stack, as before', async () => {
+    it('records nothing after initialize(0), and keeps the call stack all the same', async () => {
         const emulator = await build(COMPILED, 0)
         try {
             emulator.setUndoEnabled(false)
             await stepIntoMain(emulator)
             emulator.setUndoEnabled(true)
             await emulator.step()
-            expect(history(emulator)).toEqual(NONE)
+            expect(history(emulator)).toEqual(IN_MAIN)
             await emulator.run(2)
-            expect(history(emulator)).toEqual(NONE)
+            expect(history(emulator)).toEqual({ ...NONE, frames: ['main', 'add_five'] })
         } finally {
             emulator.dispose()
         }

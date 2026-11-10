@@ -93,7 +93,7 @@ export type MemoryWriteResult =
     | { ok: true; writtenBytes: number }
     | { ok: false; error: string; writtenBytes: number }
 
-export type NativeRunStopKind = 'none' | 'breakpoint' | 'limit'
+export type NativeRunStopKind = 'none' | 'breakpoint' | 'limit' | 'callDepth'
 
 export type NativeRunStop = {
     kind: NativeRunStopKind
@@ -253,8 +253,16 @@ export type BlinkenlibModule = {
     _blinkenlib_history_can_undo?(): boolean
     _blinkenlib_history_mark_irreversible?(): void
     _blinkenlib_history_undo?(): number
-    _blinkenlib_history_stack_depth?(): number
-    _blinkenlib_history_frame?(index: number): number
+    /** How many frames the call stack holds. */
+    _blinkenlib_call_depth?(): number
+    /**
+     * The newest `max` frames of the call stack, newest first, in a buffer the next call reuses:
+     * four u64 each, where the call went, where it returns, rsp on entry and the kind (0 a call,
+     * 1 a signal).
+     */
+    _blinkenlib_call_stack?(max: number): number
+    /** Whether the last step delivered a signal to a handler before running an instruction. */
+    _blinkenlib_step_handler_entry?(): number
     _blinkenlib_history_begin_poke?(): boolean
     _blinkenlib_history_end_poke?(): number
     blinkenlibGetRegister(register: X86RegisterName): bigint
@@ -297,7 +305,12 @@ export type BlinkenlibModule = {
     blinkenlibProvideEndOfInput(): void
     /** Discards the terminal's input, bytes and End of input alike. */
     blinkenlibClearInput(): void
-    blinkenlibSetRunControls(limit: bigint, breakpointAddresses: string[]): void
+    /** `untilCallDepth` is negative for none. */
+    blinkenlibSetRunControls(
+        limit: bigint,
+        breakpointAddresses: string[],
+        untilCallDepth: number
+    ): void
     blinkenlibGetRunControls(): NativeRunControls
     blinkenlibGetRunStop(): NativeRunStop
     blinkenlibGetLastStepInfo(): NativeStepInfo

@@ -43,6 +43,8 @@ export type StopReasonKind =
     | 'wait'
     | 'limit'
     | 'breakpoint'
+    /** A run given `untilCallDepth` reached that depth (see `X86RunOptions`). */
+    | 'callDepth'
     | 'load-fail'
     | 'host-error'
 

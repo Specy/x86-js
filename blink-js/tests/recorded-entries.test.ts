@@ -284,7 +284,7 @@ describe('the count across a run', () => {
         }
     })
 
-    it('counts what a run executed when it hands a signal to a handler and comes back early', async () => {
+    it('counts what a run executed when it hands a signal to a handler and goes on', async () => {
         const emulator = await start(TRAP)
         const twin = await start(TRAP)
         try {
@@ -296,10 +296,10 @@ describe('the count across a run', () => {
                 calls.push({ recorded, stepped: await stepsTo(twin, emulator), status })
             }
             expect(emulator.stopReason).toMatchObject({ kind: 'exit', exitCode: 1 })
-            // A run comes back as soon as it has handed the signal over, still running, with
-            // nothing to say why; the next goes on from the handler.
-            expect(calls.length).toBeGreaterThan(1)
-            expect(calls[0]).toMatchObject({ status: EmulatorStatus.Running })
+            // A run goes on into the handler it hands the signal to, and on to the end, in one
+            // call; it used to come back there, still running, with nothing to say why.
+            expect(calls).toHaveLength(1)
+            expect(calls[0]).toMatchObject({ status: EmulatorStatus.Terminated })
             for (const call of calls) expect(call.recorded).toBe(call.stepped)
             expect(calls.reduce((total, call) => total + call.recorded, 0)).toBe(14)
         } finally {

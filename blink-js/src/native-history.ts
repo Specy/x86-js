@@ -30,8 +30,8 @@ export class NativeHistory {
      */
     private cache = new Map<bigint, { length: number; undoable: boolean; step: ExecutionStep }>()
     /**
-     * Whether what the ring holds can be undone. Off, the ring records all the same, which keeps
-     * the call stack it tracks right, but nothing recorded then can ever be undone.
+     * Whether what the ring holds can be undone. Off, the ring records all the same, but nothing
+     * recorded then can ever be undone.
      */
     private undoEnabled = true
     /**
@@ -72,6 +72,11 @@ export class NativeHistory {
         if (!module._blinkenlib_history_header) {
             throw new Error(
                 'This blinkenlib.wasm cannot give an undo history header alone: it has no _blinkenlib_history_header'
+            )
+        }
+        if (!module._blinkenlib_call_stack || !module._blinkenlib_step_handler_entry) {
+            throw new Error(
+                'This blinkenlib.wasm keeps no call stack of its own: it has no _blinkenlib_call_stack'
             )
         }
     }
@@ -203,30 +208,51 @@ export class NativeHistory {
         return Boolean(result)
     }
 
-    callStack(): StackFrame[] {
-        const frames: StackFrame[] = []
-        const count = this.runtime.module._blinkenlib_history_stack_depth!()
-        for (let index = 0; index < count; index++) {
-            const pointer = this.runtime.module._blinkenlib_history_frame!(index)
-            const view = this.view(pointer, 24)
-            frames.push(
-                this.frame(
-                    view.getBigUint64(0, true),
-                    view.getBigUint64(8, true),
-                    view.getBigUint64(16, true),
-                    index
-                )
-            )
-        }
-        return frames
+    /** How many frames the call stack holds, which the wasm keeps whether or not it records. */
+    callDepth(): number {
+        return this.runtime.module._blinkenlib_call_depth!()
     }
 
-    private frame(target: bigint, destination: bigint, sp: bigint, index: number): StackFrame {
+    /**
+     * The newest `max` frames of the call stack, or all of them, oldest first. Each keeps the
+     * index, and so the colour, it has in the whole stack.
+     */
+    callStack(max = Infinity): StackFrame[] {
+        const depth = this.callDepth()
+        const count = Math.min(depth, max)
+        if (count <= 0) return []
+        const pointer = this.runtime.module._blinkenlib_call_stack!(count)
+        // newest first, four quadwords a frame, all read before any symbol is looked up: a
+        // lookup may grow the heap, which detaches the view
+        const view = this.view(pointer, count * 32)
+        const raw: [bigint, bigint, bigint, StackFrame['kind']][] = []
+        for (let newest = count - 1; newest >= 0; newest--) {
+            const at = newest * 32
+            raw.push([
+                view.getBigUint64(at, true),
+                view.getBigUint64(at + 8, true),
+                view.getBigUint64(at + 16, true),
+                view.getUint32(at + 24, true) === 1 ? 'signal' : 'call'
+            ])
+        }
+        return raw.map(([target, destination, sp, kind], position) =>
+            this.frame(target, destination, sp, kind, depth - count + position)
+        )
+    }
+
+    private frame(
+        target: bigint,
+        destination: bigint,
+        sp: bigint,
+        kind: StackFrame['kind'],
+        index: number
+    ): StackFrame {
         const symbol = this.runtime.resolveSymbol(target)
         const address = symbol?.address ?? target
         const location = this.runtime.getSourceLocationForAddress(address)
         return {
             name: symbol?.name ?? '',
+            kind,
             address,
             target,
             destination,

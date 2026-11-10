@@ -65,7 +65,7 @@ bool IsSignalSerious(int sig) {
 }
 
 void DeliverSignal(struct Machine *m, int sig, int code) {
-  u64 sp;
+  u64 sp, interrupted_sp = Read64(m->sp);
   struct SignalFrame sf;
 #ifdef __EMSCRIPTEN__
   /* Signal-frame memory and the mask are outside the current history packet.
@@ -173,6 +173,11 @@ void DeliverSignal(struct Machine *m, int sig, int code) {
   Put64(m->si, sp + offsetof(struct SignalFrame, si));
   Put64(m->dx, sp + offsetof(struct SignalFrame, uc));
   SIG_LOGF("handler is %" PRIx64, Read64(m->system->hands[sig - 1].handler));
+#ifdef __EMSCRIPTEN__
+  /* The handler is a frame of the call stack, which rt_sigreturn ends. */
+  CallStackSignal(Read64(m->system->hands[sig - 1].handler), m->ip, sp,
+                  interrupted_sp);
+#endif
   m->ip = Read64(m->system->hands[sig - 1].handler);
   // Linux handle_signal() clears these for handler entry, after saving the
   // interrupted flags in the frame. In particular TF must not trap inside
@@ -189,6 +194,9 @@ void RestartSignalSyscall(struct Machine *m, u64 number, u64 pc) {
   CopyToUserWrite(m, frame + offsetof(struct SignalFrame, uc.rax), word, 8);
   Write64(word, pc);
   CopyToUserWrite(m, frame + offsetof(struct SignalFrame, uc.rip), word, 8);
+#ifdef __EMSCRIPTEN__
+  CallStackRedirectSignal(pc);
+#endif
 }
 
 void SigRestore(struct Machine *m) {

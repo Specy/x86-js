@@ -144,6 +144,8 @@ const char *StopKindName(uint32_t kind) {
       return "breakpoint";
     case BLINKENLIB_STOP_LIMIT:
       return "limit";
+    case BLINKENLIB_STOP_CALL_DEPTH:
+      return "callDepth";
     default:
       return "none";
   }
@@ -160,8 +162,11 @@ const char *ControlFlowName(uint32_t kind) {
   }
 }
 
-void SetRunControls(uint64_t limit, val breakpointAddresses) {
+// untilCallDepth is a number, negative for none.
+void SetRunControls(uint64_t limit, val breakpointAddresses,
+                    double untilCallDepth) {
   blinkenlib_set_run_instruction_limit(limit);
+  blinkenlib_set_run_call_depth(untilCallDepth);
   blinkenlib_clear_run_breakpoints();
   uint32_t length = breakpointAddresses["length"].as<uint32_t>();
   for (uint32_t index = 0; index < length; ++index) {

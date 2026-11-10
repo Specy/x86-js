@@ -88,6 +88,7 @@ enum blinkenlib_stop_kind {
   BLINKENLIB_STOP_NONE = 0,
   BLINKENLIB_STOP_BREAKPOINT = 1,
   BLINKENLIB_STOP_LIMIT = 2,
+  BLINKENLIB_STOP_CALL_DEPTH = 3,
 };
 
 enum blinkenlib_control_flow_kind {
@@ -199,6 +200,9 @@ bool blinkenlib_set_fpu_state(const u8 *in);
 bool blinkenlib_read_memory_byte(u64 virtual_address, u8 *value);
 bool blinkenlib_write_memory_byte(u64 virtual_address, u8 value);
 void blinkenlib_set_run_instruction_limit(u64 limit);
+void blinkenlib_set_run_call_depth(double depth);
+u32 blinkenlib_call_depth(void);
+bool blinkenlib_step_handler_entry(void);
 void blinkenlib_clear_run_breakpoints();
 bool blinkenlib_add_run_breakpoint(u64 address);
 u32 blinkenlib_get_run_breakpoint_count();
